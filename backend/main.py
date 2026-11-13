@@ -1,0 +1,612 @@
+"""
+WorldGit Spatial Hub — FastAPI + WebSocket backend for multi-wearer 3D memory,
+Ctrl+F search, Spatial Triggers & Friend's World, Reality git diff, and Ctrl+Z undo.
+"""
+import json
+import math
+import os
+import time
+import uuid
+from typing import Any, Dict, List, Optional
+
+import httpx
+from dotenv import load_dotenv
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+
+from ai_services import (
+    ai_status,
+    analyze_frame_with_gemini,
+    generate_ctrl_z_instructions,
+    synthesize_elevenlabs_tts,
+)
+from db import SpatialDatabase
+
+load_dotenv()
+
+app = FastAPI(title="WorldGit Spatial Hub", version="0.2.0")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+class SpatialObject(BaseModel):
+    id: str
+    label: str
+    position: List[float]  # [x, y, z] in meters
+    seen_by: str
+    timestamp: float
+    confidence: float = 0.9
+
+
+class SpatialPin(BaseModel):
+    id: str
+    author: str
+    text: str
+    pin_type: str = "note"  # "warning" | "note" | "friend_memory"
+    position: List[float]
+    landmark: str
+    created_at: float
+    age_label: str = "just now"
+
+
+class WearerState(BaseModel):
+    wearer_id: str
+    name: str
+    position: List[float]
+    yaw: float = 0.0
+    pitch: float = 0.0
+    last_seen: float
+
+
+class WorldSnapshot(BaseModel):
+    snapshot_id: str
+    label: str
+    timestamp: float
+    objects: List[SpatialObject]
+
+
+def _generate_room_point_cloud() -> List[List[float]]:
+    """Generate a procedural 3D workshop/room point cloud [x, y, z, r, g, b]."""
+    pts: List[List[float]] = []
+
+    # Floor grid points (subtle slate)
+    for x_i in range(-10, 11):
+        for z_i in range(-10, 11):
+            x, z = x_i * 0.45, z_i * 0.45
+            pts.append([round(x, 2), 0.0, round(z, 2), 0.16, 0.22, 0.31])
+
+    # North & West walls
+    for x_i in range(-18, 19):
+        for y_i in range(1, 10):
+            x = x_i * 0.25
+            y = y_i * 0.25
+            pts.append([round(x, 2), round(y, 2), -4.5, 0.28, 0.35, 0.48])
+
+    for z_i in range(-18, 19):
+        for y_i in range(1, 10):
+            z = z_i * 0.25
+            y = y_i * 0.25
+            pts.append([-4.5, round(y, 2), round(z, 2), 0.24, 0.32, 0.44])
+
+    # Workbench cluster near [-1.8, 0.8, -2.2]
+    for x_i in range(-6, 7):
+        for z_i in range(-3, 4):
+            pts.append([round(-1.8 + x_i * 0.15, 2), 0.85, round(-2.2 + z_i * 0.15, 2), 0.55, 0.40, 0.28])
+
+    # Pillar near [2.4, y, -1.0]
+    for y_i in range(0, 12):
+        for dx in (-0.2, 0.2):
+            for dz in (-0.2, 0.2):
+                pts.append([round(2.4 + dx, 2), round(y_i * 0.22, 2), round(-1.0 + dz, 2), 0.45, 0.52, 0.62])
+
+    return pts
+
+
+class WorldState:
+    def __init__(self, db: SpatialDatabase) -> None:
+        self.db = db
+        self.wearers: Dict[str, WearerState] = {}
+        self.objects: Dict[str, SpatialObject] = {}
+        self.pins: Dict[str, SpatialPin] = {}
+        self.snapshots: List[WorldSnapshot] = []
+        self.points: List[List[float]] = _generate_room_point_cloud()
+        self.clients: List[WebSocket] = []
+        self._seed_demo_world()
+
+    def _seed_demo_world(self) -> None:
+        now = time.time()
+
+        # Pre-seed 3 crew wearers
+        seed_wearers = [
+            WearerState(wearer_id="wearer-a", name="Alex", position=[-2.0, 1.6, -1.5], yaw=45.0, last_seen=now),
+            WearerState(wearer_id="wearer-b", name="Conor (You)", position=[1.5, 1.6, 2.5], yaw=0.0, last_seen=now),
+            WearerState(wearer_id="wearer-c", name="Sam", position=[-3.5, 1.6, 1.0], yaw=120.0, last_seen=now),
+        ]
+        for w in seed_wearers:
+            self.wearers[w.wearer_id] = w
+
+        # Snapshot 1 (initial git commit)
+        snap1_objects = [
+            SpatialObject(
+                id="obj-drill",
+                label="Red DeWalt Drill",
+                position=[-0.2, 0.9, -0.5],
+                seen_by="Alex",
+                timestamp=now - 900,
+            ),
+            SpatialObject(
+                id="obj-socket",
+                label="10mm Socket Wrench",
+                position=[2.4, 0.8, -1.0],
+                seen_by="Sam",
+                timestamp=now - 900,
+            ),
+            SpatialObject(
+                id="obj-keys",
+                label="Car Keys",
+                position=[-0.5, 0.75, 1.2],
+                seen_by="Alex",
+                timestamp=now - 900,
+            ),
+            SpatialObject(
+                id="obj-medkit",
+                label="First Aid Kit",
+                position=[0.0, 1.4, -3.5],
+                seen_by="Sam",
+                timestamp=now - 900,
+            ),
+            SpatialObject(
+                id="obj-battery",
+                label="Backup Battery",
+                position=[1.0, 0.8, 0.0],
+                seen_by="Alex",
+                timestamp=now - 900,
+            ),
+        ]
+        snap1 = WorldSnapshot(
+            snapshot_id="pass-1",
+            label="pass-1-initial",
+            timestamp=now - 900,
+            objects=snap1_objects,
+        )
+
+        # Current objects (Pass 2: Drill moved, Backup Battery missing, Laser Level added)
+        current_objects = [
+            SpatialObject(
+                id="obj-drill",
+                label="Red DeWalt Drill",
+                position=[-1.8, 0.9, -2.2],
+                seen_by="Alex",
+                timestamp=now - 120,
+            ),
+            SpatialObject(
+                id="obj-socket",
+                label="10mm Socket Wrench",
+                position=[2.4, 0.8, -1.0],
+                seen_by="Sam",
+                timestamp=now - 180,
+            ),
+            SpatialObject(
+                id="obj-keys",
+                label="Car Keys",
+                position=[-0.5, 0.75, 1.2],
+                seen_by="Alex",
+                timestamp=now - 60,
+            ),
+            SpatialObject(
+                id="obj-medkit",
+                label="First Aid Kit",
+                position=[0.0, 1.4, -3.5],
+                seen_by="Sam",
+                timestamp=now - 240,
+            ),
+            SpatialObject(
+                id="obj-laser",
+                label="Laser Level",
+                position=[3.0, 0.9, 0.5],
+                seen_by="Conor (You)",
+                timestamp=now - 30,
+            ),
+        ]
+        for obj in current_objects:
+            self.objects[obj.id] = obj
+            self.db.upsert_object(obj.model_dump())
+
+        snap2 = WorldSnapshot(
+            snapshot_id="pass-2",
+            label="pass-2-current",
+            timestamp=now - 30,
+            objects=[o.model_copy() for o in current_objects],
+        )
+        self.snapshots = [snap1, snap2]
+        self.db.save_snapshot(snap1.model_dump())
+        self.db.save_snapshot(snap2.model_dump())
+
+        # Spatial Pins & Friend's World memories
+        seed_pins = [
+            SpatialPin(
+                id="pin-1",
+                author="Alex",
+                text="LIVE 400V PANEL — Do not flip Breaker #4",
+                pin_type="warning",
+                position=[-2.2, 1.3, -1.8],
+                landmark="Breaker Panel",
+                created_at=now - 120,
+                age_label="2m ago",
+            ),
+            SpatialPin(
+                id="pin-2",
+                author="Sam",
+                text="Move these drywall boxes to Floor 2 before 18:00",
+                pin_type="note",
+                position=[1.2, 0.8, -2.0],
+                landmark="Storage Rack",
+                created_at=now - 840,
+                age_label="14m ago",
+            ),
+            SpatialPin(
+                id="pin-3",
+                author="Sam",
+                text="My favourite flat white in Helsinki — get the cardamom bun!",
+                pin_type="friend_memory",
+                position=[-1.0, 1.2, 2.0],
+                landmark="Corner Espresso Bar",
+                created_at=now - 63072000,
+                age_label="2 years ago",
+            ),
+            SpatialPin(
+                id="pin-4",
+                author="Alex",
+                text="Best late-night ramen spot from our NYC trip",
+                pin_type="friend_memory",
+                position=[2.8, 1.2, 1.8],
+                landmark="East Village Ramen",
+                created_at=now - 31536000,
+                age_label="1 year ago",
+            ),
+        ]
+        for pin in seed_pins:
+            self.pins[pin.id] = pin
+            self.db.upsert_pin(pin.model_dump())
+
+    def take_snapshot(self, label: str) -> WorldSnapshot:
+        snap = WorldSnapshot(
+            snapshot_id=str(uuid.uuid4())[:8],
+            label=label,
+            timestamp=time.time(),
+            objects=[obj.model_copy() for obj in self.objects.values()],
+        )
+        self.snapshots.append(snap)
+        self.db.save_snapshot(snap.model_dump())
+        return snap
+
+    def compute_diff(self, from_idx: int = -2, to_idx: int = -1) -> Dict[str, Any]:
+        if len(self.snapshots) < 2:
+            return {"added": [], "removed": [], "moved": []}
+        prev = {o.label: o for o in self.snapshots[from_idx].objects}
+        curr = {o.label: o for o in self.snapshots[to_idx].objects}
+
+        added = [curr[k].model_dump() for k in curr if k not in prev]
+        removed = [prev[k].model_dump() for k in prev if k not in curr]
+        moved = []
+        for k in curr:
+            if k in prev:
+                p0, p1 = prev[k].position, curr[k].position
+                dist = math.sqrt(sum((a - b) ** 2 for a, b in zip(p0, p1)))
+                if dist > 0.25:
+                    moved.append(
+                        {
+                            "label": k,
+                            "from": p0,
+                            "to": p1,
+                            "distance_m": round(dist, 2),
+                        }
+                    )
+        return {"added": added, "removed": removed, "moved": moved}
+
+    def serialize_state(self) -> Dict[str, Any]:
+        return {
+            "type": "world_state",
+            "wearers": [w.model_dump() for w in self.wearers.values()],
+            "objects": [o.model_dump() for o in self.objects.values()],
+            "pins": [p.model_dump() for p in self.pins.values()],
+            "snapshots": [s.model_dump() for s in self.snapshots],
+            "diff": self.compute_diff(),
+            "point_count": len(self.points),
+            "tech_stack_status": {
+                "aiven": self.db.status(),
+                "ai": ai_status(),
+            },
+        }
+
+
+db = SpatialDatabase()
+world = WorldState(db=db)
+
+
+async def broadcast_state() -> None:
+    payload = json.dumps(world.serialize_state())
+    stale: List[WebSocket] = []
+    for ws in world.clients:
+        try:
+            await ws.send_text(payload)
+        except Exception:
+            stale.append(ws)
+    for ws in stale:
+        if ws in world.clients:
+            world.clients.remove(ws)
+
+
+def _compute_directions(wearer: WearerState, target: SpatialObject) -> Dict[str, Any]:
+    dx = target.position[0] - wearer.position[0]
+    dz = target.position[2] - wearer.position[2]
+    dist = round(math.sqrt(dx * dx + dz * dz), 1)
+    angle_deg = round(math.degrees(math.atan2(dx, -dz)) - wearer.yaw) % 360
+
+    if angle_deg < 25 or angle_deg > 335:
+        turn = "straight ahead"
+        arrow = "↑"
+    elif angle_deg < 70:
+        turn = "ahead-right"
+        arrow = "↗"
+    elif angle_deg < 115:
+        turn = "to your right"
+        arrow = "→"
+    elif angle_deg < 180:
+        turn = "behind-right"
+        arrow = "↘"
+    elif angle_deg < 245:
+        turn = "behind-left"
+        arrow = "↙"
+    elif angle_deg < 290:
+        turn = "to your left"
+        arrow = "←"
+    else:
+        turn = "ahead-left"
+        arrow = "↖"
+
+    return {
+        "distance_m": dist,
+        "bearing_deg": angle_deg,
+        "arrow": arrow,
+        "turn": turn,
+        "directions": f"{target.label} was last seen by {target.seen_by}. Walk {dist}m {turn}.",
+    }
+
+
+@app.get("/health")
+async def health() -> Dict[str, Any]:
+    return {
+        "status": "ok",
+        "wearers": len(world.wearers),
+        "objects": len(world.objects),
+        "pins": len(world.pins),
+        "points": len(world.points),
+    }
+
+
+@app.get("/api/state")
+async def get_state() -> Dict[str, Any]:
+    return world.serialize_state()
+
+
+@app.get("/api/points")
+async def get_points() -> Dict[str, Any]:
+    return {"point_count": len(world.points), "points": world.points}
+
+
+@app.get("/api/aiven-status")
+async def get_aiven_status() -> Dict[str, Any]:
+    return db.status()
+
+
+class CtrlFQuery(BaseModel):
+    wearer_id: str = "wearer-b"
+    query: str
+
+
+@app.post("/api/ctrl-f")
+async def ctrl_f_search(req: CtrlFQuery) -> Dict[str, Any]:
+    q = req.query.lower().strip()
+    matches = [o for o in world.objects.values() if q in o.label.lower()]
+    if not matches:
+        # Token fallback
+        tokens = [t for t in q.split() if len(t) > 2]
+        matches = [
+            o for o in world.objects.values() if any(t in o.label.lower() for t in tokens)
+        ]
+    if not matches:
+        return {"found": False, "message": f"No teammate has seen '{req.query}' yet."}
+
+    target = matches[0]
+    wearer = world.wearers.get(req.wearer_id)
+    if not wearer:
+        return {
+            "found": True,
+            "object": target.model_dump(),
+            "directions": f"{target.seen_by} saw {target.label}.",
+        }
+
+    nav = _compute_directions(wearer, target)
+    return {
+        "found": True,
+        "object": target.model_dump(),
+        "path": [wearer.position, target.position],
+        **nav,
+    }
+
+
+@app.post("/api/snapshot")
+async def create_snapshot(label: str = "checkpoint") -> Dict[str, Any]:
+    snap = world.take_snapshot(label)
+    await broadcast_state()
+    return snap.model_dump()
+
+
+@app.get("/api/diff")
+async def get_diff() -> Dict[str, Any]:
+    return world.compute_diff()
+
+
+@app.post("/api/ctrl-z")
+async def ctrl_z_undo() -> Dict[str, Any]:
+    diff = world.compute_diff()
+    ai_undo = await generate_ctrl_z_instructions(diff)
+    return {
+        "diff": diff,
+        "provider": ai_undo["provider"],
+        "undo_steps": ai_undo["undo_steps"],
+    }
+
+
+@app.post("/api/pin")
+async def add_pin(pin: SpatialPin) -> Dict[str, Any]:
+    world.pins[pin.id] = pin
+    db.upsert_pin(pin.model_dump())
+    await broadcast_state()
+    return pin.model_dump()
+
+
+@app.post("/api/object")
+async def upsert_object(obj: SpatialObject) -> Dict[str, Any]:
+    world.objects[obj.id] = obj
+    db.upsert_object(obj.model_dump())
+    await broadcast_state()
+    return obj.model_dump()
+
+
+class FrameAnalysisRequest(BaseModel):
+    wearer_id: str = "wearer-b"
+    image_b64: str = ""
+    pose: Optional[List[float]] = None
+    yaw: Optional[float] = None
+
+
+@app.post("/api/analyze-frame")
+async def analyze_frame(req: FrameAnalysisRequest) -> Dict[str, Any]:
+    wearer = world.wearers.get(req.wearer_id)
+    pose = req.pose or (wearer.position if wearer else [0.0, 1.5, 0.0])
+    yaw = req.yaw if req.yaw is not None else (wearer.yaw if wearer else 0.0)
+
+    # 1. Optional Modal GPU 3D point-cloud reconstruction call
+    modal_url = os.getenv("MODAL_RECONSTRUCT_URL")
+    added_points = 0
+    modal_provider = "local-synthetic-patch"
+    if modal_url and req.image_b64:
+        try:
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                r = await client.post(
+                    modal_url,
+                    json={"image_b64": req.image_b64, "pose": pose, "yaw": yaw},
+                )
+                if r.status_code == 200:
+                    data = r.json()
+                    pts = data.get("points", [])
+                    world.points.extend(pts)
+                    added_points = len(pts)
+                    modal_provider = "modal-gpu-l4"
+        except Exception:
+            pass
+
+    if added_points == 0:
+        # Add a local depth-projected point patch directly ahead of the wearer
+        rad = math.radians(yaw)
+        for dx_i in range(-3, 4):
+            for dy_i in range(-2, 3):
+                dist = 1.8
+                xw = pose[0] + dx_i * 0.2 * math.cos(rad) + dist * math.sin(rad)
+                yw = max(0.2, pose[1] + dy_i * 0.2)
+                zw = pose[2] - dx_i * 0.2 * math.sin(rad) - dist * math.cos(rad)
+                world.points.append([round(xw, 2), round(yw, 2), round(zw, 2), 0.22, 0.74, 0.97])
+                added_points += 1
+
+    # 2. Gemini semantic object indexing
+    analysis = await analyze_frame_with_gemini(req.image_b64, req.wearer_id, pose)
+    rad = math.radians(yaw)
+    created_objects: List[Dict[str, Any]] = []
+    now = time.time()
+
+    for det in analysis["detections"]:
+        rx = float(det.get("rel_x", 0.0))
+        ry = float(det.get("rel_y", -0.3))
+        rz = float(det.get("rel_z", -1.5))
+        xw = round(pose[0] + rx * math.cos(rad) - rz * math.sin(rad), 2)
+        yw = round(max(0.2, pose[1] + ry), 2)
+        zw = round(pose[2] - rx * math.sin(rad) + rz * math.cos(rad), 2)
+
+        label = str(det.get("label", "Detected Item"))
+        obj_id = f"obj-{label.lower().replace(' ', '-')[:20]}"
+        obj = SpatialObject(
+            id=obj_id,
+            label=label,
+            position=[xw, yw, zw],
+            seen_by=wearer.name if wearer else req.wearer_id,
+            timestamp=now,
+            confidence=float(det.get("confidence", 0.9)),
+        )
+        world.objects[obj.id] = obj
+        db.upsert_object(obj.model_dump())
+        created_objects.append(obj.model_dump())
+
+    await broadcast_state()
+    return {
+        "ai_provider": analysis["provider"],
+        "modal_provider": modal_provider,
+        "added_points": added_points,
+        "detected_objects": created_objects,
+        "total_points": len(world.points),
+    }
+
+
+class TtsRequest(BaseModel):
+    text: str
+
+
+@app.post("/api/tts")
+async def tts_endpoint(req: TtsRequest) -> Dict[str, Any]:
+    return await synthesize_elevenlabs_tts(req.text)
+
+
+@app.websocket("/ws/stream")
+async def ws_stream(websocket: WebSocket) -> None:
+    await websocket.accept()
+    world.clients.append(websocket)
+    await websocket.send_text(json.dumps(world.serialize_state()))
+    try:
+        while True:
+            raw = await websocket.receive_text()
+            msg = json.loads(raw)
+            msg_type = msg.get("type")
+
+            if msg_type == "pose":
+                w = WearerState(
+                    wearer_id=msg["wearer_id"],
+                    name=msg.get("name", msg["wearer_id"]),
+                    position=msg["position"],
+                    yaw=float(msg.get("yaw", 0.0)),
+                    pitch=float(msg.get("pitch", 0.0)),
+                    last_seen=time.time(),
+                )
+                world.wearers[w.wearer_id] = w
+                await broadcast_state()
+
+            elif msg_type == "frame":
+                await websocket.send_text(
+                    json.dumps(
+                        {
+                            "type": "frame_ack",
+                            "wearer_id": msg.get("wearer_id"),
+                            "ts": time.time(),
+                        }
+                    )
+                )
+    except WebSocketDisconnect:
+        if websocket in world.clients:
+            world.clients.remove(websocket)

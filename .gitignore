@@ -1,0 +1,32 @@
+# Dependencies
+node_modules/
+.venv/
+venv/
+ENV/
+
+# Python bytecode & caches
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+
+# Build outputs & test caches
+dist/
+build/
+.wearables-test/
+*.log
+
+# Local SQLite fallback databases
+*.db
+*.sqlite
+*.sqlite3
+
+# Environment secrets (keep .env.example)
+.env
+.env.local
+.env.*.local
+!.env.example
+
+# OS / Editor metadata
+.DS_Store
+Thumbs.db

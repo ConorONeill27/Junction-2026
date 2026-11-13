@@ -1,0 +1,18 @@
+# WorldGit — Cursor Rules
+
+You are working on WorldGit (Junction 2026), a multiplayer spatial memory app for Meta Ray-Ban Display glasses.
+Read EXPLAINER.md and AGENTS.md first.
+
+1. LANE ISOLATION: Ask the user which directory lane they own (`glasses-app/`, `frontend/`, `backend/`, or `gpu_worker/`). Never edit files outside that lane without explicit permission.
+2. GIT SYNC: Always run `git pull --rebase origin main` before starting work and before pushing.
+3. FROZEN CONTRACTS: Never rename or delete existing JSON fields in `/api/state`, `/api/ctrl-f`, `/api/ctrl-z`, `/api/pin`, `/api/analyze-frame`, `/api/tts`, or `/ws/stream`.
+4. OFFLINE FALLBACKS: Every cloud service (Gemini, OpenAI, ElevenLabs, Aiven, Modal) must have a working zero-key offline fallback. Never fail startup if `.env` is empty.
+5. META GLASSES HUD (`glasses-app/`):
+   - Keep the 4-file split: `useWorldGit.ts`, `HudViews.tsx`, `App.tsx`, `webmcp.ts`.
+   - Never use `TextStyle` larger than `BODY2` / `BODY2_EMPHASIZED`.
+   - Never conditionally render `<Button>` children inside `<ButtonRail>`.
+   - Never repeat the same item field (like `pin.author`) in multiple visible branches inside a `Panel`.
+   - Keep `.content-inset` `gap: calc(var(--uit-spacing-large) + var(--uit-spacing-xsmall));` in `glasses-app/src/styles.css`.
+   - Before committing `glasses-app/`, run:
+     `node ./meta-wearables-webapp-ref/plugins/meta-wearables-webapp/skills/ai-glasses-webapp-ui/scripts/validate-ui-toolkit.mjs ./glasses-app`
+     `node ./meta-wearables-webapp-ref/plugins/meta-wearables-webapp/skills/ai-glasses-webapp-test/scripts/check-webapp.mjs ./glasses-app --static-only`

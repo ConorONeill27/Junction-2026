@@ -1,0 +1,9 @@
+fastapi
+uvicorn
+websockets
+pydantic
+httpx
+google-genai
+openai
+psycopg[binary]
+python-dotenv

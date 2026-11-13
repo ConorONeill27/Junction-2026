@@ -1,0 +1,20 @@
+{
+  "name": "meta-wearables",
+  "owner": {
+    "name": "Meta Wearables"
+  },
+  "plugins": [
+    {
+      "name": "meta-wearables-webapp",
+      "source": "./plugins/meta-wearables-webapp",
+      "description": "Meta Ray-Ban Display web app skills for React, UI Toolkit, and performance optimization",
+      "version": "128.1.1"
+    },
+    {
+      "name": "meta-wearables-webapp-game",
+      "source": "./plugins/meta-wearables-webapp-game",
+      "description": "Skills for building Meta Display Glasses webapp games (Vite + TypeScript + Three.js)",
+      "version": "1.0.2"
+    }
+  ]
+}
