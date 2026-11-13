@@ -1,56 +1,65 @@
 import React, { useEffect, useRef, useState } from "react";
 import * as THREE from "three";
+import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
+import { drawImageToCanvas } from "./camera3d";
 
-const API_BASE = "http://127.0.0.1:8000";
-const WS_URL = "ws://127.0.0.1:8000/ws/stream";
+const API_BASE = "";
+const WS_PROTO = window.location.protocol === "https:" ? "wss:" : "ws:";
+const WS_URL = `${WS_PROTO}//${window.location.host}/ws/stream`;
+const IS_PHONE_SCANNER = new URLSearchParams(window.location.search).get("mode") === "scan";
+
+let cachedSplatTexture = null;
+function getGaussianSplatTexture() {
+  if (cachedSplatTexture) return cachedSplatTexture;
+  const size = 64;
+  const canvas = document.createElement("canvas");
+  canvas.width = size;
+  canvas.height = size;
+  const ctx = canvas.getContext("2d");
+  const half = size / 2;
+  const grad = ctx.createRadialGradient(half, half, 0, half, half, half);
+  grad.addColorStop(0.0, "rgba(255,255,255,1.0)");
+  grad.addColorStop(0.55, "rgba(255,255,255,0.92)");
+  grad.addColorStop(0.85, "rgba(255,255,255,0.35)");
+  grad.addColorStop(1.0, "rgba(255,255,255,0.0)");
+  ctx.fillStyle = grad;
+  ctx.fillRect(0, 0, size, size);
+  cachedSplatTexture = new THREE.CanvasTexture(canvas);
+  return cachedSplatTexture;
+}
 
 export default function App() {
   const mountRef = useRef(null);
+  const threeRef = useRef(null);
   const videoRef = useRef(null);
   const canvasRef = useRef(null);
+  const scanBusyRef = useRef(false);
+  const lastPointCountRef = useRef(-1);
+  const baseAlphaRef = useRef(null);
+  const smoothVecRef = useRef({ sin: 0, cos: 1 });
 
-  const [world, setWorld] = useState({
-    wearers: [],
-    objects: [],
-    pins: [],
-    snapshots: [],
-    diff: { added: [], removed: [], moved: [] },
-    point_count: 0,
-    tech_stack_status: null,
-  });
   const [points, setPoints] = useState([]);
-  const [query, setQuery] = useState("Red DeWalt Drill");
-  const [ctrlFResult, setCtrlFResult] = useState(null);
-  const [undoSteps, setUndoSteps] = useState([]);
-  const [showDiffOverlay, setShowDiffOverlay] = useState(true);
-  const [snapshotIdx, setSnapshotIdx] = useState(-1); // -1 = live/latest
-  const [pinText, setPinText] = useState("");
-  const [pinType, setPinType] = useState("warning");
+  const [keyframes, setKeyframes] = useState([]);
   const [cameraActive, setCameraActive] = useState(false);
-  const [captureStatus, setCaptureStatus] = useState("Idle (ready for webcam or synthetic POV)");
-  const [ttsStatus, setTtsStatus] = useState("");
+  const [autoScan, setAutoScan] = useState(false);
+  const [scanMode, setScanMode] = useState("surround"); // "surround" | "room"
+  const [bgCutoff, setBgCutoff] = useState(0.18); // 0.0 = map everything, 0.25 = foreground object only
+  const [scanYaw, setScanYaw] = useState(0);
+  const [scanPitch, setScanPitch] = useState(12);
+  const [gyroActive, setGyroActive] = useState(IS_PHONE_SCANNER);
+  const [depthPreviewB64, setDepthPreviewB64] = useState("");
+  const [splatSize, setSplatSize] = useState(0.016);
+  const [showPointCloud, setShowPointCloud] = useState(true);
+  const [showFrustums, setShowFrustums] = useState(true);
+  const [autoOrbit, setAutoOrbit] = useState(true);
+  const [statusText, setStatusText] = useState(
+    "WorldGit 3D Spatial Viewer — VGGT-1B Walk-Around Point Cloud"
+  );
 
-  // Initial state + WebSocket sync
+  const scanParamsRef = useRef({ scanYaw, scanPitch, scanMode, bgCutoff, gyroActive });
   useEffect(() => {
-    fetch(`${API_BASE}/api/state`)
-      .then((r) => r.json())
-      .then((data) => setWorld(data))
-      .catch(() => {});
-
-    fetch(`${API_BASE}/api/points`)
-      .then((r) => r.json())
-      .then((data) => setPoints(data.points || []))
-      .catch(() => {});
-
-    const ws = new WebSocket(WS_URL);
-    ws.onmessage = (ev) => {
-      const msg = JSON.parse(ev.data);
-      if (msg.type === "world_state") {
-        setWorld(msg);
-      }
-    };
-    return () => ws.close();
-  }, []);
+    scanParamsRef.current = { scanYaw, scanPitch, scanMode, bgCutoff, gyroActive };
+  }, [scanYaw, scanPitch, scanMode, bgCutoff, gyroActive]);
 
   const refreshPoints = async () => {
     try {
@@ -62,165 +71,93 @@ export default function App() {
     }
   };
 
-  // Three.js 3D Spatial Viewport
+  // Initial state + WebSocket live sync
+  useEffect(() => {
+    fetch(`${API_BASE}/api/state`)
+      .then((r) => r.json())
+      .then((data) => {
+        if (Array.isArray(data.keyframes)) setKeyframes(data.keyframes);
+      })
+      .catch(() => {});
+
+    refreshPoints();
+
+    const ws = new WebSocket(WS_URL);
+    ws.onmessage = (ev) => {
+      const msg = JSON.parse(ev.data);
+      if (msg.type === "world_state") {
+        if (Array.isArray(msg.keyframes)) {
+          setKeyframes(msg.keyframes);
+        }
+        if (
+          typeof msg.point_count === "number" &&
+          msg.point_count !== lastPointCountRef.current
+        ) {
+          lastPointCountRef.current = msg.point_count;
+          refreshPoints();
+        }
+      }
+    };
+    return () => ws.close();
+  }, []);
+
+  // 1. Initialize Persistent Three.js 3D Viewport (Laptop View)
   useEffect(() => {
     const container = mountRef.current;
-    if (!container) return;
+    if (!container) return undefined;
 
     const scene = new THREE.Scene();
-    scene.background = new THREE.Color(0x070a12);
+    scene.background = new THREE.Color(0x050811);
 
     const camera = new THREE.PerspectiveCamera(
-      55,
+      50,
       container.clientWidth / container.clientHeight,
-      0.1,
-      100
+      0.05,
+      50
     );
-    camera.position.set(0, 7.5, 9.5);
-    camera.lookAt(0, 0.5, 0);
+    camera.position.set(0.55, 1.05, 1.38);
 
     const renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
     renderer.setSize(container.clientWidth, container.clientHeight);
     container.innerHTML = "";
     container.appendChild(renderer.domElement);
 
-    const grid = new THREE.GridHelper(16, 16, 0x334155, 0x162032);
+    const controls = new OrbitControls(camera, renderer.domElement);
+    controls.target.set(0, 0.48, 0);
+    controls.enableDamping = true;
+    controls.dampingFactor = 0.08;
+    controls.autoRotate = true;
+    controls.autoRotateSpeed = 1.6;
+    controls.update();
+
+    const grid = new THREE.GridHelper(6, 24, 0x1e293b, 0x0f172a);
     scene.add(grid);
-    scene.add(new THREE.AmbientLight(0xffffff, 0.95));
 
-    // Render 3D Point Cloud
-    if (points.length > 0) {
-      const positions = new Float32Array(points.length * 3);
-      const colors = new Float32Array(points.length * 3);
-      points.forEach((pt, idx) => {
-        positions[idx * 3] = pt[0];
-        positions[idx * 3 + 1] = pt[1];
-        positions[idx * 3 + 2] = pt[2];
-        colors[idx * 3] = pt[3] ?? 0.5;
-        colors[idx * 3 + 1] = pt[4] ?? 0.7;
-        colors[idx * 3 + 2] = pt[5] ?? 0.9;
-      });
-      const pcGeom = new THREE.BufferGeometry();
-      pcGeom.setAttribute("position", new THREE.BufferAttribute(positions, 3));
-      pcGeom.setAttribute("color", new THREE.BufferAttribute(colors, 3));
-      const pcMat = new THREE.PointsMaterial({ size: 0.08, vertexColors: true });
-      scene.add(new THREE.Points(pcGeom, pcMat));
-    }
-
-    const dynamicGroup = new THREE.Group();
-    scene.add(dynamicGroup);
-
-    // Wearer Gaze Cones
-    world.wearers.forEach((w) => {
-      const cone = new THREE.Mesh(
-        new THREE.ConeGeometry(0.26, 0.75, 16),
-        new THREE.MeshBasicMaterial({
-          color: w.wearer_id === "wearer-b" ? 0x38bdf8 : 0x818cf8,
-          wireframe: true,
-        })
-      );
-      cone.position.set(w.position[0], 1.2, w.position[2]);
-      cone.rotation.x = Math.PI / 2;
-      cone.rotation.z = -(w.yaw * Math.PI) / 180;
-      dynamicGroup.add(cone);
-
-      const base = new THREE.Mesh(
-        new THREE.CylinderGeometry(0.16, 0.16, 0.9, 12),
-        new THREE.MeshBasicMaterial({
-          color: w.wearer_id === "wearer-b" ? 0x0ea5e9 : 0x6366f1,
-        })
-      );
-      base.position.set(w.position[0], 0.45, w.position[2]);
-      dynamicGroup.add(base);
+    // Subtle target ring at center where 360° surround object sits
+    const ringGeom = new THREE.RingGeometry(0.38, 0.4, 48);
+    ringGeom.rotateX(-Math.PI / 2);
+    const ringMat = new THREE.MeshBasicMaterial({
+      color: 0x38bdf8,
+      side: THREE.DoubleSide,
+      transparent: true,
+      opacity: 0.35,
     });
+    const ring = new THREE.Mesh(ringGeom, ringMat);
+    ring.position.set(0, 0.01, 0);
+    scene.add(ring);
 
-    // Time-travel selection: either live objects or historical snapshot
-    const activeObjects =
-      snapshotIdx >= 0 && world.snapshots[snapshotIdx]
-        ? world.snapshots[snapshotIdx].objects
-        : world.objects;
+    const pointsGroup = new THREE.Group();
+    const frustumsGroup = new THREE.Group();
+    scene.add(pointsGroup);
+    scene.add(frustumsGroup);
 
-    activeObjects.forEach((o) => {
-      const box = new THREE.Mesh(
-        new THREE.BoxGeometry(0.32, 0.32, 0.32),
-        new THREE.MeshBasicMaterial({ color: 0x22c55e })
-      );
-      box.position.set(o.position[0], o.position[1] || 0.3, o.position[2]);
-      dynamicGroup.add(box);
-    });
-
-    // Spatial Pins & Friend's World
-    world.pins.forEach((p) => {
-      const color =
-        p.pin_type === "warning"
-          ? 0xef4444
-          : p.pin_type === "friend_memory"
-          ? 0xa855f7
-          : 0xfacc15;
-      const sphere = new THREE.Mesh(
-        new THREE.SphereGeometry(0.2, 16, 16),
-        new THREE.MeshBasicMaterial({ color })
-      );
-      sphere.position.set(p.position[0], (p.position[1] || 0.8) + 0.35, p.position[2]);
-      dynamicGroup.add(sphere);
-    });
-
-    // Ctrl+F Turn-by-Turn Navigation Line
-    if (ctrlFResult?.found && ctrlFResult.path?.length === 2) {
-      const [start, end] = ctrlFResult.path;
-      const lineGeom = new THREE.BufferGeometry().setFromPoints([
-        new THREE.Vector3(start[0], 0.35, start[2]),
-        new THREE.Vector3(end[0], 0.55, end[2]),
-      ]);
-      const lineMat = new THREE.LineDashedMaterial({
-        color: 0x4ade80,
-        dashSize: 0.25,
-        gapSize: 0.12,
-      });
-      const line = new THREE.Line(lineGeom, lineMat);
-      line.computeLineDistances();
-      dynamicGroup.add(line);
-    }
-
-    // git diff Displacement Vectors
-    if (showDiffOverlay && world.diff) {
-      (world.diff.moved || []).forEach((m) => {
-        const diffGeom = new THREE.BufferGeometry().setFromPoints([
-          new THREE.Vector3(m.from[0], m.from[1] || 0.5, m.from[2]),
-          new THREE.Vector3(m.to[0], m.to[1] || 0.5, m.to[2]),
-        ]);
-        const diffLine = new THREE.Line(
-          diffGeom,
-          new THREE.LineBasicMaterial({ color: 0xfacc15 })
-        );
-        dynamicGroup.add(diffLine);
-
-        const ghost = new THREE.Mesh(
-          new THREE.BoxGeometry(0.3, 0.3, 0.3),
-          new THREE.MeshBasicMaterial({ color: 0xfacc15, wireframe: true })
-        );
-        ghost.position.set(m.from[0], m.from[1] || 0.5, m.from[2]);
-        dynamicGroup.add(ghost);
-      });
-
-      (world.diff.removed || []).forEach((r) => {
-        const missing = new THREE.Mesh(
-          new THREE.BoxGeometry(0.34, 0.34, 0.34),
-          new THREE.MeshBasicMaterial({ color: 0xef4444, wireframe: true })
-        );
-        missing.position.set(r.position[0], r.position[1] || 0.5, r.position[2]);
-        dynamicGroup.add(missing);
-      });
-    }
+    threeRef.current = { scene, camera, renderer, controls, pointsGroup, frustumsGroup };
 
     let animId;
-    let angle = 0.2;
     const animate = () => {
       animId = requestAnimationFrame(animate);
-      angle += 0.0018;
-      camera.position.x = Math.sin(angle) * 9.5;
-      camera.position.z = Math.cos(angle) * 9.5;
-      camera.lookAt(0, 0.6, 0);
+      controls.update();
       renderer.render(scene, camera);
     };
     animate();
@@ -236,340 +173,604 @@ export default function App() {
     return () => {
       window.removeEventListener("resize", handleResize);
       cancelAnimationFrame(animId);
+      controls.dispose();
       renderer.dispose();
+      threeRef.current = null;
     };
-  }, [world, points, ctrlFResult, showDiffOverlay, snapshotIdx]);
+  }, []);
 
-  const speakText = async (text) => {
-    try {
-      const res = await fetch(`${API_BASE}/api/tts`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ text }),
+  useEffect(() => {
+    if (threeRef.current?.controls) {
+      threeRef.current.controls.autoRotate = autoOrbit;
+      threeRef.current.controls.autoRotateSpeed = 1.6;
+    }
+  }, [autoOrbit]);
+
+  // 2. Update 3D Point Cloud & Camera Frustums
+  useEffect(() => {
+    const ctx3d = threeRef.current;
+    if (!ctx3d) return;
+    const { pointsGroup, frustumsGroup } = ctx3d;
+
+    pointsGroup.clear();
+    frustumsGroup.clear();
+
+    if (showPointCloud && points.length > 0) {
+      const positions = new Float32Array(points.length * 3);
+      const colors = new Float32Array(points.length * 3);
+      points.forEach((pt, idx) => {
+        positions[idx * 3] = pt[0];
+        positions[idx * 3 + 1] = pt[1];
+        positions[idx * 3 + 2] = pt[2];
+        colors[idx * 3] = pt[3] ?? 0.7;
+        colors[idx * 3 + 1] = pt[4] ?? 0.8;
+        colors[idx * 3 + 2] = pt[5] ?? 0.9;
       });
-      const data = await res.json();
-      setTtsStatus(`Voice: ${data.provider}`);
-      if (!data.fallback_tts && data.audio_b64) {
-        const audio = new Audio(`data:${data.mime_type};base64,${data.audio_b64}`);
-        audio.play().catch(() => {});
-      } else if ("speechSynthesis" in window) {
-        const u = new SpeechSynthesisUtterance(text);
-        window.speechSynthesis.speak(u);
-      }
-    } catch {
-      // ignore TTS error
+      const pcGeom = new THREE.BufferGeometry();
+      pcGeom.setAttribute("position", new THREE.BufferAttribute(positions, 3));
+      pcGeom.setAttribute("color", new THREE.BufferAttribute(colors, 3));
+      const pcMat = new THREE.PointsMaterial({
+        size: splatSize,
+        vertexColors: true,
+        sizeAttenuation: true,
+        map: getGaussianSplatTexture(),
+        alphaTest: 0.12,
+        transparent: true,
+      });
+      pointsGroup.add(new THREE.Points(pcGeom, pcMat));
     }
-  };
 
-  const handleCtrlF = async () => {
-    if (!query.trim()) return;
-    const res = await fetch(`${API_BASE}/api/ctrl-f`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ wearer_id: "wearer-b", query }),
-    });
-    const data = await res.json();
-    setCtrlFResult(data);
-    if (data.directions || data.message) {
-      speakText(data.directions || data.message);
+    if (showFrustums && keyframes.length > 0) {
+      keyframes.forEach((kf, i) => {
+        const isLatest = i === keyframes.length - 1;
+        const cone = new THREE.Mesh(
+          new THREE.ConeGeometry(isLatest ? 0.11 : 0.07, isLatest ? 0.24 : 0.16, 4),
+          new THREE.MeshBasicMaterial({
+            color: isLatest ? 0x22c55e : 0x38bdf8,
+            wireframe: true,
+          })
+        );
+        const [px, py, pz] = kf.pose || [0, 0.8, 1.2];
+        cone.position.set(px, py, pz);
+        cone.lookAt(0, 0.48, 0);
+        cone.rotateX(Math.PI / 2);
+        frustumsGroup.add(cone);
+      });
     }
-  };
-
-  const handleSnapshot = async () => {
-    await fetch(`${API_BASE}/api/snapshot?label=pass-${world.snapshots.length + 1}`, {
-      method: "POST",
-    });
-    setSnapshotIdx(-1);
-  };
-
-  const handleCtrlZ = async () => {
-    const res = await fetch(`${API_BASE}/api/ctrl-z`, { method: "POST" });
-    const data = await res.json();
-    const steps = data.undo_steps || [];
-    setUndoSteps(steps);
-    if (steps.length > 0) {
-      speakText(steps.join(" "));
-    }
-  };
-
-  const handleDropPin = async () => {
-    if (!pinText.trim()) return;
-    await fetch(`${API_BASE}/api/pin`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        id: `pin-${Date.now()}`,
-        author: pinType === "friend_memory" ? "Sam" : "Conor",
-        text: pinText,
-        pin_type: pinType,
-        position: [Math.random() * 4 - 2, 1.0, Math.random() * 4 - 2],
-        landmark: "Workbench",
-        created_at: Date.now() / 1000,
-        age_label: pinType === "friend_memory" ? "2 years ago" : "just now",
-      }),
-    });
-    setPinText("");
-  };
+  }, [points, keyframes, splatSize, showFrustums, showPointCloud]);
 
   const startWebcam = async () => {
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({ video: true });
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: { facingMode: { ideal: "environment" }, width: { ideal: 640 }, height: { ideal: 480 } },
+      });
       if (videoRef.current) {
         videoRef.current.srcObject = stream;
+        await videoRef.current.play().catch(() => {});
       }
       setCameraActive(true);
-      setCaptureStatus("Webcam POV live");
+      setStatusText("Live Camera + Gyro active — walk/orbit slowly around object");
     } catch {
-      setCaptureStatus("Webcam unavailable — use Synthetic POV Capture below");
+      setStatusText("Tap 'Start Camera' to grant permission");
     }
   };
 
-  const captureAndAnalyze = async () => {
-    let imageB64 = "";
-    if (cameraActive && videoRef.current && canvasRef.current) {
-      const ctx = canvasRef.current.getContext("2d");
-      canvasRef.current.width = 320;
-      canvasRef.current.height = 240;
-      ctx.drawImage(videoRef.current, 0, 0, 320, 240);
-      imageB64 = canvasRef.current.toDataURL("image/jpeg", 0.7);
+  useEffect(() => {
+    if (!IS_PHONE_SCANNER) return;
+    startWebcam();
+    setGyroActive(true);
+    setAutoScan(true);
+  }, []);
+
+  useEffect(() => {
+    if (!gyroActive) return undefined;
+    const onOrient = (e) => {
+      if (typeof e.alpha !== "number") return;
+
+      // Compensate for Android Euler gimbal flip when phone is held near-vertical (beta > 90)
+      let rawAlpha = e.alpha;
+      if (typeof e.beta === "number" && (e.beta > 95 || e.beta < -95)) {
+        rawAlpha = (rawAlpha + 180) % 360;
+      }
+
+      if (baseAlphaRef.current === null) {
+        baseAlphaRef.current = rawAlpha;
+      }
+
+      // Relative angle from starting orientation in [-180, 180], smoothed on the unit circle
+      const relDeg = ((rawAlpha - baseAlphaRef.current + 540) % 360) - 180;
+      const rad = (relDeg * Math.PI) / 180;
+      smoothVecRef.current.sin = smoothVecRef.current.sin * 0.75 + Math.sin(rad) * 0.25;
+      smoothVecRef.current.cos = smoothVecRef.current.cos * 0.75 + Math.cos(rad) * 0.25;
+      const smoothDeg = Math.round(
+        (Math.atan2(smoothVecRef.current.sin, smoothVecRef.current.cos) * 180) / Math.PI
+      );
+      setScanYaw(smoothDeg);
+
+      if (typeof e.beta === "number") {
+        const clampedBeta = Math.max(20, Math.min(90, e.beta));
+        const pitch = Math.max(5, Math.min(35, Math.round(80 - clampedBeta)));
+        setScanPitch(pitch);
+      }
+    };
+    // Listen ONLY to deviceorientation (attaching both deviceorientation and
+    // deviceorientationabsolute causes alternating positive/negative jumps!)
+    window.addEventListener("deviceorientation", onOrient);
+    return () => {
+      window.removeEventListener("deviceorientation", onOrient);
+    };
+  }, [gyroActive]);
+
+  const captureKeyframe = async () => {
+    if (scanBusyRef.current || !canvasRef.current) return;
+    if (!cameraActive || !videoRef.current || videoRef.current.readyState < 2) return;
+
+    scanBusyRef.current = true;
+    const {
+      scanYaw: curYaw,
+      scanPitch: curPitch,
+      scanMode: curMode,
+      bgCutoff: curCutoff,
+      gyroActive: curGyro,
+    } = scanParamsRef.current;
+
+    try {
+      drawImageToCanvas(videoRef.current, canvasRef.current, 320, 240);
+      const imageB64 = canvasRef.current.toDataURL("image/jpeg", 0.8);
+
+      const res = await fetch(`${API_BASE}/api/analyze-frame`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          wearer_id: "wearer-b",
+          image_b64: imageB64,
+          yaw: curYaw,
+          pitch: curPitch,
+          scan_mode: curMode,
+          bg_cutoff: curCutoff,
+          skip_ai: true,
+        }),
+      });
+      const data = await res.json();
+      if (data.depth_preview_b64) {
+        setDepthPreviewB64(data.depth_preview_b64);
+      }
+      if (Array.isArray(data.keyframes)) {
+        setKeyframes(data.keyframes);
+      }
+      if (!curGyro && typeof data.yaw === "number") {
+        setScanYaw(Math.round(data.yaw));
+      }
+      if (data.added_points > 0) {
+        setStatusText(
+          `✓ Keyframe #${data.keyframe_count} @ ${Math.round(data.yaw ?? curYaw)}° | Total: ${data.total_points.toLocaleString()} pts`
+        );
+        await refreshPoints();
+      } else {
+        setStatusText(
+          `Frame #${data.keyframe_count || keyframes.length} processed — keep orbiting around the object`
+        );
+      }
+    } catch {
+      setStatusText("Frame sync busy — retrying...");
+    } finally {
+      scanBusyRef.current = false;
     }
-    setCaptureStatus("Sending frame to Modal GPU + Gemini...");
-    const res = await fetch(`${API_BASE}/api/analyze-frame`, {
+  };
+
+  useEffect(() => {
+    if (!autoScan || !cameraActive) return undefined;
+    captureKeyframe();
+    const id = setInterval(() => {
+      captureKeyframe();
+    }, 900);
+    return () => clearInterval(id);
+  }, [autoScan, cameraActive]);
+
+  const clearScan = async () => {
+    baseAlphaRef.current = null;
+    smoothVecRef.current = { sin: 0, cos: 1 };
+    setScanYaw(0);
+    await fetch(`${API_BASE}/api/reset-cloud`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ wearer_id: "wearer-b", image_b64: imageB64 }),
+      body: JSON.stringify({ empty: true }),
     });
-    const data = await res.json();
-    setCaptureStatus(
-      `Indexed ${data.detected_objects?.length || 0} objects (${data.ai_provider}) & +${data.added_points} pts (${data.modal_provider})`
-    );
-    await refreshPoints();
+    setKeyframes([]);
+    setPoints([]);
+    setStatusText("Cleared 3D map & zeroed angle to 0° — ready for fresh 360° scan");
   };
 
-  const aiven = world.tech_stack_status?.aiven;
-  const ai = world.tech_stack_status?.ai;
+  const loadVggtModel = async () => {
+    const res = await fetch(`${API_BASE}/api/load-vggt-model`, { method: "POST" });
+    const data = await res.json();
+    if (!data.ok) {
+      setStatusText(data.error || "VGGT walk-around cloud not generated yet");
+      return;
+    }
+    if (Array.isArray(data.keyframes)) setKeyframes(data.keyframes);
+    await refreshPoints();
+    setShowPointCloud(true);
+    setStatusText(`Loaded VGGT-1B walk-around 3D cloud (${data.point_count?.toLocaleString()} pts in ${data.elapsed_s}s on ${data.device})`);
+  };
 
-  return (
-    <div style={{ display: "flex", flexDirection: "column", height: "100vh", width: "100vw" }}>
-      {/* Top Tech Challenge Status Bar */}
-      <header
+  const uploadWalkthroughVideo = async (e) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    setStatusText(`Running incremental VGGT-1B on ${file.name} (RTX 5060)...`);
+    const buf = await file.arrayBuffer();
+    const res = await fetch(`${API_BASE}/api/reconstruct-video-bytes`, {
+      method: "POST",
+      headers: { "Content-Type": "application/octet-stream" },
+      body: buf,
+    });
+    const data = await res.json();
+    if (data.ok) {
+      if (Array.isArray(data.keyframes)) setKeyframes(data.keyframes);
+      await refreshPoints();
+      setShowPointCloud(true);
+      setStatusText(`Reconstructed ${file.name} via VGGT-1B: ${data.point_count?.toLocaleString()} pts in ${data.elapsed_s}s`);
+    } else {
+      setStatusText(data.error || "VGGT reconstruction failed");
+    }
+    e.target.value = "";
+  };
+
+  // ============================================================================
+  // PHONE UI (?mode=scan) — Simplified 360° Surround Scanner
+  // ============================================================================
+  if (IS_PHONE_SCANNER) {
+    return (
+      <div
         style={{
+          minHeight: "100vh",
+          background: "#020617",
+          color: "#f8fafc",
+          padding: 14,
           display: "flex",
-          justifyContent: "space-between",
-          alignItems: "center",
-          padding: "8px 16px",
-          background: "#0f172a",
-          borderBottom: "1px solid #1e293b",
-          fontSize: 12,
+          flexDirection: "column",
+          gap: 12,
+          fontFamily: "system-ui, sans-serif",
         }}
       >
-        <div style={{ fontWeight: 700, fontSize: 15 }}>
-          WorldGit — Version Control for Reality
-        </div>
-        <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
-          <span style={{ background: "#1e293b", padding: "3px 8px", borderRadius: 4 }}>
-            Meta Display HUD: :4173
-          </span>
-          <span style={{ background: "#1e293b", padding: "3px 8px", borderRadius: 4 }}>
-            Gemini: {ai?.gemini ? "Live Key" : "Sim Fallback"}
-          </span>
-          <span style={{ background: "#1e293b", padding: "3px 8px", borderRadius: 4 }}>
-            Modal GPU: {ai?.modal_url === "stub-local-ready" ? "Local/Deployable" : "Live L4"}
-          </span>
-          <span style={{ background: "#1e293b", padding: "3px 8px", borderRadius: 4 }}>
-            ElevenLabs: {ai?.elevenlabs ? "Live TTS" : "WebSpeech Fallback"}
-          </span>
-          <span style={{ background: "#1e293b", padding: "3px 8px", borderRadius: 4 }}>
-            Aiven DB: {aiven?.backend || "connecting..."} ({aiven?.rows?.spatial_objects || 0} objs)
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+          <strong style={{ fontSize: 17 }}>360° 3D Scanner</strong>
+          <span style={{ fontSize: 13, color: "#38bdf8", fontWeight: 600 }}>
+            {keyframes.length} frames • {points.length.toLocaleString()} pts
           </span>
         </div>
-      </header>
 
-      <div style={{ display: "flex", flex: 1, minHeight: 0 }}>
-        {/* Left 3D Spatial Viewport */}
-        <div style={{ flex: 1, position: "relative" }}>
-          <div ref={mountRef} style={{ width: "100%", height: "100%" }} />
+        {/* Live Camera + Neural Depth-Anything-V2 PiP */}
+        <div
+          style={{
+            position: "relative",
+            borderRadius: 12,
+            overflow: "hidden",
+            background: "#0f172a",
+            height: 320,
+            border: autoScan ? "2px solid #22c55e" : "2px solid #334155",
+          }}
+        >
+          <video
+            ref={videoRef}
+            autoPlay
+            muted
+            playsInline
+            style={{ width: "100%", height: "100%", objectFit: "cover", display: "block" }}
+          />
+          {/* Target guide reticle for centering the object */}
           <div
             style={{
               position: "absolute",
-              bottom: 14,
-              left: 14,
-              background: "rgba(15,23,42,0.85)",
-              padding: "8px 12px",
-              borderRadius: 8,
+              inset: "18% 20%",
+              border: "1px dashed rgba(56,189,248,0.65)",
+              borderRadius: 16,
+              pointerEvents: "none",
+            }}
+          />
+          {depthPreviewB64 && (
+            <img
+              src={depthPreviewB64}
+              alt="Depth Map"
+              style={{
+                position: "absolute",
+                bottom: 10,
+                right: 10,
+                width: 112,
+                height: 84,
+                borderRadius: 8,
+                border: "1px solid #38bdf8",
+                objectFit: "cover",
+              }}
+            />
+          )}
+          <div
+            style={{
+              position: "absolute",
+              top: 10,
+              left: 10,
+              background: "rgba(2,6,23,0.82)",
+              padding: "5px 10px",
+              borderRadius: 6,
               fontSize: 12,
-              border: "1px solid #334155",
+              color: "#38bdf8",
             }}
           >
-            <div>
-              Points: <b>{points.length}</b> | Wearers: <b>{world.wearers.length}</b> | Objects:{" "}
-              <b>{world.objects.length}</b> | Pins: <b>{world.pins.length}</b>
+            Angle: <b>{scanYaw}°</b> | Tilt: <b>{scanPitch}°</b>
+          </div>
+        </div>
+        <canvas ref={canvasRef} style={{ display: "none" }} />
+
+        {/* 3 Big Primary Controls */}
+        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
+          <button
+            onClick={() => setAutoScan((v) => !v)}
+            style={{
+              padding: 14,
+              fontSize: 15,
+              fontWeight: 700,
+              borderRadius: 10,
+              background: autoScan ? "#16a34a" : "#1e293b",
+              color: "#fff",
+              border: "none",
+            }}
+          >
+            {autoScan ? "● Auto-Scan: ON" : "Auto-Scan: PAUSED"}
+          </button>
+          <button
+            onClick={captureKeyframe}
+            style={{
+              padding: 14,
+              fontSize: 15,
+              fontWeight: 700,
+              borderRadius: 10,
+              background: "#0284c7",
+              color: "#fff",
+              border: "none",
+            }}
+          >
+            Snap Frame Now
+          </button>
+        </div>
+
+        {/* Mode + Background Cutoff + Manual Angle Fallback */}
+        <div style={{ background: "#0f172a", padding: 12, borderRadius: 10, fontSize: 13 }}>
+          <div style={{ display: "flex", gap: 8, marginBottom: 10 }}>
+            <button
+              onClick={() => setScanMode("surround")}
+              style={{
+                flex: 1,
+                padding: 9,
+                borderRadius: 8,
+                border: scanMode === "surround" ? "1px solid #38bdf8" : "1px solid #334155",
+                background: scanMode === "surround" ? "#0c4a6e" : "#1e293b",
+                color: "#fff",
+                fontWeight: 600,
+              }}
+            >
+              360° Object Surround
+            </button>
+            <button
+              onClick={() => setScanMode("room")}
+              style={{
+                flex: 1,
+                padding: 9,
+                borderRadius: 8,
+                border: scanMode === "room" ? "1px solid #38bdf8" : "1px solid #334155",
+                background: scanMode === "room" ? "#0c4a6e" : "#1e293b",
+                color: "#fff",
+                fontWeight: 600,
+              }}
+            >
+              Outward Room Scan
+            </button>
+          </div>
+
+          <div style={{ marginBottom: 8 }}>
+            <div style={{ display: "flex", justifyContent: "space-between", fontSize: 12, color: "#cbd5e1" }}>
+              <span>Background Wall Cutoff (Isolate Object):</span>
+              <b>{Math.round(bgCutoff * 100)}%</b>
             </div>
-            <div style={{ color: "#94a3b8", marginTop: 4 }}>
-              Blue Cones = Wearers | Green Cubes = Objects | Red/Yellow/Purple Spheres = Pins & Friend's World | Yellow Wireframe = git diff
+            <input
+              type="range"
+              min={0.0}
+              max={0.45}
+              step={0.02}
+              value={bgCutoff}
+              onChange={(e) => setBgCutoff(Number(e.target.value))}
+              style={{ width: "100%" }}
+            />
+          </div>
+
+          <div>
+            <div style={{ display: "flex", justifyContent: "space-between", fontSize: 12, color: "#cbd5e1" }}>
+              <span>Orbit Angle ({gyroActive ? "Gyro Auto" : "Manual Slider"}): {scanYaw}°</span>
+              <button
+                onClick={() => setGyroActive((v) => !v)}
+                style={{ fontSize: 11, padding: "2px 8px", borderRadius: 4 }}
+              >
+                {gyroActive ? "Use Slider" : "Use Gyro"}
+              </button>
             </div>
+            <input
+              type="range"
+              min={-180}
+              max={180}
+              value={scanYaw}
+              onChange={(e) => {
+                setGyroActive(false);
+                setScanYaw(Number(e.target.value));
+              }}
+              style={{ width: "100%" }}
+            />
           </div>
         </div>
 
-        {/* Right Controls */}
-        <aside
-          style={{
-            width: 390,
-            background: "#111827",
-            borderLeft: "1px solid #1f2937",
-            padding: 14,
-            overflowY: "auto",
-            display: "flex",
-            flexDirection: "column",
-            gap: 12,
-          }}
-        >
-          {/* Ctrl+F Search */}
-          <section style={{ background: "#1e293b", padding: 12, borderRadius: 8 }}>
-            <h3 style={{ margin: "0 0 8px", fontSize: 14 }}>Ctrl+F Physical Search</h3>
-            <div style={{ display: "flex", gap: 6 }}>
-              <input
-                value={query}
-                onChange={(e) => setQuery(e.target.value)}
-                placeholder="e.g. drill, keys, socket..."
-                style={{ flex: 1, padding: 6, borderRadius: 4, border: "none" }}
-              />
-              <button onClick={handleCtrlF} style={{ padding: "6px 10px", cursor: "pointer" }}>
-                Find
-              </button>
-            </div>
-            {ctrlFResult && (
-              <p style={{ margin: "8px 0 0", fontSize: 12, color: "#38bdf8" }}>
-                {ctrlFResult.arrow ? `${ctrlFResult.arrow} ` : ""}
-                {ctrlFResult.directions || ctrlFResult.message}
-              </p>
-            )}
-            {ttsStatus && (
-              <p style={{ margin: "4px 0 0", fontSize: 11, color: "#94a3b8" }}>{ttsStatus}</p>
-            )}
-          </section>
+        <div style={{ display: "flex", gap: 10 }}>
+          <button
+            onClick={clearScan}
+            style={{
+              flex: 1,
+              padding: 12,
+              fontSize: 14,
+              fontWeight: 600,
+              borderRadius: 10,
+              background: "#dc2626",
+              color: "#fff",
+              border: "none",
+            }}
+          >
+            Clear / Reset 3D Map
+          </button>
+          {!cameraActive && (
+            <button onClick={startWebcam} style={{ flex: 1, padding: 12, borderRadius: 10 }}>
+              Start Camera
+            </button>
+          )}
+        </div>
 
-          {/* Spatial Pin & Friend's World */}
-          <section style={{ background: "#1e293b", padding: 12, borderRadius: 8 }}>
-            <h3 style={{ margin: "0 0 8px", fontSize: 14 }}>Spatial Pins & Friend's World</h3>
-            <select
-              value={pinType}
-              onChange={(e) => setPinType(e.target.value)}
-              style={{ width: "100%", padding: 6, marginBottom: 6 }}
-            >
-              <option value="warning">Team Warning (Auto-Whisper)</option>
-              <option value="note">Spatial Note</option>
-              <option value="friend_memory">Friend's World Memory</option>
-            </select>
-            <div style={{ display: "flex", gap: 6 }}>
-              <input
-                value={pinText}
-                onChange={(e) => setPinText(e.target.value)}
-                placeholder="Pin warning or friend memory..."
-                style={{ flex: 1, padding: 6, borderRadius: 4, border: "none" }}
-              />
-              <button onClick={handleDropPin} style={{ padding: "6px 10px", cursor: "pointer" }}>
-                Pin
-              </button>
-            </div>
-            <div style={{ marginTop: 8, maxHeight: 110, overflowY: "auto", fontSize: 11 }}>
-              {world.pins.map((p) => (
-                <div key={p.id} style={{ marginBottom: 4, color: "#cbd5e1" }}>
-                  <b
-                    style={{
-                      color:
-                        p.pin_type === "warning"
-                          ? "#f87171"
-                          : p.pin_type === "friend_memory"
-                          ? "#c084fc"
-                          : "#facc15",
-                    }}
-                  >
-                    [{p.pin_type}]
-                  </b>{" "}
-                  {p.author} ({p.age_label}): {p.text}
-                </div>
-              ))}
-            </div>
-          </section>
+        <p style={{ fontSize: 12, color: "#94a3b8", margin: 0 }}>{statusText}</p>
+      </div>
+    );
+  }
 
-          {/* git diff, Time Travel & Ctrl+Z */}
-          <section style={{ background: "#1e293b", padding: 12, borderRadius: 8 }}>
-            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-              <h3 style={{ margin: 0, fontSize: 14 }}>git diff & Ctrl+Z Undo</h3>
-              <label style={{ fontSize: 11 }}>
-                <input
-                  type="checkbox"
-                  checked={showDiffOverlay}
-                  onChange={(e) => setShowDiffOverlay(e.target.checked)}
-                />{" "}
-                Diff Overlay
-              </label>
-            </div>
-            <div style={{ marginTop: 8 }}>
-              <label style={{ fontSize: 11, color: "#94a3b8" }}>
-                Time Travel Snapshot:{" "}
-                {snapshotIdx === -1
-                  ? "Live (Latest)"
-                  : world.snapshots[snapshotIdx]?.label || "Snapshot"}
-              </label>
-              <input
-                type="range"
-                min={-1}
-                max={Math.max(0, world.snapshots.length - 1)}
-                value={snapshotIdx}
-                onChange={(e) => setSnapshotIdx(Number(e.target.value))}
-                style={{ width: "100%" }}
-              />
-            </div>
-            <div style={{ display: "flex", gap: 8, marginTop: 8 }}>
-              <button onClick={handleSnapshot} style={{ flex: 1, padding: 7, cursor: "pointer" }}>
-                Commit Snapshot
-              </button>
-              <button onClick={handleCtrlZ} style={{ flex: 1, padding: 7, cursor: "pointer" }}>
-                Ctrl+Z Undo
-              </button>
-            </div>
-            {undoSteps.length > 0 && (
-              <ul style={{ margin: "8px 0 0", paddingLeft: 18, fontSize: 12, color: "#facc15" }}>
-                {undoSteps.map((s, i) => (
-                  <li key={i}>{s}</li>
-                ))}
-              </ul>
-            )}
-          </section>
+  // ============================================================================
+  // LAPTOP UI (http://localhost:5173/) — Full-Screen 3D Reconstruction Studio
+  // ============================================================================
+  return (
+    <div style={{ position: "relative", width: "100vw", height: "100vh", overflow: "hidden", background: "#050811", color: "#f8fafc", fontFamily: "system-ui, sans-serif" }}>
+      {/* Full-Screen Three.js 3D Viewport */}
+      <div ref={mountRef} style={{ width: "100%", height: "100%" }} />
 
-          {/* Live POV Frame Capture -> Modal + Gemini */}
-          <section style={{ background: "#1e293b", padding: 12, borderRadius: 8 }}>
-            <h3 style={{ margin: "0 0 8px", fontSize: 14 }}>First-Person POV → Modal + Gemini</h3>
-            <video
-              ref={videoRef}
-              autoPlay
-              muted
-              playsInline
-              style={{
-                width: "100%",
-                height: cameraActive ? 110 : 0,
-                objectFit: "cover",
-                borderRadius: 6,
-                background: "#0f172a",
-              }}
-            />
-            <canvas ref={canvasRef} style={{ display: "none" }} />
-            <div style={{ display: "flex", gap: 6, marginTop: 6 }}>
-              <button onClick={startWebcam} style={{ flex: 1, padding: 6, cursor: "pointer" }}>
-                Start Webcam
-              </button>
-              <button
-                onClick={captureAndAnalyze}
-                style={{ flex: 1, padding: 6, cursor: "pointer" }}
-              >
-                Scan & Index Frame
-              </button>
-            </div>
-            <p style={{ margin: "6px 0 0", fontSize: 11, color: "#94a3b8" }}>{captureStatus}</p>
-          </section>
-        </aside>
+      {/* Minimal Top Telemetry Bar */}
+      <div
+        style={{
+          position: "absolute",
+          top: 16,
+          left: 16,
+          right: 16,
+          display: "flex",
+          justifyContent: "space-between",
+          alignItems: "center",
+          background: "rgba(15, 23, 42, 0.85)",
+          backdropFilter: "blur(8px)",
+          padding: "10px 18px",
+          borderRadius: 12,
+          border: "1px solid #1e293b",
+          pointerEvents: "auto",
+        }}
+      >
+        <div style={{ display: "flex", alignItems: "center", gap: 14 }}>
+          <strong style={{ fontSize: 16 }}>WorldGit 3D Reconstruction Studio</strong>
+          <span style={{ fontSize: 13, color: "#38bdf8", background: "#0f172a", padding: "4px 10px", borderRadius: 6 }}>
+            Keyframes: <b>{keyframes.length}</b>
+          </span>
+          <span style={{ fontSize: 13, color: "#4ade80", background: "#0f172a", padding: "4px 10px", borderRadius: 6 }}>
+            3D Points: <b>{points.length.toLocaleString()}</b>
+          </span>
+        </div>
+        <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+          <button
+            onClick={loadVggtModel}
+            style={{
+              padding: "7px 14px",
+              borderRadius: 8,
+              background: "#7c3aed",
+              color: "#fff",
+              border: "none",
+              fontWeight: 600,
+              cursor: "pointer",
+            }}
+          >
+            Load VGGT Walk-Around
+          </button>
+          <label
+            style={{
+              padding: "7px 14px",
+              borderRadius: 8,
+              background: "#4f46e5",
+              color: "#fff",
+              fontWeight: 600,
+              fontSize: 13,
+              cursor: "pointer",
+            }}
+          >
+            Upload .MP4 (VGGT)
+            <input type="file" accept="video/*" onChange={uploadWalkthroughVideo} style={{ display: "none" }} />
+          </label>
+          <button
+            onClick={clearScan}
+            style={{
+              padding: "7px 14px",
+              borderRadius: 8,
+              background: "#dc2626",
+              color: "#fff",
+              border: "none",
+              fontWeight: 600,
+              cursor: "pointer",
+            }}
+          >
+            Clear / Reset 3D Map
+          </button>
+        </div>
+      </div>
+
+      {/* Minimal Bottom View Controls */}
+      <div
+        style={{
+          position: "absolute",
+          bottom: 16,
+          left: 16,
+          background: "rgba(15, 23, 42, 0.88)",
+          backdropFilter: "blur(8px)",
+          padding: "10px 16px",
+          borderRadius: 12,
+          border: "1px solid #1e293b",
+          display: "flex",
+          alignItems: "center",
+          gap: 18,
+          fontSize: 13,
+        }}
+      >
+        <label style={{ display: "flex", alignItems: "center", gap: 6, cursor: "pointer" }}>
+          <input
+            type="checkbox"
+            checked={showPointCloud}
+            onChange={(e) => setShowPointCloud(e.target.checked)}
+          />
+          3D Point Cloud ({points.length.toLocaleString()})
+        </label>
+        <label style={{ display: "flex", alignItems: "center", gap: 8 }}>
+          Point Size:
+          <input
+            type="range"
+            min={0.008}
+            max={0.08}
+            step={0.002}
+            value={splatSize}
+            onChange={(e) => setSplatSize(Number(e.target.value))}
+            style={{ width: 95 }}
+          />
+        </label>
+        <label style={{ display: "flex", alignItems: "center", gap: 6, cursor: "pointer" }}>
+          <input
+            type="checkbox"
+            checked={showFrustums}
+            onChange={(e) => setShowFrustums(e.target.checked)}
+          />
+          Show 360° Camera Ring
+        </label>
+        <label style={{ display: "flex", alignItems: "center", gap: 6, cursor: "pointer" }}>
+          <input
+            type="checkbox"
+            checked={autoOrbit}
+            onChange={(e) => setAutoOrbit(e.target.checked)}
+          />
+          Auto-Turntable 3D View
+        </label>
+        <span style={{ color: "#94a3b8", fontSize: 12 }}>
+          Left-Drag: Orbit • Right-Drag: Pan • Scroll: Zoom
+        </span>
       </div>
     </div>
   );

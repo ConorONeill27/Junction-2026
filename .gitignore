@@ -1,8 +1,11 @@
 # Dependencies
 node_modules/
 .venv/
+.venv*/
 venv/
 ENV/
+backend/moge_repo/
+backend/vggt_repo/
 
 # Python bytecode & caches
 __pycache__/

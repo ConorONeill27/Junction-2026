@@ -2,6 +2,7 @@
 WorldGit Spatial Hub — FastAPI + WebSocket backend for multi-wearer 3D memory,
 Ctrl+F search, Spatial Triggers & Friend's World, Reality git diff, and Ctrl+Z undo.
 """
+import asyncio
 import json
 import math
 import os
@@ -11,9 +12,12 @@ from typing import Any, Dict, List, Optional
 
 import httpx
 from dotenv import load_dotenv
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
+from pathlib import Path
 from pydantic import BaseModel
+import tempfile
 
 from ai_services import (
     ai_status,
@@ -22,6 +26,7 @@ from ai_services import (
     synthesize_elevenlabs_tts,
 )
 from db import SpatialDatabase
+from reconstruction import reconstructor
 
 load_dotenv()
 
@@ -320,6 +325,7 @@ class WorldState:
             "snapshots": [s.model_dump() for s in self.snapshots],
             "diff": self.compute_diff(),
             "point_count": len(self.points),
+            "keyframes": reconstructor.keyframes[-36:],
             "tech_stack_status": {
                 "aiven": self.db.status(),
                 "ai": ai_status(),
@@ -329,6 +335,27 @@ class WorldState:
 
 db = SpatialDatabase()
 world = WorldState(db=db)
+world.objects.clear()
+
+_STATIC_DIR = Path(__file__).resolve().parent / "static"
+
+
+def _load_oj_carton_into_world() -> int:
+    pts_file = _STATIC_DIR / "oj_carton_points.json"
+    if pts_file.exists():
+        try:
+            with open(pts_file, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            world.points = data.get("points", [])
+            reconstructor.keyframes = data.get("keyframes", [])
+            return len(world.points)
+        except Exception:
+            pass
+    world.points = []
+    return 0
+
+
+_load_oj_carton_into_world()
 
 
 async def broadcast_state() -> None:
@@ -397,9 +424,153 @@ async def get_state() -> Dict[str, Any]:
     return world.serialize_state()
 
 
+def _merge_points_voxel(
+    existing: List[List[float]],
+    incoming: List[List[float]],
+    voxel_size: float = 0.025,
+    max_points: int = 60000,
+) -> List[List[float]]:
+    """Merge 3D RGB points on a spatial voxel grid so repeated scans stay crisp and bounded."""
+    grid: Dict[tuple, List[float]] = {}
+    for pt in existing:
+        if len(pt) < 6:
+            continue
+        key = (round(pt[0] / voxel_size), round(pt[1] / voxel_size), round(pt[2] / voxel_size))
+        grid[key] = pt
+    for pt in incoming:
+        if len(pt) < 6:
+            continue
+        key = (round(pt[0] / voxel_size), round(pt[1] / voxel_size), round(pt[2] / voxel_size))
+        grid[key] = [
+            round(float(pt[0]), 3),
+            round(float(pt[1]), 3),
+            round(float(pt[2]), 3),
+            round(float(pt[3]), 2),
+            round(float(pt[4]), 2),
+            round(float(pt[5]), 2),
+        ]
+    merged = list(grid.values())
+    if len(merged) > max_points:
+        merged = merged[-max_points:]
+    return merged
+
+
 @app.get("/api/points")
 async def get_points() -> Dict[str, Any]:
     return {"point_count": len(world.points), "points": world.points}
+
+
+class ResetCloudRequest(BaseModel):
+    empty: bool = True
+
+
+@app.post("/api/reset-cloud")
+async def reset_cloud(req: ResetCloudRequest) -> Dict[str, Any]:
+    reconstructor.reset()
+    if req.empty:
+        world.points = []
+        world.objects.clear()
+    else:
+        _load_oj_carton_into_world()
+    await broadcast_state()
+    return {"point_count": len(world.points), "empty": req.empty}
+
+
+@app.post("/api/load-oj-model")
+async def load_oj_model() -> Dict[str, Any]:
+    count = _load_oj_carton_into_world()
+    await broadcast_state()
+    return {
+        "ok": True,
+        "point_count": count,
+        "keyframes": reconstructor.keyframes,
+        "glb_url": "/api/model.glb",
+    }
+
+
+@app.post("/api/load-vggt-model")
+async def load_vggt_model() -> Dict[str, Any]:
+    vggt_file = _STATIC_DIR / "vggt_walkthrough_points.json"
+    if not vggt_file.exists():
+        return {"ok": False, "error": "No VGGT walkthrough point cloud generated yet"}
+    with open(vggt_file, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    world.points = data.get("points", [])
+    reconstructor.keyframes = data.get("keyframes", [])
+    await broadcast_state()
+    return {
+        "ok": True,
+        "point_count": len(world.points),
+        "keyframes": reconstructor.keyframes,
+        "elapsed_s": data.get("elapsed_s"),
+        "device": data.get("device"),
+    }
+
+
+_vggt_runner = None
+
+
+def _get_vggt_runner():
+    global _vggt_runner
+    if _vggt_runner is None:
+        from walkthrough_vggt import IncrementalVGGTReconstructor
+        _vggt_runner = IncrementalVGGTReconstructor()
+    return _vggt_runner
+
+
+@app.post("/api/reconstruct-video-bytes")
+async def reconstruct_video_bytes(request: Request) -> Dict[str, Any]:
+    """Reconstructs any uploaded .mp4 walkthrough video incrementally via VGGT-1B."""
+    raw_bytes = await request.body()
+    if not raw_bytes:
+        return {"ok": False, "error": "Empty video upload"}
+
+    with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tf:
+        tf.write(raw_bytes)
+        tmp_vid = tf.name
+
+    try:
+        out_json = _STATIC_DIR / "vggt_walkthrough_points.json"
+        runner = _get_vggt_runner()
+        payload = await asyncio.to_thread(
+            runner.reconstruct_video_incremental,
+            tmp_vid,
+            out_json,
+            12,
+            3,
+            21,
+        )
+        world.points = payload.get("points", [])
+        reconstructor.keyframes = payload.get("keyframes", [])
+        await broadcast_state()
+        return {
+            "ok": True,
+            "point_count": len(world.points),
+            "keyframes": reconstructor.keyframes,
+            "elapsed_s": payload.get("elapsed_s"),
+            "device": payload.get("device"),
+        }
+    finally:
+        if os.path.exists(tmp_vid):
+            os.remove(tmp_vid)
+
+
+@app.get("/api/model.glb")
+async def get_model_glb() -> FileResponse:
+    return FileResponse(
+        path=str(_STATIC_DIR / "oj_carton.glb"),
+        media_type="model/gltf-binary",
+        filename="bonne_orange_juice_3d.glb",
+    )
+
+
+@app.get("/api/model.ply")
+async def get_model_ply() -> FileResponse:
+    return FileResponse(
+        path=str(_STATIC_DIR / "oj_carton.ply"),
+        media_type="application/octet-stream",
+        filename="bonne_orange_juice_3d.ply",
+    )
 
 
 @app.get("/api/aiven-status")
@@ -487,6 +658,12 @@ class FrameAnalysisRequest(BaseModel):
     image_b64: str = ""
     pose: Optional[List[float]] = None
     yaw: Optional[float] = None
+    pitch: Optional[float] = None
+    points: Optional[List[List[float]]] = None
+    replace_cloud: bool = False
+    skip_ai: bool = True
+    scan_mode: str = "surround"
+    bg_cutoff: float = 0.22
 
 
 @app.post("/api/analyze-frame")
@@ -495,11 +672,68 @@ async def analyze_frame(req: FrameAnalysisRequest) -> Dict[str, Any]:
     pose = req.pose or (wearer.position if wearer else [0.0, 1.5, 0.0])
     yaw = req.yaw if req.yaw is not None else (wearer.yaw if wearer else 0.0)
 
-    # 1. Optional Modal GPU 3D point-cloud reconstruction call
+    if wearer:
+        if req.pose is not None:
+            wearer.position = [round(float(v), 2) for v in req.pose[:3]]
+        if req.yaw is not None:
+            wearer.yaw = round(float(req.yaw), 1)
+        if req.pitch is not None:
+            wearer.pitch = round(float(req.pitch), 1)
+        wearer.last_seen = time.time()
+
+    if req.replace_cloud:
+        world.points = []
+        reconstructor.reset()
+
+    # 1. Pure 3D Surround / Room Reconstruction (Indexing disabled)
     modal_url = os.getenv("MODAL_RECONSTRUCT_URL")
     added_points = 0
     modal_provider = "local-synthetic-patch"
-    if modal_url and req.image_b64:
+    recon_meta: Dict[str, Any] = {}
+    created_objects: List[Dict[str, Any]] = []
+    now = time.time()
+
+    if req.image_b64:
+        recon_res = reconstructor.process_keyframe(
+            req.image_b64,
+            hint_pose=req.pose,
+            hint_yaw=req.yaw,
+            hint_pitch=req.pitch,
+            mode=req.scan_mode,
+            bg_cutoff=req.bg_cutoff,
+            run_detection=False,
+        )
+        if recon_res.get("ok"):
+            pts = recon_res.get("points", [])
+            if req.scan_mode == "surround":
+                world.points = reconstructor.carve_and_fuse_points(world.points, pts, voxel_size=0.016)
+            else:
+                world.points = _merge_points_voxel(world.points, pts, voxel_size=0.045)
+            added_points = len(pts)
+            modal_provider = recon_res.get("provider", "depth-anything-v2-surround")
+            pose = recon_res["pose"]
+            yaw = recon_res["yaw"]
+            if wearer:
+                wearer.position = pose
+                wearer.yaw = yaw
+                wearer.pitch = recon_res["pitch"]
+                wearer.last_seen = now
+            recon_meta = {
+                "pose": pose,
+                "yaw": yaw,
+                "pitch": recon_res["pitch"],
+                "inliers": recon_res.get("inliers", 0),
+                "keyframe_count": recon_res.get("keyframe_count", 0),
+                "keyframes": recon_res.get("keyframes", []),
+                "depth_preview_b64": recon_res.get("depth_preview_b64", ""),
+                "detections_3d": [],
+            }
+
+    if added_points == 0 and req.points:
+        world.points = _merge_points_voxel(world.points, req.points)
+        added_points = len(req.points)
+        modal_provider = "laptop-rgb-depth"
+    elif added_points == 0 and modal_url and req.image_b64:
         try:
             async with httpx.AsyncClient(timeout=15.0) as client:
                 r = await client.post(
@@ -509,29 +743,32 @@ async def analyze_frame(req: FrameAnalysisRequest) -> Dict[str, Any]:
                 if r.status_code == 200:
                     data = r.json()
                     pts = data.get("points", [])
-                    world.points.extend(pts)
+                    world.points = _merge_points_voxel(world.points, pts)
                     added_points = len(pts)
                     modal_provider = "modal-gpu-l4"
         except Exception:
             pass
 
-    if added_points == 0:
-        # Add a local depth-projected point patch directly ahead of the wearer
+    if added_points == 0 and not req.image_b64:
+        # Add a local depth-projected point patch only when synthetic POV (no camera image) is used
         rad = math.radians(yaw)
+        patch: List[List[float]] = []
         for dx_i in range(-3, 4):
             for dy_i in range(-2, 3):
                 dist = 1.8
                 xw = pose[0] + dx_i * 0.2 * math.cos(rad) + dist * math.sin(rad)
                 yw = max(0.2, pose[1] + dy_i * 0.2)
                 zw = pose[2] - dx_i * 0.2 * math.sin(rad) - dist * math.cos(rad)
-                world.points.append([round(xw, 2), round(yw, 2), round(zw, 2), 0.22, 0.74, 0.97])
-                added_points += 1
+                patch.append([round(xw, 2), round(yw, 2), round(zw, 2), 0.22, 0.74, 0.97])
+        world.points = _merge_points_voxel(world.points, patch)
+        added_points = len(patch)
 
-    # 2. Gemini semantic object indexing
-    analysis = await analyze_frame_with_gemini(req.image_b64, req.wearer_id, pose)
+    # 2. Optional Gemini semantic object indexing when live GEMINI_API_KEY is configured or no image_b64
+    if req.skip_ai or (req.image_b64 and not os.getenv("GEMINI_API_KEY")):
+        analysis = {"provider": modal_provider, "detections": []}
+    else:
+        analysis = await analyze_frame_with_gemini(req.image_b64, req.wearer_id, pose)
     rad = math.radians(yaw)
-    created_objects: List[Dict[str, Any]] = []
-    now = time.time()
 
     for det in analysis["detections"]:
         rx = float(det.get("rel_x", 0.0))
@@ -562,6 +799,7 @@ async def analyze_frame(req: FrameAnalysisRequest) -> Dict[str, Any]:
         "added_points": added_points,
         "detected_objects": created_objects,
         "total_points": len(world.points),
+        **recon_meta,
     }
 
 
