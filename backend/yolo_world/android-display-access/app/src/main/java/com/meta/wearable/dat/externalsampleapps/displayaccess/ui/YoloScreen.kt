@@ -11,6 +11,8 @@ import androidx.compose.foundation.layout.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
@@ -55,7 +57,6 @@ fun YoloScreen(state: YoloState, preview: Bitmap?, savedAddress: String, onConne
     speech.error?.let { Text(it, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall) }
     Text(audio.message, style = MaterialTheme.typography.bodySmall,
       color = if (audio.recording) Color.Red else MaterialTheme.colorScheme.onSurface)
-    Text(state.status, style = MaterialTheme.typography.bodySmall)
     Box(Modifier.weight(1f).fillMaxWidth().background(Color.Black)) {
       if (preview != null) Image(preview.asImageBitmap(), "Phone rear camera", Modifier.fillMaxSize(), contentScale = ContentScale.Fit)
       Canvas(Modifier.fillMaxSize().pointerInput(Unit) {
@@ -76,6 +77,10 @@ fun YoloScreen(state: YoloState, preview: Bitmap?, savedAddress: String, onConne
         drawYoloOverlay(drawContext.canvas.nativeCanvas, size.width, size.height, state, cursor, speech)
         drawLiveSpeechOverlay(drawContext.canvas.nativeCanvas, size.width, size.height, speech)
       }
+      Text(state.status, style = MaterialTheme.typography.bodySmall, color = Color.White,
+        maxLines = 1, overflow = TextOverflow.Ellipsis,
+        modifier = Modifier.align(Alignment.TopStart).fillMaxWidth()
+          .background(Color.Black.copy(alpha = .65f)).padding(4.dp))
     }
   }
 }

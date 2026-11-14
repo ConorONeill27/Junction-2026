@@ -10,7 +10,7 @@ import android.os.Handler
 import java.io.ByteArrayOutputStream
 
 /** Camera2 exposes 60 FPS modes hidden by the legacy camera API on some phones. */
-data class CameraFrame(val bitmap: Bitmap, val jpeg: ByteArray, val rotation: Int)
+data class CameraFrame(val bitmap: Bitmap, val jpeg: ByteArray, val rotation: Int, val timestampNanos: Long, val focalX: Double, val focalY: Double)
 
 class PhoneCamera(private val context: Context, private val handler: Handler) {
   private var device: CameraDevice? = null
@@ -39,13 +39,24 @@ class PhoneCamera(private val context: Context, private val handler: Handler) {
       val focus = listOf(CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_VIDEO,
         CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE, CaptureRequest.CONTROL_AF_MODE_AUTO)
         .firstOrNull { it in modes } ?: CaptureRequest.CONTROL_AF_MODE_OFF
+      val realtimeTimestamps = info.get(CameraCharacteristics.SENSOR_INFO_TIMESTAMP_SOURCE) == CameraCharacteristics.SENSOR_INFO_TIMESTAMP_SOURCE_REALTIME
       val orientation = info.get(CameraCharacteristics.SENSOR_ORIENTATION) ?: 90
+      val physical = info.get(CameraCharacteristics.SENSOR_INFO_PHYSICAL_SIZE)
+      val focalLength = info.get(CameraCharacteristics.LENS_INFO_AVAILABLE_FOCAL_LENGTHS)?.firstOrNull()
+      val rawAspect = size.width.toDouble() / size.height
+      val sensorAspect = physical?.let { it.width.toDouble() / it.height } ?: rawAspect
+      val cropWidth = physical?.let { if (sensorAspect > rawAspect) it.height * rawAspect else it.width.toDouble() }
+      val cropHeight = physical?.let { if (sensorAspect > rawAspect) it.height.toDouble() else it.width / rawAspect }
+      val fx = if (focalLength != null && cropWidth != null && cropWidth > 0) focalLength / cropWidth else .9 * maxOf(size.width, size.height) / size.width
+      val fy = if (focalLength != null && cropHeight != null && cropHeight > 0) focalLength / cropHeight else .9 * maxOf(size.width, size.height) / size.height
       val images = ImageReader.newInstance(size.width, size.height, ImageFormat.YUV_420_888, 2)
       reader = images
       images.setOnImageAvailableListener({ source ->
         val image = source.acquireLatestImage() ?: return@setOnImageAvailableListener
         try {
-          if (!closed) onFrame(bitmap(image, orientation))
+          val received = android.os.SystemClock.elapsedRealtimeNanos()
+          val timestamp = if (realtimeTimestamps && image.timestamp in (received - 1_000_000_000L)..received) image.timestamp else received
+          if (!closed) onFrame(bitmap(image, orientation, timestamp, if (orientation % 180 == 0) fx else fy, if (orientation % 180 == 0) fy else fx))
         } catch (error: Exception) { if (!closed) onError(error.message ?: "Frame conversion failed")
         } finally { image.close() }
       }, handler)
@@ -85,7 +96,7 @@ class PhoneCamera(private val context: Context, private val handler: Handler) {
     } catch (error: Exception) { onError(error.message ?: "Camera startup failed") }
   }
 
-  private fun bitmap(image: Image, orientation: Int): CameraFrame {
+  private fun bitmap(image: Image, orientation: Int, timestamp: Long, focalX: Double, focalY: Double): CameraFrame {
     val width = image.width
     val height = image.height
     val nv21 = ByteArray(width * height * 3 / 2)
@@ -118,7 +129,7 @@ class PhoneCamera(private val context: Context, private val handler: Handler) {
     val raw = BitmapFactory.decodeByteArray(jpeg, 0, jpeg.size)
     val upright = Bitmap.createBitmap(raw, 0, 0, width, height, Matrix().apply { postRotate(orientation.toFloat()) }, true)
     if (upright !== raw) raw.recycle()
-    return CameraFrame(upright, jpeg, orientation)
+    return CameraFrame(upright, jpeg, orientation, timestamp, focalX, focalY)
   }
 
   fun close() {

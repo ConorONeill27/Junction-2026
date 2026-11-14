@@ -148,9 +148,14 @@ fun AppScaffold(
     else if (yoloViewModel.pinchCursor()) startSpeechFor(null)
   }
   DisposableEffect(displayViewModel, audioPermission) {
+    displayViewModel.onGlassesMotion = yoloViewModel::setGlassesMotion
+    displayViewModel.onGlassesMotionStopped = yoloViewModel::clearGlassesMotion
     displayViewModel.onAudioPinch = audioPinch
     displayViewModel.onCursorPinch = cursorPinch
     onDispose {
+      displayViewModel.onGlassesMotion = null
+      displayViewModel.onGlassesMotionStopped = null
+      yoloViewModel.clearGlassesMotion()
       displayViewModel.onAudioPinch = null
       displayViewModel.onCursorPinch = null
     }

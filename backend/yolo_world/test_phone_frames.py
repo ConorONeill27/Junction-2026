@@ -38,6 +38,26 @@ class PhoneFrameTests(unittest.TestCase):
         with urllib.request.urlopen(self.url + "/api/detections") as response:
             self.assertEqual(json.load(response)["detections"], result["detections"])
 
+    def test_phone_mode_bypasses_server_flow_and_keeps_legacy_mode(self):
+        self.server.close()
+        calls = []
+        def predict(frame):
+            calls.append('detect')
+            return []
+        def track(frame, rotation):
+            calls.append('flow')
+            return []
+        self.server = DetectionServer('127.0.0.1', 0, predict=predict, track=track).start()
+        self.url = f'http://127.0.0.1:{self.server.http.server_port}'
+        _, jpeg = cv2.imencode('.jpg', np.zeros((100, 100, 3), dtype=np.uint8))
+        request = urllib.request.Request(self.url + '/api/frame', jpeg.tobytes(),
+            {'Content-Type': 'image/jpeg', 'X-Tracking-Mode': 'phone'})
+        with urllib.request.urlopen(request, timeout=5) as response:
+            self.assertEqual(json.load(response)['tracking_mode'], 'phone')
+        with self.post(jpeg.tobytes()) as response:
+            self.assertEqual(json.load(response)['tracking_mode'], 'server')
+        self.assertEqual(calls, ['detect', 'flow'])
+
     def test_invalid_frame_releases_inference_lock(self):
         with self.assertRaises(urllib.error.HTTPError) as error:
             self.post(b"not a jpeg")

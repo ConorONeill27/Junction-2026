@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import sys
 import time
+import threading
 
 from detection_output import DEFAULT_OUTPUT, write_detection_centers
 from object_store import DEFAULT_OBJECTS_DIR, ObjectStore
@@ -67,23 +68,25 @@ def main():
         model = YOLOWorld(str(args.model))
         model.to('cpu' if args.device == 'cpu' else f'cuda:{args.device}' if str(args.device).isdecimal() else args.device)
         object_store = ObjectStore(args.objects_dir)
+        detector_lock = threading.Lock()
         def predict_phone(frame):
-            result = model.predict(frame, device=args.device, verbose=False)[0]
-            detections = [{"label": result.names[int(box.cls.item())],
-                           "confidence": round(float(box.conf.item()), 4),
-                           "bbox_xyxy": box.xyxy[0].cpu().tolist()} for box in result.boxes]
-            for item in detections:
-                x1, y1, x2, y2 = item["bbox_xyxy"]
-                item["center_px"] = [(x1 + x2) / 2, (y1 + y2) / 2]
-            object_store.update(detections, frame)
-            write_detection_centers(detections, args.output)
-            return detections
+            with detector_lock:
+                result = model.predict(frame, device=args.device, verbose=False)[0]
+                detections = [{"label": result.names[int(box.cls.item())],
+                               "confidence": round(float(box.conf.item()), 4),
+                               "bbox_xyxy": box.xyxy[0].cpu().tolist()} for box in result.boxes]
+                for item in detections:
+                    x1, y1, x2, y2 = item["bbox_xyxy"]
+                    item["center_px"] = [(x1 + x2) / 2, (y1 + y2) / 2]
+                object_store.update(detections, frame)
+                write_detection_centers(detections, args.output)
+                return detections
 
         from flow_tracker import TrackingPipeline
         tracking = TrackingPipeline(predict_phone, args.interval)
         if args.classes:
             model.set_classes(args.classes)
-        detection_server = DetectionServer(args.host, args.port, track=tracking).start()
+        detection_server = DetectionServer(args.host, args.port, predict=predict_phone, track=tracking).start()
         print(f"Phone detection API: http://<laptop-ip>:{args.port}/api/detections", flush=True)
         if args.source == "phone":
             print(f"Waiting for phone camera JPEGs at /api/frame; YOLO target {1 / args.interval:g} FPS (every {args.interval:g}s).", flush=True)

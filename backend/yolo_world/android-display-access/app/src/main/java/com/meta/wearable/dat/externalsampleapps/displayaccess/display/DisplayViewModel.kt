@@ -51,6 +51,14 @@ import com.meta.wearable.dat.externalsampleapps.displayaccess.AudioClipState
 import com.meta.wearable.dat.externalsampleapps.displayaccess.HeadCursorState
 import com.meta.wearable.dat.externalsampleapps.displayaccess.LiveSpeechState
 import com.meta.wearable.dat.externalsampleapps.displayaccess.drawLiveSpeechOverlay
+import com.meta.wearable.dat.motion.Motion
+import com.meta.wearable.dat.motion.addMotion
+import com.meta.wearable.dat.motion.removeMotion
+import com.meta.wearable.dat.motion.types.MotionConfiguration
+import com.meta.wearable.dat.motion.types.MotionSamplingRate
+import com.meta.wearable.dat.motion.types.MotionSource
+import com.meta.wearable.dat.motion.types.MotionState
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.CoroutineExceptionHandler
@@ -222,6 +230,65 @@ class DisplayViewModel(
   private var audioState = AudioClipState()
   var onAudioPinch: (() -> Unit)? = null
   var onCursorPinch: (() -> Unit)? = null
+  var onGlassesMotion: ((FloatArray?, FloatArray?) -> Unit)? = null
+  var onGlassesMotionStopped: (() -> Unit)? = null
+  private var motion: Motion? = null
+  private var motionSession: DeviceSession? = null
+  private var motionJobs = emptyList<Job>()
+
+  private fun attachMotion(currentSession: DeviceSession) {
+    if (motion != null) return
+    currentSession.addMotion(MotionConfiguration(samplingRate = MotionSamplingRate.HZ_60)).fold(
+      onSuccess = { attached ->
+        motion = attached
+        motionSession = currentSession
+        motionJobs = listOf(
+          viewModelScope.launch(sessionObserverExceptionHandler, start = CoroutineStart.UNDISPATCHED) {
+            attached.samples.collect { sample ->
+              if (sample.source != MotionSource.GLASSES) return@collect
+              val rotation = sample.orientation?.let { q ->
+                val norm = kotlin.math.sqrt(q.x*q.x + q.y*q.y + q.z*q.z + q.w*q.w)
+                if (norm < .001f || !norm.isFinite()) null else FloatArray(9).also {
+                  android.hardware.SensorManager.getRotationMatrixFromVector(it, floatArrayOf(q.x/norm, q.y/norm, q.z/norm, q.w/norm))
+                  // Convert device right/up/out axes to image right/down/forward.
+                  for (row in 0..2) { it[row*3+1] *= -1f; it[row*3+2] *= -1f }
+                }
+              }
+              val gyro = sample.gyroscope?.let { floatArrayOf(it.x, -it.y, -it.z) }
+              onGlassesMotion?.invoke(rotation, gyro)
+            }
+          },
+          viewModelScope.launch(sessionObserverExceptionHandler, start = CoroutineStart.UNDISPATCHED) {
+            attached.state.collect { state ->
+              Log.i(TAG, "Glasses motion state: $state")
+              if (state != MotionState.STARTED) onGlassesMotionStopped?.invoke()
+            }
+          },
+          viewModelScope.launch(sessionObserverExceptionHandler, start = CoroutineStart.UNDISPATCHED) {
+            attached.errors.collect { error ->
+              if (error != null) {
+                Log.w(TAG, "Glasses motion unavailable: $error")
+                onGlassesMotionStopped?.invoke()
+              }
+            }
+          },
+        )
+        attached.start()
+      },
+      onFailure = { error, _ -> Log.w(TAG, "Motion capability unavailable: ${error.description}") },
+    )
+  }
+
+  private fun detachMotion() {
+    motion?.stop()
+    motionJobs.forEach { it.cancel() }
+    motionJobs = emptyList()
+    motionSession?.removeMotion()
+    motionSession = null
+    motion = null
+    onGlassesMotionStopped?.invoke()
+  }
+
   private var cursorState = HeadCursorState()
   private var speechState = LiveSpeechState()
 
@@ -245,12 +312,19 @@ class DisplayViewModel(
     if (_uiState.value.displayState == DisplayState.STARTED) displayYoloScreen()
   }
 
+  private var yoloRenderJob: Job? = null
+  private var lastYoloRenderAt = 0L
+
   private fun displayYoloScreen() {
+    val now = android.os.SystemClock.elapsedRealtimeNanos()
+    // Keep one HUD send in flight; never queue old tracking frames behind a slow display link.
+    if (yoloRenderJob?.isActive == true || now - lastYoloRenderAt < 33_000_000L) return
+    lastYoloRenderAt = now
     val bitmap = android.graphics.Bitmap.createBitmap(600, 480, android.graphics.Bitmap.Config.ARGB_8888)
     com.meta.wearable.dat.externalsampleapps.displayaccess.drawYoloOverlay(
       android.graphics.Canvas(bitmap), 600f, 480f, yoloState, cursorState, speechState)
     drawLiveSpeechOverlay(android.graphics.Canvas(bitmap), 600f, 480f, speechState)
-    sendContent {
+    yoloRenderJob = sendContent {
       flexBox(direction = Direction.COLUMN, gap = 4) {
         image(bitmap = bitmap, sizePreset = ImageSize.FILL, flexGrow = 1f)
         text(if (speechState.active && speechState.noteId != null) "Recording note - pinch to stop recording" else if (speechState.active) "Listening - pause to finish, or pinch again" else if (audioState.recording) "Recording - use Stop recording to finish" else
@@ -299,6 +373,7 @@ class DisplayViewModel(
                   when (state) {
                     DeviceSessionState.STARTED -> {
                       Log.i(TAG, "Session started")
+                      attachMotion(newSession)
                       _uiState.value =
                           _uiState.value.copy(
                               selectedDeviceId = selectedDeviceId,
@@ -314,6 +389,7 @@ class DisplayViewModel(
                     }
                     DeviceSessionState.STOPPED -> {
                       Log.i(TAG, "Session stopped")
+                      detachMotion()
                       clearPendingWork()
                       cleanupDisplay()
                       _uiState.value =
@@ -476,13 +552,13 @@ class DisplayViewModel(
 
   // -- Content --
 
-  private fun sendContent(content: ContentScope.() -> Unit) {
+  private fun sendContent(content: ContentScope.() -> Unit): Job {
     _uiState.value =
         _uiState.value.copy(
             isSending = true,
             errorMessage = null,
         )
-    viewModelScope.launch(dispatcher + sendContentExceptionHandler) {
+    return viewModelScope.launch(dispatcher + sendContentExceptionHandler) {
       val currentDisplay =
           synchronized(sessionLock) { display }
               ?: run {
@@ -614,6 +690,7 @@ class DisplayViewModel(
               snackbarMessage = "Stopping session...",
           )
 
+      detachMotion()
       detachDisplay()
       clearSessionStateJob()?.cancel()
       clearSessionErrorJob()?.cancel()
@@ -650,6 +727,9 @@ class DisplayViewModel(
   }
 
   private fun cleanupDisplay() {
+    yoloRenderJob?.cancel()
+    yoloRenderJob = null
+    lastYoloRenderAt = 0L
     tutorialVideoStateJob?.cancel()
     tutorialVideoStateJob = null
     clearDisplayStateJob()?.cancel()

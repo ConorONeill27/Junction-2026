@@ -89,11 +89,13 @@ class DetectionServer:
                         rotation = np.array([float(v) for v in raw_rotation.split(",")]).reshape(3, 3)
                         if not np.isfinite(rotation).all() or not np.allclose(rotation.T @ rotation, np.eye(3), atol=0.02) or np.linalg.det(rotation) < 0.98:
                             raise ValueError("Invalid rotation")
-                    detections = track(frame, rotation) if track else predict(frame)
+                    phone_tracking = self.headers.get("X-Tracking-Mode") == "phone" and predict is not None
+                    detections = predict(frame) if phone_tracking else track(frame, rotation) if track else predict(frame)
                     owner.publish(detections, [frame.shape[1], frame.shape[0]], "phone_camera")
                     with owner.lock:
                         owner.snapshot["processing_seconds"] = time.monotonic() - started
                         result = copy.deepcopy(owner.snapshot)
+                    result["tracking_mode"] = "phone" if phone_tracking else "server"
                     result["inference_seconds"] = time.monotonic() - started
                     data = json.dumps(result).encode()
                     self.send_response(200)

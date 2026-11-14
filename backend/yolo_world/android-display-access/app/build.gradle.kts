@@ -69,6 +69,7 @@ dependencies {
   implementation(libs.androidx.material.icons.extended)
   implementation(libs.androidx.material3)
   implementation(libs.androidx.navigation.compose)
+  implementation("com.meta.wearable:mwdat-motion:1.0.1")
   implementation(libs.mwdat.core)
   implementation(libs.mwdat.display)
   implementation(libs.mwdat.mockdevice)

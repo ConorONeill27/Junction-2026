@@ -20,6 +20,9 @@ data class YoloItem(val id: String, val label: String, val confidence: Double, v
 data class YoloState(val status: String = "Enter your laptop address to connect", val items: List<YoloItem> = emptyList(), val sample: Boolean = false, val width: Int = 480, val height: Int = 640)
 
 class YoloViewModel(application: Application) : AndroidViewModel(application) {
+  private val localTracker = LocalObjectTracker()
+  private val phoneMotion = MotionPredictor()
+  private val glassesMotion = MotionPredictor()
   private val cursorController = HeadCursorController()
   private val mutableCursor = MutableStateFlow(HeadCursorState())
   val cursor = mutableCursor.asStateFlow()
@@ -48,15 +51,29 @@ class YoloViewModel(application: Application) : AndroidViewModel(application) {
     simulatedRotation = rotation?.clone()
     (simulatedRotation ?: cameraRotation)?.let { updateHeadCursor(it) }
   }
+  fun setGlassesMotion(rotation: FloatArray?, gyro: FloatArray?) {
+    val now = android.os.SystemClock.elapsedRealtimeNanos()
+    rotation?.let { glassesMotion.orientation(it, now) }
+    gyro?.takeIf { it.size == 3 }?.let { glassesMotion.angularVelocity(it[0], it[1], it[2], now) }
+    glassesMotion.predict(now + 15_000_000L)?.let { updateHeadCursor(it) }
+  }
+
+  fun clearGlassesMotion() { glassesMotion.clear() }
+
   private val sensorListener = object : android.hardware.SensorEventListener {
     override fun onAccuracyChanged(sensor: android.hardware.Sensor?, accuracy: Int) {}
     override fun onSensorChanged(event: android.hardware.SensorEvent) {
+      if (event.sensor.type == android.hardware.Sensor.TYPE_GYROSCOPE) {
+        phoneMotion.angularVelocity(event.values[0], -event.values[1], -event.values[2], event.timestamp)
+        return
+      }
       val rotation = FloatArray(9)
       android.hardware.SensorManager.getRotationMatrixFromVector(rotation, event.values)
       // Portrait JPEG camera axes: right, down, forward; Android device: right, up, out.
       for (row in 0..2) { rotation[row * 3 + 1] *= -1f; rotation[row * 3 + 2] *= -1f }
       cameraRotation = rotation
-      updateHeadCursor(simulatedRotation ?: rotation)
+      phoneMotion.orientation(rotation, event.timestamp)
+      updateHeadCursor(simulatedRotation ?: glassesMotion.predict(android.os.SystemClock.elapsedRealtimeNanos() + 15_000_000L) ?: rotation)
     }
   }
   private val preferences = application.getSharedPreferences("yolo", 0)
@@ -98,6 +115,7 @@ class YoloViewModel(application: Application) : AndroidViewModel(application) {
       return
     }
     generation.incrementAndGet()
+    handler.post { localTracker.reset() }
     base = uri.toString()
     serverRotatesImages = false
     preferences.edit().putString("address", base).apply()
@@ -110,6 +128,11 @@ class YoloViewModel(application: Application) : AndroidViewModel(application) {
       sensors.getDefaultSensor(android.hardware.Sensor.TYPE_GAME_ROTATION_VECTOR)?.let {
         sensors.registerListener(sensorListener, it, android.hardware.SensorManager.SENSOR_DELAY_FASTEST, handler)
       }
+      sensors.getDefaultSensor(android.hardware.Sensor.TYPE_GYROSCOPE)?.let {
+        sensors.registerListener(sensorListener, it, android.hardware.SensorManager.SENSOR_DELAY_GAME, handler)
+      }
+      phoneMotion.clear()
+      localTracker.reset()
       captureEpoch = android.os.SystemClock.elapsedRealtimeNanos()
       captureCount = 0
       nextUploadAt = 0L
@@ -123,7 +146,7 @@ class YoloViewModel(application: Application) : AndroidViewModel(application) {
       }, onFrame = { frame ->
           val bitmap = frame.bitmap
           // Measure delivered camera frames independently of tracking responses.
-          val capturedAt = android.os.SystemClock.elapsedRealtimeNanos()
+          val capturedAt = frame.timestampNanos
           captureCount++
           if (capturedAt - captureEpoch >= 1_000_000_000L) {
             captureFps = captureCount * 1_000_000_000.0 / (capturedAt - captureEpoch)
@@ -131,10 +154,24 @@ class YoloViewModel(application: Application) : AndroidViewModel(application) {
             captureCount = 0
           }
           mutablePreview.value = bitmap
+          val pose = simulatedRotation?.clone() ?: phoneMotion.predict(capturedAt)
+          val ratio = minOf(1f, 160f / maxOf(bitmap.width, bitmap.height))
+          val small = android.graphics.Bitmap.createScaledBitmap(bitmap,
+            (bitmap.width * ratio).toInt().coerceAtLeast(1), (bitmap.height * ratio).toInt().coerceAtLeast(1), true)
+          val pixels = IntArray(small.width * small.height)
+          small.getPixels(pixels, 0, small.width, 0, 0, small.width, small.height)
+          val gray = GrayFrame(small.width, small.height, IntArray(pixels.size) { index ->
+            val pixel = pixels[index]
+            (77 * ((pixel shr 16) and 255) + 150 * ((pixel shr 8) and 255) + 29 * (pixel and 255)) shr 8
+          })
+          if (small !== bitmap) small.recycle()
+          val tracked = localTracker.frame(gray, pose, capturedAt / 1e9, bitmap.width, bitmap.height, frame.focalX, frame.focalY)
+          val status = if (System.currentTimeMillis() - lastResult > 3000) "Waiting for YOLO corrections..." else
+            "Camera %.0f FPS | YOLO %.1f FPS".format(captureFps, trackingFps)
+          mutableState.value = YoloState(status, tracked, false, bitmap.width, bitmap.height)
           val now = capturedAt
           if (now + 1_000_000L >= nextUploadAt && busy.compareAndSet(false, true)) {
-            nextUploadAt = maxOf(now, nextUploadAt + 1_000_000_000L / 60L)
-            val pose = (simulatedRotation ?: cameraRotation)?.clone()
+            nextUploadAt = maxOf(now, nextUploadAt + 200_000_000L)
             val target = base
             val requestGeneration = generation.get()
             viewModelScope.launch(Dispatchers.IO) {
@@ -154,6 +191,7 @@ class YoloViewModel(application: Application) : AndroidViewModel(application) {
                 connection.requestMethod = "POST"
                 connection.doOutput = true
                 connection.setRequestProperty("Content-Type", "image/jpeg")
+                connection.setRequestProperty("X-Tracking-Mode", "phone")
                 connection.setRequestProperty("X-Image-Rotation", if (useCameraJpeg) frame.rotation.toString() else "0")
                 pose?.let { connection.setRequestProperty("X-Camera-Rotation", it.joinToString(",")) }
                 connection.setFixedLengthStreamingMode(payload.size)
@@ -182,9 +220,10 @@ class YoloViewModel(application: Application) : AndroidViewModel(application) {
                   android.util.Log.i("WorldGitCamera", "Delivered camera FPS=$captureFps; flow response FPS=$trackingFps; encode ms=${(requestStarted - encodeStarted) / 1_000_000.0}; request ms=${(completedAt - requestStarted) / 1_000_000.0}; server ms=${json.optDouble("inference_seconds") * 1000}")
                 }
                 lastResult = System.currentTimeMillis()
-                if (generation.get() == requestGeneration) mutableState.value = YoloState(
-                  "60 FPS target | camera %.1f / flow %.1f FPS | YOLO 5 FPS target\n%s".format(captureFps, trackingFps, cameraMode),
-                  items, false, frameSize.getInt(0), frameSize.getInt(1))
+                handler.post {
+                  if (generation.get() == requestGeneration) localTracker.correct(items, capturedAt / 1e9,
+                    android.os.SystemClock.elapsedRealtimeNanos() / 1e9, frameSize.getInt(0), frameSize.getInt(1))
+                }
               } catch (error: CancellationException) { throw error
               } catch (error: Exception) {
                 if (generation.get() == requestGeneration) mutableState.value = YoloState("Disconnected. Start laptop YOLO in phone mode; check address / USB forwarding.")
@@ -202,6 +241,7 @@ class YoloViewModel(application: Application) : AndroidViewModel(application) {
     sensors.unregisterListener(sensorListener)
     handler.post {
       camera?.close(); camera = null
+      localTracker.reset(); phoneMotion.clear()
       mutablePreview.value = null
       mutableState.value = YoloState("Camera paused")
     }

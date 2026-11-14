@@ -190,3 +190,49 @@ PyPI NeMo 2.7.3 rejects the Unified checkpoint's `att_chunk_context_size` encode
 option. Keep the checkpoint's configuration intact; do not remove Unified encoder
 fields to load it into an older runtime. CUDA graph decoding is disabled while
 normal CUDA inference remains enabled, avoiding optional graph-runtime JIT setup.
+
+
+## Local AR tracking and detector corrections
+
+The Android camera thread now runs sparse forward/backward patch tracking on an
+upright luminance image with a maximum dimension of 160 pixels. GPU YOLO requests
+are limited to one in flight at a 200-ms cadence. `X-Tracking-Mode: phone` asks the
+server for detections on that exact submitted image, without server optical flow.
+Clients that omit the header keep the existing server tracking path.
+
+Exposure timestamps (when Camera2 supplies realtime timestamps) align images with
+a bounded orientation/gyro history. Camera sensor size and focal length provide
+approximate projection intrinsics; optical flow supplies the remaining image
+motion. Digital stabilization is disabled. This is rotational prediction plus
+image tracking, not calibrated 6-DoF spatial anchoring or depth estimation.
+
+A 1.5-second motion history reprojects delayed detections to the latest frame.
+Replies older than one second, replies from an old connection generation, and
+responses for another image size are discarded. Existing tracks receive coordinate
+corrections; their normalized center and size use the One Euro filter at camera
+cadence (min cutoff 1.2 Hz, beta 3, derivative cutoff 1 Hz). Known IMU rotation is
+applied immediately, while optical-flow noise and detector residuals are smoothed.
+Lower min cutoff increases steadiness and lag; higher beta improves fast correction
+response. Object IDs are preserved through overlapping same-label reacquisitions,
+so cursor selection and session notes follow the smoothed geometry. Tracks expire
+1.2 seconds after their last valid detector observation. A single HUD update is
+allowed in flight, capped at 30 Hz, so old overlays cannot queue behind a slow link.
+
+Meta DAT 1.0.1's experimental `mwdat-motion` module is attached after the session
+starts. It requests 60-Hz glasses samples, ignores Neural Band samples, handles
+nullable sensor fields, and tears down collectors and the capability with the
+session. Enable Motion for the app in Wearables Developer Center to test physical
+hardware. Unsupported/paused/error states fall back without breaking the display.
+The SDK quaternion is interpreted as camera-to-world after converting device
+right/up/out axes to image right/down/forward; validate this mounting convention on
+physical hardware before relying on calibrated AR alignment.
+
+The current source is the **phone camera**. Its boxes use the **phone** orientation
+and gyroscope. Glasses orientation/gyro drive head aiming, with bounded 15-ms
+prediction; they must not move boxes in a phone-camera image. Physical glasses
+camera tracking needs its own synchronized frames and camera-to-IMU calibration.
+
+Validation: `gradlew.bat assembleDebug testDebugUnitTest` covers stationary jitter,
+adaptive response, optical translation, correction blending, delayed pose replay,
+stale replies, resolution resets, and gyro prediction. Server compatibility is
+covered by `python -m unittest discover -s backend/yolo_world -p "test_*.py" -q`.
