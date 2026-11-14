@@ -1,0 +1,7 @@
+*.pt
+*.onnx
+settings/
+detections.txt
+*.tmp
+objects/
+audioClips/
