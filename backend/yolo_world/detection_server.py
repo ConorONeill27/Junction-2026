@@ -8,6 +8,7 @@ import socket
 import threading
 import time
 from audio_clips import AudioClips, DEFAULT_AUDIO_DIR, MAX_AUDIO_BYTES
+from parakeet_asr import ParakeetClient, TranscriptionUnavailable, MAX_PCM_BYTES, validate_pcm
 
 
 class CameraHTTPServer(ThreadingHTTPServer):
@@ -22,12 +23,13 @@ class CameraHTTPServer(ThreadingHTTPServer):
 
 
 class DetectionServer:
-    def __init__(self, host="0.0.0.0", port=8765, predict=None, track=None, audio_dir=DEFAULT_AUDIO_DIR):
+    def __init__(self, host="0.0.0.0", port=8765, predict=None, track=None, audio_dir=DEFAULT_AUDIO_DIR, transcribe=None):
         self.lock = threading.Lock()
         self.snapshot = {"timestamp": None, "source": "laptop_camera", "detections": []}
         owner = self
         self.inference_lock = threading.Lock()
         self.audio_clips = AudioClips(audio_dir)
+        self.transcribe = transcribe or ParakeetClient().transcribe
 
         class Handler(BaseHTTPRequestHandler):
             protocol_version = "HTTP/1.1"
@@ -51,6 +53,9 @@ class DetectionServer:
                 self.wfile.write(data)
 
             def do_POST(self):
+                if self.path == '/api/transcribe':
+                    self.transcribe_audio()
+                    return
                 if self.path == '/api/audio-clips':
                     self.save_audio_clip()
                     return
@@ -126,6 +131,34 @@ class DetectionServer:
                     self.send_error(409, 'Clip ID already used')
                 except (ValueError, OSError):
                     self.send_error(400, 'Unable to save audio clip')
+
+            def transcribe_audio(self):
+                try:
+                    length = int(self.headers.get('Content-Length', '0'))
+                    if not 3200 <= length <= MAX_PCM_BYTES or length % 2:
+                        self.send_error(413, 'Expected 0.1 to 30 seconds of PCM16 audio')
+                        return
+                    if self.headers.get('Content-Type') != 'application/octet-stream' or self.headers.get('X-Sample-Rate') != '16000':
+                        self.send_error(415, 'Expected mono 16-kHz PCM16 little-endian')
+                        return
+                    body = self.rfile.read(length)
+                    validate_pcm(body)
+                    data = json.dumps(owner.transcribe(body)).encode()
+                    self.send_response(200)
+                    self.send_header('Content-Type', 'application/json')
+                    self.send_header('Content-Length', str(len(data)))
+                    self.send_header('Cache-Control', 'no-store')
+                    self.end_headers()
+                    self.wfile.write(data)
+                except TranscriptionUnavailable as error:
+                    data = json.dumps({'error': str(error)}).encode()
+                    self.send_response(503)
+                    self.send_header('Content-Type', 'application/json')
+                    self.send_header('Content-Length', str(len(data)))
+                    self.end_headers()
+                    self.wfile.write(data)
+                except (OSError, ValueError):
+                    self.send_error(400, 'Invalid transcription audio')
 
             def log_message(self, *args):
                 pass

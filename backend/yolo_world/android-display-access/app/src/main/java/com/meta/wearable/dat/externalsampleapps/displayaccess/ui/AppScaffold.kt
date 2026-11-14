@@ -34,6 +34,8 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.setValue
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.ui.Alignment
@@ -56,6 +58,7 @@ import com.meta.wearable.dat.externalsampleapps.displayaccess.R
 import com.meta.wearable.dat.externalsampleapps.displayaccess.SampleApp
 import com.meta.wearable.dat.externalsampleapps.displayaccess.YoloViewModel
 import com.meta.wearable.dat.externalsampleapps.displayaccess.AudioClipsViewModel
+import com.meta.wearable.dat.externalsampleapps.displayaccess.LiveTranscriptionViewModel
 import com.meta.wearable.dat.externalsampleapps.displayaccess.display.DisplayViewModel
 import com.meta.wearable.dat.externalsampleapps.displayaccess.wearables.DeveloperPreviewMode
 import com.meta.wearable.dat.externalsampleapps.displayaccess.wearables.WearablesViewModel
@@ -89,6 +92,9 @@ fun AppScaffold(
   val displayViewModel: DisplayViewModel = viewModel()
   val yoloViewModel: YoloViewModel = viewModel()
   val audioViewModel: AudioClipsViewModel = viewModel()
+  val speechViewModel: LiveTranscriptionViewModel = viewModel()
+  val speechState by speechViewModel.state.collectAsStateWithLifecycle()
+  var permissionForSpeech by remember { mutableStateOf(false) }
   val audioState by audioViewModel.state.collectAsStateWithLifecycle()
   val yoloState by yoloViewModel.state.collectAsStateWithLifecycle()
   val cursorState by yoloViewModel.cursor.collectAsStateWithLifecycle()
@@ -99,15 +105,38 @@ fun AppScaffold(
   ) { granted -> if (granted) yoloViewModel.startCamera() }
   val audioPermission = androidx.activity.compose.rememberLauncherForActivityResult(
     androidx.activity.result.contract.ActivityResultContracts.RequestPermission()
-  ) { granted -> if (granted) audioViewModel.toggle(yoloViewModel.savedAddress) else audioViewModel.permissionDenied() }
+  ) { granted ->
+    if (permissionForSpeech) {
+      if (granted) speechViewModel.start(yoloViewModel.savedAddress)
+      else speechViewModel.unavailable("Microphone permission is needed for live transcription")
+    } else {
+      if (granted) audioViewModel.toggle(yoloViewModel.savedAddress) else audioViewModel.permissionDenied()
+    }
+    permissionForSpeech = false
+  }
   val audioPinch: () -> Unit = {
-    if (context.checkSelfPermission(android.Manifest.permission.RECORD_AUDIO) == android.content.pm.PackageManager.PERMISSION_GRANTED)
-      audioViewModel.toggle(yoloViewModel.savedAddress)
-    else audioPermission.launch(android.Manifest.permission.RECORD_AUDIO)
+    if (!speechViewModel.state.value.active) {
+      permissionForSpeech = false
+      if (context.checkSelfPermission(android.Manifest.permission.RECORD_AUDIO) == android.content.pm.PackageManager.PERMISSION_GRANTED)
+        audioViewModel.toggle(yoloViewModel.savedAddress)
+      else audioPermission.launch(android.Manifest.permission.RECORD_AUDIO)
+    }
+  }
+  val cursorPinch: () -> Unit = {
+    if (speechViewModel.state.value.active) speechViewModel.finish()
+    else if (yoloViewModel.pinchCursor()) {
+      if (audioViewModel.state.value.recording) speechViewModel.unavailable("Stop the audio clip recording before live transcription")
+      else if (context.checkSelfPermission(android.Manifest.permission.RECORD_AUDIO) == android.content.pm.PackageManager.PERMISSION_GRANTED)
+        speechViewModel.start(yoloViewModel.savedAddress)
+      else {
+        permissionForSpeech = true
+        audioPermission.launch(android.Manifest.permission.RECORD_AUDIO)
+      }
+    }
   }
   DisposableEffect(displayViewModel, audioPermission) {
     displayViewModel.onAudioPinch = audioPinch
-    displayViewModel.onCursorPinch = { yoloViewModel.pinchCursor() }
+    displayViewModel.onCursorPinch = cursorPinch
     onDispose {
       displayViewModel.onAudioPinch = null
       displayViewModel.onCursorPinch = null
@@ -115,13 +144,17 @@ fun AppScaffold(
   }
   LaunchedEffect(audioState) { displayViewModel.updateAudio(audioState) }
   LaunchedEffect(cursorState) { displayViewModel.updateCursor(cursorState) }
+  LaunchedEffect(speechState) { displayViewModel.updateSpeech(speechState) }
   val lifecycleOwner = androidx.lifecycle.compose.LocalLifecycleOwner.current
   DisposableEffect(lifecycleOwner) {
     val observer = androidx.lifecycle.LifecycleEventObserver { _, event ->
       if (event == androidx.lifecycle.Lifecycle.Event.ON_RESUME &&
           context.checkSelfPermission(android.Manifest.permission.CAMERA) == android.content.pm.PackageManager.PERMISSION_GRANTED) yoloViewModel.startCamera()
       if (event == androidx.lifecycle.Lifecycle.Event.ON_PAUSE) yoloViewModel.stopCamera()
-      if (event == androidx.lifecycle.Lifecycle.Event.ON_STOP) audioViewModel.finishRecording()
+      if (event == androidx.lifecycle.Lifecycle.Event.ON_STOP) {
+        audioViewModel.finishRecording()
+        speechViewModel.cancel()
+      }
     }
     lifecycleOwner.lifecycle.addObserver(observer)
     onDispose { lifecycleOwner.lifecycle.removeObserver(observer); yoloViewModel.stopCamera() }
@@ -212,7 +245,7 @@ fun AppScaffold(
       composable(Routes.YOLO) {
         YoloScreen(yoloState, cameraPreview, yoloViewModel.savedAddress, { address -> yoloViewModel.connect(address); permission.launch(android.Manifest.permission.CAMERA) }, ::openSamples,
           audioState, audioPinch, { audioViewModel.retryUploads(yoloViewModel.savedAddress) },
-          cursorState, { yoloViewModel.pinchCursor() })
+          cursorState, cursorPinch, speechState)
       }
       composable(Routes.CONNECT) {
         ConnectScreen(

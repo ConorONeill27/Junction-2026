@@ -17,12 +17,14 @@ import androidx.compose.ui.unit.dp
 import com.meta.wearable.dat.externalsampleapps.displayaccess.YoloState
 import com.meta.wearable.dat.externalsampleapps.displayaccess.AudioClipState
 import com.meta.wearable.dat.externalsampleapps.displayaccess.HeadCursorState
+import com.meta.wearable.dat.externalsampleapps.displayaccess.LiveSpeechState
+import com.meta.wearable.dat.externalsampleapps.displayaccess.drawLiveSpeechOverlay
 import com.meta.wearable.dat.externalsampleapps.displayaccess.drawYoloOverlay
 
 @Composable
 fun YoloScreen(state: YoloState, preview: Bitmap?, savedAddress: String, onConnect: (String) -> Unit, onPreview: () -> Unit,
   audio: AudioClipState, onAudioPinch: () -> Unit, onRetryAudio: () -> Unit,
-  cursor: HeadCursorState, onCursorPinch: () -> Unit) {
+  cursor: HeadCursorState, onCursorPinch: () -> Unit, speech: LiveSpeechState) {
   var address by rememberSaveable { mutableStateOf(savedAddress) }
   Column(Modifier.fillMaxSize().padding(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
     OutlinedTextField(value = address, onValueChange = { address = it }, label = { Text("Laptop YOLO address") },
@@ -32,7 +34,7 @@ fun YoloScreen(state: YoloState, preview: Bitmap?, savedAddress: String, onConne
       OutlinedButton(onClick = onPreview) { Text("Meta preview") }
     }
     Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-      OutlinedButton(onClick = onAudioPinch, enabled = !audio.uploading) {
+      OutlinedButton(onClick = onAudioPinch, enabled = !audio.uploading && !speech.active) {
         Text(if (audio.recording) "Stop recording" else "Record audio")
       }
       if (audio.pendingCount > 0 && !audio.recording) {
@@ -40,9 +42,10 @@ fun YoloScreen(state: YoloState, preview: Bitmap?, savedAddress: String, onConne
       }
     }
     Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-      OutlinedButton(onClick = onCursorPinch) { Text(if (cursor.visible) "Pinch: select / hide" else "Pinch: show cursor") }
+      OutlinedButton(onClick = onCursorPinch) { Text(if (speech.active) "Finish speaking" else if (cursor.visible) "Pinch: select / speak" else "Pinch: show cursor") }
     }
-    Text(if (cursor.visible) "Move your head to aim. Pinch a label to select; pinch empty space to hide." else "Pinch to show the head-aimed cursor.", style = MaterialTheme.typography.bodySmall)
+    Text(if (cursor.visible) "Move your head to aim. Pinch a label to select; pinch empty space to speak." else "Pinch to show the head-aimed cursor.", style = MaterialTheme.typography.bodySmall)
+    speech.error?.let { Text(it, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall) }
     Text(audio.message, style = MaterialTheme.typography.bodySmall,
       color = if (audio.recording) Color.Red else MaterialTheme.colorScheme.onSurface)
     Text(state.status, style = MaterialTheme.typography.bodySmall)
@@ -50,6 +53,7 @@ fun YoloScreen(state: YoloState, preview: Bitmap?, savedAddress: String, onConne
       if (preview != null) Image(preview.asImageBitmap(), "Phone rear camera", Modifier.fillMaxSize(), contentScale = ContentScale.Fit)
       Canvas(Modifier.fillMaxSize()) {
         drawYoloOverlay(drawContext.canvas.nativeCanvas, size.width, size.height, state, cursor)
+        drawLiveSpeechOverlay(drawContext.canvas.nativeCanvas, size.width, size.height, speech)
       }
     }
   }

@@ -49,6 +49,8 @@ import com.meta.wearable.dat.externalsampleapps.displayaccess.SampleApp
 import com.meta.wearable.dat.externalsampleapps.displayaccess.YoloState
 import com.meta.wearable.dat.externalsampleapps.displayaccess.AudioClipState
 import com.meta.wearable.dat.externalsampleapps.displayaccess.HeadCursorState
+import com.meta.wearable.dat.externalsampleapps.displayaccess.LiveSpeechState
+import com.meta.wearable.dat.externalsampleapps.displayaccess.drawLiveSpeechOverlay
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.CoroutineExceptionHandler
@@ -221,6 +223,12 @@ class DisplayViewModel(
   var onAudioPinch: (() -> Unit)? = null
   var onCursorPinch: (() -> Unit)? = null
   private var cursorState = HeadCursorState()
+  private var speechState = LiveSpeechState()
+
+  fun updateSpeech(state: LiveSpeechState) {
+    speechState = state
+    if (_uiState.value.displayState == DisplayState.STARTED) displayYoloScreen()
+  }
 
   fun updateCursor(state: HeadCursorState) {
     cursorState = state
@@ -241,14 +249,15 @@ class DisplayViewModel(
     val bitmap = android.graphics.Bitmap.createBitmap(600, 480, android.graphics.Bitmap.Config.ARGB_8888)
     com.meta.wearable.dat.externalsampleapps.displayaccess.drawYoloOverlay(
       android.graphics.Canvas(bitmap), 600f, 480f, yoloState, cursorState)
+    drawLiveSpeechOverlay(android.graphics.Canvas(bitmap), 600f, 480f, speechState)
     sendContent {
       flexBox(direction = Direction.COLUMN, gap = 4) {
         image(bitmap = bitmap, sizePreset = ImageSize.FILL, flexGrow = 1f)
-        text(if (audioState.recording) "Recording - use Stop recording to finish" else
-          if (cursorState.visible) "Aim with your head. Pinch to select; empty space hides cursor." else "Pinch to show cursor", style = TextStyle.META)
+        text(if (speechState.active) "Listening - pause to finish, or pinch again" else if (audioState.recording) "Recording - use Stop recording to finish" else
+          if (cursorState.visible) "Aim with your head. Pinch to select; empty space starts speech." else "Pinch to show cursor", style = TextStyle.META)
         buttonGroup {
           button(
-            if (cursorState.visible) "Select / hide cursor" else "Show cursor",
+            if (speechState.active) "Finish speaking" else if (cursorState.visible) "Select / speak" else "Show cursor",
             onClick = { onCursorPinch?.invoke() },
             actionRole = ActionRole.PRIMARY,
           )

@@ -137,7 +137,7 @@ The primary Neural Band pinch action now controls the cursor; audio recording
 remains a separate explicit control. First pinch: show a small white circle at the
 center and set the current head pose as neutral. Move your head to aim. The next
 pinch selects the text label under the circle and fills that label blue. Pinching
-empty space clears selection and hides the circle. Pinching again shows a newly
+empty space clears selection, hides the circle, and starts live speech input. Pinching again shows a newly
 centered cursor. Selection follows the tracked object ID between camera frames.
 
 The mobile simulator uses the existing phone rotation-vector sensor as the head
@@ -154,3 +154,39 @@ commit cursor state at most 30 times per second.
 
 Head-aiming unit tests: `gradlew.bat testDebugUnitTest` (from the Android directory,
 with the same JAVA_HOME/ANDROID_HOME/GRADLE_USER_HOME used by `build_apk.py`).
+
+## Live Parakeet transcription
+
+Show the cursor, then pinch empty space to speak. A white microphone appears in
+the middle of the HUD and live captions appear in a bottom text box. Pinching a
+label continues to select it instead. A second pinch while listening finishes the
+utterance manually. Speech ends automatically after 1.2 seconds of silence; the
+final words remain briefly (0.7 seconds), then both microphone and caption vanish.
+No speech for 8 seconds also dismisses the interaction. Capture is limited to 30
+seconds per utterance, and stops on app backgrounding. Existing audio-clip recording
+remains a separate control; it cannot hold the microphone at the same time.
+
+The phone captures real mono 16-kHz PCM16 and submits the latest utterance buffer
+about every 500 ms to `POST /api/transcribe` on the YOLO server (port 8765). That
+endpoint forwards to a separate local GPU worker on port 8766, keeping ASR imports
+and inference separate from camera tracking. The exact model is
+`nvidia/parakeet-unified-en-0.6b`, an English model. Buffered partial hypotheses can
+change as more audio arrives. This integration retranscribes bounded utterance
+buffers; it does not claim the model card's minimum chunk latency. Audio used for
+live captions is transient and is not saved to audioClips automatically.
+
+Install the optional runtime in an isolated environment with CUDA PyTorch:
+`pip install -r requirements-asr.txt`, then run `start_parakeet.cmd` (Windows) or
+`python parakeet_asr.py` in that environment. NVIDIA officially supports Linux;
+native Windows compatibility depends on the installed native dependencies. The
+Windows launcher uses `.venv-parakeet` when present. Model weights/cache live under
+ignored `settings/parakeet/`. `GET http://127.0.0.1:8766/health` must report ready=true
+before testing. No API key is required. No other ASR model, CPU, Android speech
+recognizer, or fake transcription is substituted when the GPU worker is unavailable.
+Camera startup and other app features still work if Parakeet is absent.
+
+The runtime is pinned to NVIDIA NeMo source revision a039a6cfce00aa57a6a8cd8e96166c1379f903e8 because
+PyPI NeMo 2.7.3 rejects the Unified checkpoint's `att_chunk_context_size` encoder
+option. Keep the checkpoint's configuration intact; do not remove Unified encoder
+fields to load it into an older runtime. CUDA graph decoding is disabled while
+normal CUDA inference remains enabled, avoiding optional graph-runtime JIT setup.

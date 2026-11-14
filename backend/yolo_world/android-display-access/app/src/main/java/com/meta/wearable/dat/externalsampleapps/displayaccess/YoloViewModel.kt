@@ -32,9 +32,11 @@ class YoloViewModel(application: Application) : AndroidViewModel(application) {
     mutableCursor.value = cursorController.updatePose(rotation)
   }
 
-  fun pinchCursor() {
+  fun pinchCursor(): Boolean {
+    val wasVisible = mutableCursor.value.visible
     mutableCursor.value = cursorController.pinch { x, y -> yoloLabelAt(mutableState.value, x, y) }
     android.util.Log.i("WorldGitCursor", "Pinch: ${mutableCursor.value}")
+    return wasVisible && !mutableCursor.value.visible
   }
 
   private val sensors = application.getSystemService(android.content.Context.SENSOR_SERVICE) as android.hardware.SensorManager
