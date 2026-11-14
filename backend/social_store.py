@@ -233,16 +233,6 @@ def seed_everyday_social_data(db: Any) -> None:
             "radius_m": 0.95,
             "created_by": "usr-conor",
         })
-        db.upsert_zone({
-            "zone_id": "zone-room-desk",
-            "world_id": "world_1",
-            "name": "Room Desk",
-            "x": -0.85,
-            "y": 0.75,
-            "z": -0.35,
-            "radius_m": 0.95,
-            "created_by": "usr-conor",
-        })
 
     # Seed clean everyday friend notes if none exist
     if not db.list_pins():

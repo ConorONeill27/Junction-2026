@@ -59,7 +59,7 @@ function createLabelSprite(title, subtitle = "", accent = "#22c55e") {
   const tex = new THREE.CanvasTexture(canvas);
   const mat = new THREE.SpriteMaterial({ map: tex, transparent: true, depthTest: false });
   const sprite = new THREE.Sprite(mat);
-  sprite.scale.set(1.15, 0.29, 1);
+  sprite.scale.set(0.62, 0.16, 1);
   return sprite;
 }
 
@@ -716,7 +716,7 @@ export default function App() {
       markersGroup.add(sprite);
     });
 
-    // 3) Render audience-scoped spatial pins & place reviews
+    // 3) Render audience-scoped spatial pins belonging to THIS scanned space only
     const AUDIENCE_HEX = {
       public: 0x34d399,
       friends: 0x2997ff,
@@ -727,22 +727,23 @@ export default function App() {
     (spatialPins || []).forEach((pin) => {
       if (!Array.isArray(pin.position) || pin.position.length < 3) return;
       if (pin.pin_type === "bottle") return;
+      if (pin.world_id !== mp.worldId) return;
       const [px, py, pz] = pin.position;
       const hex = AUDIENCE_HEX[pin.audience_type] || 0x2997ff;
       const hexStr = `#${hex.toString(16).padStart(6, "0")}`;
 
       const orb = new THREE.Mesh(
-        new THREE.OctahedronGeometry(0.065, 0),
+        new THREE.OctahedronGeometry(0.05, 0),
         new THREE.MeshBasicMaterial({ color: hex })
       );
-      orb.position.set(px, py + 0.14, pz);
+      orb.position.set(px, py + 0.1, pz);
       markersGroup.add(orb);
 
       const title = pin.place_name
         ? `${pin.place_name}${pin.rating ? ` (${pin.rating}/5)` : ""}`
         : pin.landmark || "Spatial Note";
       const sprite = createLabelSprite(title, `${pin.author}: ${pin.text}`, hexStr);
-      sprite.position.set(px, py + 0.45, pz);
+      sprite.position.set(px, py + 0.3, pz);
       markersGroup.add(sprite);
     });
 
@@ -755,7 +756,7 @@ export default function App() {
         : null;
       if (!pos || pos.length < 3) return;
       const [zx, zy, zz] = pos;
-      const zRingGeo = new THREE.RingGeometry(0.32, 0.36, 36);
+      const zRingGeo = new THREE.RingGeometry(0.22, 0.25, 36);
       zRingGeo.rotateX(-Math.PI / 2);
       const zRing = new THREE.Mesh(
         zRingGeo,
@@ -766,33 +767,35 @@ export default function App() {
           opacity: 0.45,
         })
       );
-      zRing.position.set(zx, Math.max(0.02, zy - 0.35), zz);
+      zRing.position.set(zx, Math.max(0.015, zy), zz);
       markersGroup.add(zRing);
 
       const zSprite = createLabelSprite(zone.name, "Named Zone", "#38bdf8");
-      zSprite.scale.set(0.85, 0.22, 1);
-      zSprite.position.set(zx, zy + 0.28, zz);
+      zSprite.scale.set(0.54, 0.14, 1);
+      zSprite.position.set(zx, zy + 0.22, zz);
       markersGroup.add(zSprite);
     });
 
-    // 5) Render Live Multiplayer Wearer Avatars
+    // 5) Render Live Multiplayer Wearer Avatars ONLY when actively streaming
     const WEARER_COLORS = ["#34d399", "#2997ff", "#f59e0b", "#c084fc"];
-    (mp.liveState?.wearers || []).forEach((w, idx) => {
-      if (!Array.isArray(w.position) || w.position.length < 3) return;
-      const [wx, wy, wz] = w.position;
-      const colStr = WEARER_COLORS[idx % WEARER_COLORS.length];
-      const avatar = new THREE.Mesh(
-        new THREE.SphereGeometry(0.08, 16, 16),
-        new THREE.MeshBasicMaterial({ color: colStr })
-      );
-      avatar.position.set(wx, wy, wz);
-      markersGroup.add(avatar);
+    (mp.liveState?.wearers || [])
+      .filter((w) => Boolean(w.sensor_active))
+      .forEach((w, idx) => {
+        if (!Array.isArray(w.position) || w.position.length < 3) return;
+        const [wx, wy, wz] = w.position;
+        const colStr = WEARER_COLORS[idx % WEARER_COLORS.length];
+        const avatar = new THREE.Mesh(
+          new THREE.SphereGeometry(0.065, 16, 16),
+          new THREE.MeshBasicMaterial({ color: colStr })
+        );
+        avatar.position.set(wx, wy, wz);
+        markersGroup.add(avatar);
 
-      const wSprite = createLabelSprite(w.name || w.wearer_id, w.landmark || "Live", colStr);
-      wSprite.scale.set(0.8, 0.2, 1);
-      wSprite.position.set(wx, wy + 0.32, wz);
-      markersGroup.add(wSprite);
-    });
+        const wSprite = createLabelSprite(w.name || w.wearer_id, "Live", colStr);
+        wSprite.scale.set(0.5, 0.13, 1);
+        wSprite.position.set(wx, wy + 0.24, wz);
+        markersGroup.add(wSprite);
+      });
 
     // 6) Render From -> To Movement Arc for Ask Result
     if (mp.askResult?.path?.from_position && mp.askResult?.path?.to_position) {
