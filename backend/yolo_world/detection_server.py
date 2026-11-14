@@ -10,6 +10,7 @@ import threading
 import time
 from audio_clips import AudioClips, DEFAULT_AUDIO_DIR, MAX_AUDIO_BYTES
 from parakeet_asr import ParakeetClient, TranscriptionUnavailable, MAX_PCM_BYTES, validate_pcm
+from place_anchors import DEFAULT_PLACES_DIR, PlaceAnchorStore
 from spatial_notes import DEFAULT_NOTES_DIR, SpatialNoteStore
 
 
@@ -25,7 +26,7 @@ class CameraHTTPServer(ThreadingHTTPServer):
 
 
 class DetectionServer:
-    def __init__(self, host="0.0.0.0", port=8765, predict=None, track=None, audio_dir=DEFAULT_AUDIO_DIR, transcribe=None, notes_dir=DEFAULT_NOTES_DIR):
+    def __init__(self, host="0.0.0.0", port=8765, predict=None, track=None, audio_dir=DEFAULT_AUDIO_DIR, transcribe=None, notes_dir=DEFAULT_NOTES_DIR, places_dir=DEFAULT_PLACES_DIR):
         self.lock = threading.Lock()
         self.snapshot = {"timestamp": None, "source": "laptop_camera", "detections": []}
         owner = self
@@ -33,6 +34,7 @@ class DetectionServer:
         self.audio_clips = AudioClips(audio_dir)
         self.transcribe = transcribe or ParakeetClient().transcribe
         self.notes = SpatialNoteStore(notes_dir)
+        self.places = PlaceAnchorStore(places_dir)
         self.latest_frame = None
         self.latest_detections = []
 
@@ -67,6 +69,9 @@ class DetectionServer:
                 if self.path == "/api/notes":
                     self._send_json({"notes": owner.notes.list_notes()})
                     return
+                if self.path == "/api/places":
+                    self._send_json({"places": owner.places.list_places()})
+                    return
                 if self.path != "/api/detections":
                     self.send_error(404)
                     return
@@ -84,6 +89,10 @@ class DetectionServer:
                     owner.notes.clear()
                     self._send_json({"ok": True, "notes": []})
                     return
+                if self.path == "/api/places":
+                    owner.places.clear()
+                    self._send_json({"ok": True, "places": []})
+                    return
                 self.send_error(404)
 
             def do_POST(self):
@@ -92,6 +101,9 @@ class DetectionServer:
                     return
                 if self.path == "/api/notes":
                     self.save_note()
+                    return
+                if self.path == "/api/places":
+                    self.save_place()
                     return
                 if self.path == '/api/transcribe':
                     self.transcribe_audio()
@@ -132,6 +144,7 @@ class DetectionServer:
                     phone_tracking = self.headers.get("X-Tracking-Mode") == "phone" and predict is not None
                     detections = predict(frame) if phone_tracking else track(frame, rotation) if track else predict(frame)
                     detections = owner.notes.annotate_detections(detections, frame)
+                    detections.extend(owner.places.match_frame(frame))
                     with owner.lock:
                         owner.latest_frame = frame.copy()
                         owner.latest_detections = list(detections)
@@ -205,6 +218,27 @@ class DetectionServer:
                     self.wfile.write(data)
                 except (OSError, ValueError):
                     self.send_error(400, 'Invalid transcription audio')
+
+            def save_place(self):
+                try:
+                    length = int(self.headers.get("Content-Length", "0"))
+                    if not 2 <= length <= 2_500_000:
+                        self.send_error(400, "Invalid place payload")
+                        return
+                    payload = json.loads(self.rfile.read(length).decode("utf-8"))
+                    with owner.lock:
+                        latest_frame = owner.latest_frame.copy() if owner.latest_frame is not None else None
+                    record = owner.places.add_place(
+                        name=payload.get("name", ""),
+                        rating=payload.get("rating", 4),
+                        review=payload.get("review", ""),
+                        author=payload.get("author", "Friend"),
+                        image_bgr=None if payload.get("image_b64") else latest_frame,
+                        image_b64=payload.get("image_b64"),
+                    )
+                    self._send_json({"ok": True, "place": record})
+                except (OSError, ValueError, TypeError):
+                    self.send_error(400, "Invalid place request")
 
             def save_note(self):
                 try:
