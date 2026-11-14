@@ -36,4 +36,13 @@ class SpeechEndpointTest {
     repeat(299) { assertFalse(endpoint.add(voice, voice.size)) }
     assertTrue(endpoint.add(voice, voice.size))
   }
+  @Test fun manualNoteDoesNotStopForSilenceOrDuration() {
+    val endpoint = SpeechEndpoint(manualStop = true)
+    repeat(100) { assertFalse(endpoint.add(silence, silence.size)) }
+    assertFalse(endpoint.heardSpeech)
+    assertFalse(endpoint.add(voice, voice.size))
+    assertTrue(endpoint.heardSpeech)
+    repeat(400) { assertFalse(endpoint.add(silence, silence.size)) }
+    repeat(400) { assertFalse(endpoint.add(voice, voice.size)) }
+  }
 }

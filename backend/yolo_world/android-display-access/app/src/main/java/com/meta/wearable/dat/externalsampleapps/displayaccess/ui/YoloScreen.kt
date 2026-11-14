@@ -1,6 +1,9 @@
 package com.meta.wearable.dat.externalsampleapps.displayaccess.ui
 
 import android.graphics.Bitmap
+import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.ui.input.pointer.pointerInput
+import com.meta.wearable.dat.externalsampleapps.displayaccess.yoloNoteAt
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
@@ -24,7 +27,11 @@ import com.meta.wearable.dat.externalsampleapps.displayaccess.drawYoloOverlay
 @Composable
 fun YoloScreen(state: YoloState, preview: Bitmap?, savedAddress: String, onConnect: (String) -> Unit, onPreview: () -> Unit,
   audio: AudioClipState, onAudioPinch: () -> Unit, onRetryAudio: () -> Unit,
-  cursor: HeadCursorState, onCursorPinch: () -> Unit, speech: LiveSpeechState) {
+  cursor: HeadCursorState, onCursorPinch: () -> Unit, speech: LiveSpeechState, onNoteAction: (String) -> Unit) {
+  val latestState by rememberUpdatedState(state)
+  val latestCursor by rememberUpdatedState(cursor)
+  val latestSpeech by rememberUpdatedState(speech)
+  val latestNoteAction by rememberUpdatedState(onNoteAction)
   var address by rememberSaveable { mutableStateOf(savedAddress) }
   Column(Modifier.fillMaxSize().padding(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
     OutlinedTextField(value = address, onValueChange = { address = it }, label = { Text("Laptop YOLO address") },
@@ -51,8 +58,22 @@ fun YoloScreen(state: YoloState, preview: Bitmap?, savedAddress: String, onConne
     Text(state.status, style = MaterialTheme.typography.bodySmall)
     Box(Modifier.weight(1f).fillMaxWidth().background(Color.Black)) {
       if (preview != null) Image(preview.asImageBitmap(), "Phone rear camera", Modifier.fillMaxSize(), contentScale = ContentScale.Fit)
-      Canvas(Modifier.fillMaxSize()) {
-        drawYoloOverlay(drawContext.canvas.nativeCanvas, size.width, size.height, state, cursor)
+      Canvas(Modifier.fillMaxSize().pointerInput(Unit) {
+        detectTapGestures { position ->
+          val state = latestState
+          val cursor = latestCursor
+          val speech = latestSpeech
+          if (state.width <= 0 || state.height <= 0) return@detectTapGestures
+          val scale = minOf(size.width.toFloat() / state.width, size.height.toFloat() / state.height)
+          val left = (size.width - state.width * scale) / 2f
+          val top = (size.height - state.height * scale) / 2f
+          val tapped = cursor.copy(visible = true,
+            x = (position.x - left) / scale / state.width,
+            y = (position.y - top) / scale / state.height)
+          yoloNoteAt(state, tapped, speech)?.let(latestNoteAction)
+        }
+      }) {
+        drawYoloOverlay(drawContext.canvas.nativeCanvas, size.width, size.height, state, cursor, speech)
         drawLiveSpeechOverlay(drawContext.canvas.nativeCanvas, size.width, size.height, speech)
       }
     }

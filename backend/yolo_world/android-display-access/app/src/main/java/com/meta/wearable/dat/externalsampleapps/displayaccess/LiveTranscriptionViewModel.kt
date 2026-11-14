@@ -20,7 +20,7 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 import org.json.JSONObject
 
-data class LiveSpeechState(val active: Boolean = false, val text: String = "", val error: String? = null)
+data class LiveSpeechState(val active: Boolean = false, val text: String = "", val error: String? = null, val noteId: String? = null, val notes: Map<String, String> = emptyMap(), val finishing: Boolean = false)
 
 class LiveTranscriptionViewModel(application: Application) : AndroidViewModel(application) {
   private val mutableState = MutableStateFlow(LiveSpeechState())
@@ -32,18 +32,18 @@ class LiveTranscriptionViewModel(application: Application) : AndroidViewModel(ap
   private var capture: Job? = null
   private var network: Job? = null
 
-  fun unavailable(message: String) { mutableState.value = LiveSpeechState(error = message) }
+  fun unavailable(message: String) { mutableState.value = mutableState.value.copy(active = false, noteId = null, error = message) }
 
-  fun start(address: String) {
+  fun start(address: String, noteId: String? = null) {
     if (mutableState.value.active) return
     val current = generation.incrementAndGet()
     stopRequested = false
-    mutableState.value = LiveSpeechState(active = true)
+    mutableState.value = LiveSpeechState(active = true, noteId = noteId, notes = mutableState.value.notes)
     capture = viewModelScope.launch(Dispatchers.IO) {
       var recorder: AudioRecord? = null
       var error: String? = null
       val pcm = ByteArrayOutputStream()
-      val endpoint = SpeechEndpoint()
+      val endpoint = SpeechEndpoint(manualStop = noteId != null)
       try {
         val minimum = AudioRecord.getMinBufferSize(16000, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT)
         require(minimum > 0) { "16-kHz microphone input is unavailable" }
@@ -75,7 +75,7 @@ class LiveTranscriptionViewModel(application: Application) : AndroidViewModel(ap
             network = viewModelScope.launch(Dispatchers.IO) {
               try {
                 val text = recognize(address, snapshot)
-                if (generation.get() == current) mutableState.value = LiveSpeechState(active = true, text = text)
+                if (generation.get() == current) mutableState.value = mutableState.value.copy(text = text)
               } catch (failure: Exception) {
                 if (failure is CancellationException) throw failure
                 error = failure.message ?: "Parakeet GPU transcription failed"
@@ -94,23 +94,39 @@ class LiveTranscriptionViewModel(application: Application) : AndroidViewModel(ap
       }
       network?.join()
       if (generation.get() != current) return@launch
-      if (error == null && endpoint.heardSpeech) {
+      if (error == null && endpoint.heardSpeech && pcm.size() >= 3200) {
         try {
           val text = recognize(address, pcm.toByteArray())
           if (generation.get() != current) return@launch
-          mutableState.value = LiveSpeechState(active = true, text = text)
-          delay(700) // Briefly show the final words, then clear both mic and caption.
+          mutableState.value = mutableState.value.copy(text = text)
+          if (noteId == null) delay(700) // Notes remain visible after capture ends.
         } catch (failure: Exception) {
           if (failure is CancellationException) throw failure
           error = failure.message ?: "Final transcription failed"
         }
       }
-      if (generation.get() == current) mutableState.value = LiveSpeechState(error = error)
+      if (generation.get() == current) {
+        val result = mutableState.value
+        val notes = if (noteId != null && result.text.isNotBlank()) result.notes + (noteId to result.text) else result.notes
+        mutableState.value = LiveSpeechState(error = error, notes = notes)
+      }
       Log.i("WorldGitSpeech", "Live speech finished; heardSpeech=${endpoint.heardSpeech}; error=$error")
     }
   }
 
   private fun recognize(address: String, pcm: ByteArray): String {
+    // Keep microphone capture independent of network work, and respect the
+    // existing server's 30-second request limit even for long manual notes.
+    val segmentBytes = 16000 * 2 * 25
+    return (pcm.indices step segmentBytes).map { offset ->
+      val end = minOf(offset + segmentBytes, pcm.size)
+      val segment = pcm.copyOfRange(offset, end)
+      // Pad a very short final segment to the server's 100-ms minimum.
+      recognizeChunk(address, if (segment.size < 3200) segment.copyOf(3200) else segment)
+    }.filter { it.isNotBlank() }.joinToString(" ")
+  }
+
+  private fun recognizeChunk(address: String, pcm: ByteArray): String {
     val active = URI("${address.trimEnd('/')}/api/transcribe").toURL().openConnection() as HttpURLConnection
     connection = active
     try {
@@ -137,7 +153,7 @@ class LiveTranscriptionViewModel(application: Application) : AndroidViewModel(ap
     }
   }
 
-  fun finish() { stopRequested = true }
+  fun finish() { stopRequested = true; mutableState.value = mutableState.value.copy(finishing = true) }
 
   fun cancel() {
     generation.incrementAndGet()
@@ -146,7 +162,7 @@ class LiveTranscriptionViewModel(application: Application) : AndroidViewModel(ap
     connection?.disconnect()
     capture?.cancel()
     network?.cancel()
-    mutableState.value = LiveSpeechState()
+    mutableState.value = LiveSpeechState(notes = mutableState.value.notes)
   }
 
   override fun onCleared() { cancel(); super.onCleared() }

@@ -4,7 +4,7 @@ import kotlin.math.max
 import kotlin.math.sqrt
 
 /** Sample-count timing keeps endpointing independent of network and UI delays. */
-class SpeechEndpoint(private val sampleRate: Int = 16000) {
+class SpeechEndpoint(private val sampleRate: Int = 16000, private val manualStop: Boolean = false) {
   var heardSpeech = false
     private set
   private var samples = 0L
@@ -29,8 +29,8 @@ class SpeechEndpoint(private val sampleRate: Int = 16000) {
       voicedRun = 0
       if (!heardSpeech) noise = noise * .95 + rms * .05
     }
-    return samples >= sampleRate * 30L ||
+    return !manualStop && (samples >= sampleRate * 30L ||
       (heardSpeech && samples - lastVoice >= sampleRate * 12L / 10) ||
-      (!heardSpeech && samples >= sampleRate * 8L)
+      (!heardSpeech && samples >= sampleRate * 8L))
   }
 }
