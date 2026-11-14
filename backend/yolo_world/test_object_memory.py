@@ -81,6 +81,52 @@ class ObjectMemoryTests(unittest.TestCase):
             finally:
                 server.close()
 
+    def test_left_behind_voice_query_beside_left_bed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            room_dets = [
+                {"object_id": "c1", "label": "chair", "confidence": 0.70, "bbox_xyxy": [0.0, 250.0, 345.0, 720.0]},
+                {"object_id": "b1", "label": "bottle", "confidence": 0.49, "bbox_xyxy": [525.0, 600.0, 583.0, 710.0]},
+                {"object_id": "bed1", "label": "bed", "confidence": 0.51, "bbox_xyxy": [598.0, 380.0, 720.0, 1000.0]},
+            ]
+            server = DetectionServer(
+                "127.0.0.1",
+                0,
+                predict=lambda _f: room_dets,
+                notes_dir=Path(tmp) / "notes",
+                places_dir=Path(tmp) / "places",
+                memory_dir=Path(tmp) / "memory",
+            ).start()
+            port = server.http.server_address[1]
+            try:
+                frame = np.full((1000, 720, 3), 40, dtype=np.uint8)
+                ok, jpg = cv2.imencode(".jpg", frame)
+                self.assertTrue(ok)
+                req = urllib.request.Request(
+                    f"http://127.0.0.1:{port}/api/frame",
+                    data=jpg.tobytes(),
+                    headers={"Content-Type": "image/jpeg", "X-Tracking-Mode": "phone"},
+                    method="POST",
+                )
+                with urllib.request.urlopen(req, timeout=5) as resp:
+                    self.assertEqual(resp.status, 200)
+
+                ask_req = urllib.request.Request(
+                    f"http://127.0.0.1:{port}/api/memory/ask",
+                    data=json.dumps({"question": "hey meta, have i left anything behind?"}).encode("utf-8"),
+                    headers={"Content-Type": "application/json"},
+                    method="POST",
+                )
+                with urllib.request.urlopen(ask_req, timeout=5) as resp:
+                    ans = json.loads(resp.read().decode("utf-8"))
+                self.assertTrue(ans["found"])
+                self.assertEqual(
+                    ans["spoken_response"],
+                    "You left your water bottle on the ground beside the left bed.",
+                )
+                self.assertTrue(len(ans.get("snapshot_b64", "")) > 100)
+            finally:
+                server.close()
+
 
 if __name__ == "__main__":
     unittest.main()

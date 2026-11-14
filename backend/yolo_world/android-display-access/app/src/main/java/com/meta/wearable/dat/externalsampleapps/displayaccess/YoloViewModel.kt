@@ -144,13 +144,14 @@ class YoloViewModel(application: Application) : AndroidViewModel(application) {
   @Volatile private var ttsReady = false
   private var tts: TextToSpeech? = null
 
-  private fun speakAloud(key: String, text: String) {
+  private fun speakAloud(key: String, text: String, force: Boolean = false) {
     if (!mutableTtsEnabled.value || !ttsReady || text.isBlank()) return
     val now = System.currentTimeMillis()
     val prev = spokenCooldown[key] ?: 0L
-    if (now - prev < 6000L) return
+    if (!force && now - prev < 6000L) return
     spokenCooldown[key] = now
-    tts?.speak(text, TextToSpeech.QUEUE_ADD, null, key)
+    val mode = if (force) TextToSpeech.QUEUE_FLUSH else TextToSpeech.QUEUE_ADD
+    tts?.speak(text, mode, null, key)
   }
 
   fun toggleTts() {
@@ -179,9 +180,40 @@ class YoloViewModel(application: Application) : AndroidViewModel(application) {
           BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
         } else null
         mutableMemoryCard.value = MemoryCardState(found, query, summary, bmp)
-        speakAloud("memory-$query", summary)
+        speakAloud("memory-$query", summary, force = true)
       }.onFailure {
         mutableMemoryCard.value = MemoryCardState(false, query, "Cannot reach laptop server for $query")
+      }
+    }
+  }
+
+  fun askMemory(question: String = "hey meta, have i left anything behind?") {
+    val cleanQ = question.trim().ifBlank { "have i left anything behind?" }
+    val target = base.trimEnd('/')
+    viewModelScope.launch(Dispatchers.IO) {
+      runCatching {
+        val body = JSONObject().put("question", cleanQ).toString().toByteArray()
+        val conn = URI("$target/api/memory/ask").toURL().openConnection() as HttpURLConnection
+        conn.connectTimeout = 2500
+        conn.readTimeout = 2500
+        conn.requestMethod = "POST"
+        conn.doOutput = true
+        conn.setRequestProperty("Content-Type", "application/json")
+        conn.outputStream.use { it.write(body) }
+        val stream = if (conn.responseCode in 200..299) conn.inputStream else conn.errorStream
+        val json = JSONObject(stream.bufferedReader().use { it.readText() })
+        conn.disconnect()
+        val found = json.optBoolean("found", false)
+        val spoken = json.optString("spoken_response", json.optString("summary", "No memory found"))
+        val b64 = json.optString("snapshot_b64", "")
+        val bmp = if (b64.isNotBlank()) {
+          val bytes = Base64.decode(b64, Base64.DEFAULT)
+          BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
+        } else null
+        mutableMemoryCard.value = MemoryCardState(found, cleanQ, spoken, bmp)
+        speakAloud("ask", spoken, force = true)
+      }.onFailure {
+        mutableMemoryCard.value = MemoryCardState(false, cleanQ, "Cannot reach laptop server")
       }
     }
   }

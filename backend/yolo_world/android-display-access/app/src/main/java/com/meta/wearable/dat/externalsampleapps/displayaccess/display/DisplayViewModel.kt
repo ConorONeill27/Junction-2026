@@ -508,11 +508,28 @@ class DisplayViewModel(
       val p = android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG).apply {
         color = android.graphics.Color.argb(220, 12, 24, 18); style = android.graphics.Paint.Style.FILL
       }
-      hudCanvas.drawRoundRect(20f, 520f, 580f, 584f, 10f, 10f, p)
+      hudCanvas.drawRoundRect(16f, 512f, 584f, 588f, 10f, 10f, p)
       p.style = android.graphics.Paint.Style.STROKE; p.strokeWidth = 2f; p.color = android.graphics.Color.rgb(72, 235, 160)
-      hudCanvas.drawRoundRect(20f, 520f, 580f, 584f, 10f, 10f, p)
-      p.style = android.graphics.Paint.Style.FILL; p.color = android.graphics.Color.WHITE; p.textSize = 20f
-      hudCanvas.drawText(banner.take(48), 32f, 558f, p)
+      hudCanvas.drawRoundRect(16f, 512f, 584f, 588f, 10f, 10f, p)
+      p.style = android.graphics.Paint.Style.FILL; p.color = android.graphics.Color.WHITE; p.textSize = 18f
+      val words = banner.split(Regex("\\s+"))
+      val line1 = StringBuilder()
+      val line2 = StringBuilder()
+      for (w in words) {
+        if (line2.isEmpty() && line1.length + w.length + 1 <= 44) {
+          if (line1.isNotEmpty()) line1.append(' ')
+          line1.append(w)
+        } else {
+          if (line2.isNotEmpty()) line2.append(' ')
+          line2.append(w)
+        }
+      }
+      if (line2.isEmpty()) {
+        hudCanvas.drawText(line1.toString(), 28f, 557f, p)
+      } else {
+        hudCanvas.drawText(line1.toString(), 28f, 542f, p)
+        hudCanvas.drawText(line2.toString().take(46), 28f, 569f, p)
+      }
     }
     if (hudCalibration.showGuide) {
       val canvas = hudCanvas
