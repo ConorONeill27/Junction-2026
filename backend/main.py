@@ -29,11 +29,21 @@ from ai_services import (
 from db import SpatialDatabase
 from imu_fusion import ImuSessionStore
 from reconstruction import reconstructor
+from social_store import (
+    USER_TO_WEARER,
+    WEARER_TO_USER,
+    build_ask_answer,
+    can_user_view,
+    evaluate_sighting_transition,
+    resolve_viewer_id,
+    resolve_zone,
+    seed_everyday_social_data,
+)
 from video_localizer import DEFAULT_VIDEO_PATH, localize_video_on_world
 
 load_dotenv()
 
-app = FastAPI(title="WorldGit Spatial Hub", version="0.2.0")
+app = FastAPI(title="WorldGit Spatial Hub", version="0.3.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -51,17 +61,31 @@ class SpatialObject(BaseModel):
     seen_by: str
     timestamp: float
     confidence: float = 0.9
+    world_id: str = "world_1"
+    zone_name: str = ""
+    owner_id: str = "usr-conor"
+    audience_type: str = "group"
+    group_ids: List[str] = ["grp-family"]
 
 
 class SpatialPin(BaseModel):
-    id: str
+    id: Optional[str] = None
     author: str
     text: str
-    pin_type: str = "note"  # "warning" | "note" | "friend_memory"
+    pin_type: str = "note"  # "warning" | "note" | "friend_memory" | "bottle"
     position: List[float]
     landmark: str
-    created_at: float
+    created_at: Optional[float] = None
     age_label: str = "just now"
+    world_id: Optional[str] = None
+    author_id: Optional[str] = None
+    audience_type: str = "public"
+    group_ids: List[str] = []
+    target_user_ids: List[str] = []
+    rating: Optional[int] = None
+    place_name: Optional[str] = None
+    lat: Optional[float] = None
+    lon: Optional[float] = None
 
 
 class WearerState(BaseModel):
@@ -75,6 +99,9 @@ class WearerState(BaseModel):
     steps: int = 0
     sensor_active: bool = False
     last_seen: float
+    user_id: Optional[str] = None
+    avatar_color: Optional[str] = None
+    world_id: Optional[str] = None
 
 
 class WorldSnapshot(BaseModel):
@@ -135,164 +162,67 @@ class WorldState:
         self.raw_point_count: int = len(self.points)
         self.completed_point_count: int = 0
         self.video_trail: List[Dict[str, Any]] = []
-        self.clients: List[WebSocket] = []
+        self.active_world_id: str = "world_1"
+        self.world_cache: Dict[str, Dict[str, Any]] = {}
+        self.scan_jobs: Dict[str, Dict[str, Any]] = {}
+        self.clients: Dict[WebSocket, Dict[str, Optional[str]]] = {}
         self._seed_demo_world()
 
     def _seed_demo_world(self) -> None:
         now = time.time()
+        self.db.migrate_purge_legacy_industrial_seed()
+        seed_everyday_social_data(self.db)
 
-        # Pre-seed 3 crew wearers
         seed_wearers = [
-            WearerState(wearer_id="wearer-a", name="Alex", position=[-2.0, 1.6, -1.5], yaw=45.0, last_seen=now),
-            WearerState(wearer_id="wearer-b", name="Conor (You)", position=[1.5, 1.6, 2.5], yaw=0.0, last_seen=now),
-            WearerState(wearer_id="wearer-c", name="Sam", position=[-3.5, 1.6, 1.0], yaw=120.0, last_seen=now),
+            WearerState(
+                wearer_id="wearer-b",
+                name="Conor",
+                user_id="usr-conor",
+                avatar_color="#2997ff",
+                position=[0.95, 1.4, 0.35],
+                yaw=260.0,
+                world_id="world_1",
+                last_seen=now,
+            ),
+            WearerState(
+                wearer_id="wearer-c",
+                name="Mum",
+                user_id="usr-mum",
+                avatar_color="#34d399",
+                position=[-0.35, 1.4, -0.4],
+                yaw=120.0,
+                world_id="world_1",
+                last_seen=now,
+            ),
+            WearerState(
+                wearer_id="wearer-a",
+                name="Alex",
+                user_id="usr-alex",
+                avatar_color="#a78bfa",
+                position=[0.1, 1.4, -1.3],
+                yaw=45.0,
+                world_id="world_1",
+                last_seen=now,
+            ),
         ]
         for w in seed_wearers:
             self.wearers[w.wearer_id] = w
 
-        # Snapshot 1 (initial git commit)
-        snap1_objects = [
-            SpatialObject(
-                id="obj-drill",
-                label="Red DeWalt Drill",
-                position=[-0.2, 0.9, -0.5],
-                seen_by="Alex",
-                timestamp=now - 900,
-            ),
-            SpatialObject(
-                id="obj-socket",
-                label="10mm Socket Wrench",
-                position=[2.4, 0.8, -1.0],
-                seen_by="Sam",
-                timestamp=now - 900,
-            ),
-            SpatialObject(
-                id="obj-keys",
-                label="Car Keys",
-                position=[-0.5, 0.75, 1.2],
-                seen_by="Alex",
-                timestamp=now - 900,
-            ),
-            SpatialObject(
-                id="obj-medkit",
-                label="First Aid Kit",
-                position=[0.0, 1.4, -3.5],
-                seen_by="Sam",
-                timestamp=now - 900,
-            ),
-            SpatialObject(
-                id="obj-battery",
-                label="Backup Battery",
-                position=[1.0, 0.8, 0.0],
-                seen_by="Alex",
-                timestamp=now - 900,
-            ),
-        ]
-        snap1 = WorldSnapshot(
-            snapshot_id="pass-1",
-            label="pass-1-initial",
-            timestamp=now - 900,
-            objects=snap1_objects,
+        # Hydrate real persisted objects and pins from DB
+        for raw_obj in self.db.list_objects():
+            self.objects[raw_obj["id"]] = SpatialObject(**raw_obj)
+        for raw_pin in self.db.list_pins():
+            self.pins[raw_pin["id"]] = SpatialPin(**raw_pin)
+
+        # Preserve empty-DB snapshot baseline for Ctrl+Z compatibility
+        snap = WorldSnapshot(
+            snapshot_id="pass-initial",
+            label="initial-space",
+            timestamp=now - 60,
+            objects=[o.model_copy() for o in self.objects.values()],
         )
-
-        # Current objects (Pass 2: Drill moved, Backup Battery missing, Laser Level added)
-        current_objects = [
-            SpatialObject(
-                id="obj-drill",
-                label="Red DeWalt Drill",
-                position=[-1.8, 0.9, -2.2],
-                seen_by="Alex",
-                timestamp=now - 120,
-            ),
-            SpatialObject(
-                id="obj-socket",
-                label="10mm Socket Wrench",
-                position=[2.4, 0.8, -1.0],
-                seen_by="Sam",
-                timestamp=now - 180,
-            ),
-            SpatialObject(
-                id="obj-keys",
-                label="Car Keys",
-                position=[-0.5, 0.75, 1.2],
-                seen_by="Alex",
-                timestamp=now - 60,
-            ),
-            SpatialObject(
-                id="obj-medkit",
-                label="First Aid Kit",
-                position=[0.0, 1.4, -3.5],
-                seen_by="Sam",
-                timestamp=now - 240,
-            ),
-            SpatialObject(
-                id="obj-laser",
-                label="Laser Level",
-                position=[3.0, 0.9, 0.5],
-                seen_by="Conor (You)",
-                timestamp=now - 30,
-            ),
-        ]
-        for obj in current_objects:
-            self.objects[obj.id] = obj
-            self.db.upsert_object(obj.model_dump())
-
-        snap2 = WorldSnapshot(
-            snapshot_id="pass-2",
-            label="pass-2-current",
-            timestamp=now - 30,
-            objects=[o.model_copy() for o in current_objects],
-        )
-        self.snapshots = [snap1, snap2]
-        self.db.save_snapshot(snap1.model_dump())
-        self.db.save_snapshot(snap2.model_dump())
-
-        # Spatial Pins & Friend's World memories
-        seed_pins = [
-            SpatialPin(
-                id="pin-1",
-                author="Alex",
-                text="LIVE 400V PANEL — Do not flip Breaker #4",
-                pin_type="warning",
-                position=[-2.2, 1.3, -1.8],
-                landmark="Breaker Panel",
-                created_at=now - 120,
-                age_label="2m ago",
-            ),
-            SpatialPin(
-                id="pin-2",
-                author="Sam",
-                text="Move these drywall boxes to Floor 2 before 18:00",
-                pin_type="note",
-                position=[1.2, 0.8, -2.0],
-                landmark="Storage Rack",
-                created_at=now - 840,
-                age_label="14m ago",
-            ),
-            SpatialPin(
-                id="pin-3",
-                author="Sam",
-                text="My favourite flat white in Helsinki — get the cardamom bun!",
-                pin_type="friend_memory",
-                position=[-1.0, 1.2, 2.0],
-                landmark="Corner Espresso Bar",
-                created_at=now - 63072000,
-                age_label="2 years ago",
-            ),
-            SpatialPin(
-                id="pin-4",
-                author="Alex",
-                text="Best late-night ramen spot from our NYC trip",
-                pin_type="friend_memory",
-                position=[2.8, 1.2, 1.8],
-                landmark="East Village Ramen",
-                created_at=now - 31536000,
-                age_label="1 year ago",
-            ),
-        ]
-        for pin in seed_pins:
-            self.pins[pin.id] = pin
-            self.db.upsert_pin(pin.model_dump())
+        self.snapshots = [snap]
+        self.db.save_snapshot(snap.model_dump())
 
     def take_snapshot(self, label: str) -> WorldSnapshot:
         snap = WorldSnapshot(
@@ -329,21 +259,91 @@ class WorldState:
                     )
         return {"added": added, "removed": removed, "moved": moved}
 
-    def serialize_state(self) -> Dict[str, Any]:
+    def get_world_payload(self, world_id: Optional[str] = None) -> Dict[str, Any]:
+        wid = world_id or self.active_world_id
+        if wid in self.world_cache:
+            return self.world_cache[wid]
+        if wid != self.active_world_id:
+            idx_path = _STATIC_DIR / "worlds" / "index.json"
+            if idx_path.exists():
+                try:
+                    idx = json.loads(idx_path.read_text(encoding="utf-8"))
+                    target = next((w for w in idx.get("worlds", []) if w.get("world_id") == wid), None)
+                    if target and Path(target["json_path"]).exists():
+                        data = json.loads(Path(target["json_path"]).read_text(encoding="utf-8"))
+                        cached = {
+                            "points": data.get("points", []),
+                            "raw_point_count": int(data.get("raw_point_count") or len(data.get("points", []))),
+                            "completed_point_count": int(data.get("completed_point_count") or 0),
+                            "wall_segments": data.get("wall_segments", []),
+                            "predicted_openings": data.get("predicted_openings", []),
+                            "room_envelope": data.get("room_envelope"),
+                            "keyframes": data.get("keyframes", []),
+                        }
+                        self.world_cache[wid] = cached
+                        return cached
+                except Exception:
+                    pass
         return {
-            "type": "world_state",
-            "wearers": [w.model_dump() for w in self.wearers.values()],
-            "objects": [o.model_dump() for o in self.objects.values()],
-            "pins": [p.model_dump() for p in self.pins.values()],
-            "snapshots": [s.model_dump() for s in self.snapshots],
-            "diff": self.compute_diff(),
-            "point_count": len(self.points),
+            "points": self.points,
             "raw_point_count": self.raw_point_count or len(self.points),
             "completed_point_count": self.completed_point_count,
             "wall_segments": self.wall_segments,
             "predicted_openings": self.predicted_openings,
             "room_envelope": self.room_envelope,
             "keyframes": reconstructor.keyframes[-120:],
+        }
+
+    def serialize_state(
+        self,
+        viewer_id: Optional[str] = None,
+        world_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        vid = resolve_viewer_id(viewer_id)
+        wid = world_id or self.active_world_id
+        wp = self.get_world_payload(wid)
+
+        visible_objects = [
+            o.model_dump()
+            for o in self.objects.values()
+            if can_user_view(o.model_dump(), vid, self.db)
+        ]
+        visible_obj_ids = {o["id"] for o in visible_objects}
+
+        visible_pins = [
+            p.model_dump()
+            for p in self.pins.values()
+            if can_user_view(p.model_dump(), vid, self.db)
+        ]
+        visible_events = [
+            ev
+            for ev in self.db.list_object_events(world_id=wid, limit=80)
+            if ev["object_id"] in visible_obj_ids or vid == ev.get("actor_user_id")
+        ]
+        spaces_meta = [
+            s for s in self.db.list_spaces_meta() if can_user_view(s, vid, self.db)
+        ]
+
+        return {
+            "type": "world_state",
+            "viewer_id": vid,
+            "world_id": wid,
+            "wearers": [w.model_dump() for w in self.wearers.values()],
+            "objects": visible_objects,
+            "pins": visible_pins,
+            "zones": self.db.list_zones(world_id=wid),
+            "object_events": visible_events,
+            "spaces": spaces_meta,
+            "scan_jobs": list(self.scan_jobs.values()),
+            "snapshots": [s.model_dump() for s in self.snapshots],
+            "diff": self.compute_diff(),
+            "point_count": len(wp["points"]),
+            "raw_point_count": wp["raw_point_count"],
+            "completed_point_count": wp["completed_point_count"],
+            "wall_segments": wp["wall_segments"],
+            "predicted_openings": wp["predicted_openings"],
+            "room_envelope": wp["room_envelope"],
+            "keyframes": wp["keyframes"][-120:],
             "video_trail": self.video_trail,
             "tech_stack_status": {
                 "aiven": self.db.status(),
@@ -354,7 +354,6 @@ class WorldState:
 
 db = SpatialDatabase()
 world = WorldState(db=db)
-world.objects.clear()
 
 _STATIC_DIR = Path(__file__).resolve().parent / "static"
 imu_store = ImuSessionStore(_STATIC_DIR / "imu_sessions")
@@ -389,6 +388,7 @@ def _load_startup_world() -> None:
             target = next((w for w in worlds_list if w.get("world_id") == wid), worlds_list[0] if worlds_list else None)
             if target and Path(target["json_path"]).exists():
                 data = json.loads(Path(target["json_path"]).read_text(encoding="utf-8"))
+                world.active_world_id = target.get("world_id") or "world_1"
                 world.points = data.get("points", [])
                 world.raw_point_count = int(data.get("raw_point_count") or len(world.points))
                 world.completed_point_count = int(data.get("completed_point_count") or 0)
@@ -396,6 +396,15 @@ def _load_startup_world() -> None:
                 world.predicted_openings = data.get("predicted_openings", [])
                 world.room_envelope = data.get("room_envelope")
                 reconstructor.keyframes = data.get("keyframes", [])
+                world.world_cache[world.active_world_id] = {
+                    "points": world.points,
+                    "raw_point_count": world.raw_point_count,
+                    "completed_point_count": world.completed_point_count,
+                    "wall_segments": world.wall_segments,
+                    "predicted_openings": world.predicted_openings,
+                    "room_envelope": world.room_envelope,
+                    "keyframes": reconstructor.keyframes,
+                }
                 return
         except Exception:
             pass
@@ -406,16 +415,15 @@ _load_startup_world()
 
 
 async def broadcast_state() -> None:
-    payload = json.dumps(world.serialize_state())
     stale: List[WebSocket] = []
-    for ws in world.clients:
+    for ws, ctx in list(world.clients.items()):
         try:
+            payload = json.dumps(world.serialize_state(viewer_id=ctx.get("viewer_id"), world_id=ctx.get("world_id")))
             await ws.send_text(payload)
         except Exception:
             stale.append(ws)
     for ws in stale:
-        if ws in world.clients:
-            world.clients.remove(ws)
+        world.clients.pop(ws, None)
 
 
 async def broadcast_wearers() -> None:
@@ -424,14 +432,13 @@ async def broadcast_wearers() -> None:
         "wearers": [w.model_dump() for w in world.wearers.values()],
     })
     stale: List[WebSocket] = []
-    for ws in world.clients:
+    for ws in list(world.clients.keys()):
         try:
             await ws.send_text(payload)
         except Exception:
             stale.append(ws)
     for ws in stale:
-        if ws in world.clients:
-            world.clients.remove(ws)
+        world.clients.pop(ws, None)
 
 
 def _compute_directions(wearer: WearerState, target: SpatialObject) -> Dict[str, Any]:
@@ -483,8 +490,8 @@ async def health() -> Dict[str, Any]:
 
 
 @app.get("/api/state")
-async def get_state() -> Dict[str, Any]:
-    return world.serialize_state()
+async def get_state(viewer_id: Optional[str] = None, world_id: Optional[str] = None) -> Dict[str, Any]:
+    return world.serialize_state(viewer_id=viewer_id, world_id=world_id)
 
 
 def _merge_points_voxel(
@@ -524,11 +531,12 @@ async def get_points() -> Dict[str, Any]:
 
 
 @app.get("/api/points.bin")
-async def get_points_bin() -> Response:
+async def get_points_bin(world_id: Optional[str] = None) -> Response:
     """Streams [x, y, z, r, g, b] float32 tuples in compact binary for 60fps Three.js loading."""
-    if not world.points:
+    pts = world.get_world_payload(world_id)["points"] if world_id else world.points
+    if not pts:
         return Response(content=b"", media_type="application/octet-stream", headers={"X-Point-Count": "0"})
-    arr = np.asarray(world.points, dtype="<f4")
+    arr = np.asarray(pts, dtype="<f4")
     if arr.ndim != 2 or arr.shape[1] < 6:
         return Response(content=b"", media_type="application/octet-stream", headers={"X-Point-Count": "0"})
     arr = np.ascontiguousarray(arr[:, :6])
@@ -726,6 +734,14 @@ def _probe_video_duration_s(video_path: Path) -> float:
 
 
 async def _background_ingest_dat_scan(saved_vid: Path, imu_session_id: str) -> None:
+    job_id = f"scan-{uuid.uuid4().hex[:8]}"
+    world.scan_jobs[job_id] = {
+        "job_id": job_id,
+        "name": saved_vid.name,
+        "status": "processing",
+        "started_at": time.time(),
+    }
+    await broadcast_state()
     try:
         vid_dur_s = _probe_video_duration_s(saved_vid)
         imu_sess = imu_store.match_video_session(saved_vid, vid_dur_s, explicit_session_id=imu_session_id)
@@ -735,12 +751,26 @@ async def _background_ingest_dat_scan(saved_vid: Path, imu_session_id: str) -> N
         cid = clip_meta["clip_id"]
         containing = next((w for w in idx.get("worlds", []) if cid in w.get("clips", [])), None)
         if containing:
+            wid = containing["world_id"]
             _load_world_json(Path(containing["json_path"]))
-            idx["active_world_id"] = containing["world_id"]
+            world.active_world_id = wid
+            idx["active_world_id"] = wid
             mgr.save_index(idx)
+            db.upsert_space_meta({
+                "world_id": wid,
+                "display_name": containing.get("label") or saved_vid.stem,
+                "owner_id": "usr-conor",
+                "audience_type": "group",
+                "group_ids": ["grp-family"],
+            })
+            world.scan_jobs[job_id]["status"] = "ready"
+            world.scan_jobs[job_id]["world_id"] = wid
             await broadcast_state()
     except Exception as exc:
+        world.scan_jobs[job_id]["status"] = "failed"
+        world.scan_jobs[job_id]["error"] = str(exc)
         print(f"[dat-scans] background ingest error: {exc}")
+        await broadcast_state()
 
 
 @app.post("/api/dat-scans")
@@ -1032,36 +1062,333 @@ async def localize_video_endpoint(request: Request) -> Dict[str, Any]:
 class CtrlFQuery(BaseModel):
     wearer_id: str = "wearer-b"
     query: str
+    viewer_id: Optional[str] = None
+    world_id: Optional[str] = None
+
+
+def _match_objects_for_query(q_raw: str, candidates: List[SpatialObject]) -> List[SpatialObject]:
+    q = q_raw.lower().strip()
+    if any(p in q for p in ("left anything", "left behind", "anything behind", "forgot")):
+        return sorted(candidates, key=lambda o: o.timestamp, reverse=True)
+    matches = [o for o in candidates if q in o.label.lower()]
+    if not matches:
+        tokens = [t for t in q.replace("?", "").replace("'", "").split() if len(t) > 2]
+        matches = [o for o in candidates if any(t in o.label.lower() for t in tokens)]
+    return matches
 
 
 @app.post("/api/ctrl-f")
 async def ctrl_f_search(req: CtrlFQuery) -> Dict[str, Any]:
-    q = req.query.lower().strip()
-    matches = [o for o in world.objects.values() if q in o.label.lower()]
-    if not matches:
-        # Token fallback
-        tokens = [t for t in q.split() if len(t) > 2]
-        matches = [
-            o for o in world.objects.values() if any(t in o.label.lower() for t in tokens)
-        ]
+    vid = resolve_viewer_id(req.viewer_id or WEARER_TO_USER.get(req.wearer_id))
+    visible = [o for o in world.objects.values() if can_user_view(o.model_dump(), vid, db)]
+    matches = _match_objects_for_query(req.query, visible)
     if not matches:
         return {"found": False, "message": f"No teammate has seen '{req.query}' yet."}
 
     target = matches[0]
     wearer = world.wearers.get(req.wearer_id)
+    events = db.list_object_events(world_id=target.world_id, object_id=target.id, limit=25)
+    zone_label = target.zone_name or "Room"
     if not wearer:
+        spoken = build_ask_answer(target.label, zone_label, 0.0, "nearby", events)
         return {
             "found": True,
             "object": target.model_dump(),
-            "directions": f"{target.seen_by} saw {target.label}.",
+            "directions": spoken,
+            "spoken_answer": spoken,
+            "history": events,
         }
 
     nav = _compute_directions(wearer, target)
+    spoken = build_ask_answer(target.label, zone_label, nav["distance_m"], nav["turn"], events)
     return {
         "found": True,
         "object": target.model_dump(),
         "path": [wearer.position, target.position],
         **nav,
+        "spoken_answer": spoken,
+        "history": events,
+    }
+
+
+# ============================================================================
+# Everyday Consumer Multiplayer APIs (Social, Zones, Movement Ledger, Ask QA)
+# ============================================================================
+
+@app.get("/api/social/bootstrap")
+async def social_bootstrap(viewer_id: Optional[str] = None) -> Dict[str, Any]:
+    vid = resolve_viewer_id(viewer_id)
+    users = db.list_users()
+    viewer = next((u for u in users if u["user_id"] == vid), {"user_id": "guest", "name": "Guest", "handle": "@guest", "avatar_color": "#64748b", "friend_code": "GUEST"})
+    friend_ids = set(db.list_friend_ids(vid)) if vid != "guest" else set()
+    friends = [u for u in users if u["user_id"] in friend_ids]
+    groups = db.list_groups(user_id=vid) if vid != "guest" else []
+    spaces = [s for s in db.list_spaces_meta() if can_user_view(s, vid, db)]
+    return {
+        "viewer": viewer,
+        "users": users,
+        "friends": friends,
+        "groups": groups,
+        "spaces": spaces,
+        "scan_jobs": list(world.scan_jobs.values()),
+    }
+
+
+class CreateProfileReq(BaseModel):
+    name: str
+    handle: Optional[str] = None
+
+
+@app.post("/api/social/profiles")
+async def create_profile(req: CreateProfileReq) -> Dict[str, Any]:
+    clean_name = req.name.strip() or "Friend"
+    slug = "".join(c for c in clean_name.lower() if c.isalnum())[:12] or uuid.uuid4().hex[:6]
+    uid = f"usr-{slug}-{uuid.uuid4().hex[:4]}"
+    handle = req.handle.strip() if req.handle else f"@{slug}"
+    if not handle.startswith("@"):
+        handle = f"@{handle}"
+    user = {
+        "user_id": uid,
+        "name": clean_name,
+        "handle": handle,
+        "avatar_color": "#38bdf8",
+        "friend_code": uuid.uuid4().hex[:6].upper(),
+    }
+    db.upsert_user(user)
+    wid = f"wearer-{slug}"
+    world.wearers[wid] = WearerState(
+        wearer_id=wid,
+        name=clean_name,
+        user_id=uid,
+        avatar_color="#38bdf8",
+        position=[0.2, 1.4, 0.2],
+        yaw=0.0,
+        world_id=world.active_world_id,
+        last_seen=time.time(),
+    )
+    await broadcast_state()
+    return {"ok": True, "user": user}
+
+
+class AddFriendReq(BaseModel):
+    user_id: str
+    target_handle_or_code: str
+
+
+@app.post("/api/social/friends/add")
+async def add_friend_endpoint(req: AddFriendReq) -> Dict[str, Any]:
+    target = db.find_user_by_handle_or_code(req.target_handle_or_code)
+    if target is None:
+        return {"ok": False, "error": f"No user found matching '{req.target_handle_or_code}'"}
+    db.add_friendship(req.user_id, target["user_id"])
+    await broadcast_state()
+    return {"ok": True, "friend": target}
+
+
+class CreateGroupReq(BaseModel):
+    owner_id: str
+    name: str
+    kind: str = "custom"
+    member_ids: List[str] = []
+
+
+@app.post("/api/social/groups")
+async def create_group_endpoint(req: CreateGroupReq) -> Dict[str, Any]:
+    gid = f"grp-{uuid.uuid4().hex[:8]}"
+    members = list(dict.fromkeys([req.owner_id, *req.member_ids]))
+    grp = {
+        "group_id": gid,
+        "name": req.name.strip() or "New Group",
+        "kind": req.kind,
+        "owner_id": req.owner_id,
+        "invite_code": uuid.uuid4().hex[:6].upper(),
+        "member_ids": members,
+    }
+    db.create_group(grp)
+    await broadcast_state()
+    return {"ok": True, "group": grp}
+
+
+class JoinGroupReq(BaseModel):
+    user_id: str
+    invite_code: str
+
+
+@app.post("/api/social/groups/join")
+async def join_group_endpoint(req: JoinGroupReq) -> Dict[str, Any]:
+    grp = db.find_group_by_invite(req.invite_code)
+    if grp is None:
+        return {"ok": False, "error": "Invalid group invite code"}
+    db.join_group(grp["group_id"], req.user_id)
+    await broadcast_state()
+    return {"ok": True, "group": grp}
+
+
+class ShareSpaceReq(BaseModel):
+    world_id: str
+    viewer_id: str
+    display_name: Optional[str] = None
+    audience_type: str = "group"
+    group_ids: List[str] = []
+
+
+@app.post("/api/spaces/share")
+async def share_space_endpoint(req: ShareSpaceReq) -> Dict[str, Any]:
+    existing = next((s for s in db.list_spaces_meta() if s["world_id"] == req.world_id), None)
+    meta = {
+        "world_id": req.world_id,
+        "display_name": req.display_name or (existing["display_name"] if existing else req.world_id),
+        "owner_id": existing["owner_id"] if existing else req.viewer_id,
+        "audience_type": req.audience_type,
+        "group_ids": req.group_ids,
+    }
+    db.upsert_space_meta(meta)
+    await broadcast_state()
+    return {"ok": True, "space": meta}
+
+
+class CreateZoneReq(BaseModel):
+    world_id: str = "world_1"
+    name: str
+    position: List[float]
+    radius_m: float = 1.2
+    created_by: str = "usr-conor"
+
+
+@app.get("/api/zones")
+async def get_zones_endpoint(world_id: Optional[str] = None) -> Dict[str, Any]:
+    return {"zones": db.list_zones(world_id=world_id)}
+
+
+@app.post("/api/zones")
+async def create_zone_endpoint(req: CreateZoneReq) -> Dict[str, Any]:
+    zone = {
+        "zone_id": f"zone-{uuid.uuid4().hex[:8]}",
+        "world_id": req.world_id,
+        "name": req.name.strip() or "Named Zone",
+        "x": float(req.position[0]),
+        "y": float(req.position[1]),
+        "z": float(req.position[2]),
+        "radius_m": float(req.radius_m),
+        "created_by": req.created_by,
+    }
+    db.upsert_zone(zone)
+    await broadcast_state()
+    return {"ok": True, "zone": zone}
+
+
+class ObjectSightingReq(BaseModel):
+    world_id: str = "world_1"
+    label: str
+    position: List[float]
+    actor_user_id: str = "usr-conor"
+    zone_hint: Optional[str] = None
+    confidence: float = 0.9
+    audience_type: str = "group"
+    group_ids: List[str] = ["grp-family"]
+
+
+@app.post("/api/objects/sighting")
+async def record_object_sighting(req: ObjectSightingReq) -> Dict[str, Any]:
+    now = time.time()
+    slug = "".join(c if c.isalnum() else "-" for c in req.label.lower().strip()).strip("-")[:24] or "item"
+    obj_id = f"obj-{slug}"
+    actor = db.get_user(req.actor_user_id)
+    actor_name = actor["name"] if actor else req.actor_user_id
+
+    zones = db.list_zones(world_id=req.world_id)
+    resolved_zone = resolve_zone(req.world_id, req.position, zones, req.zone_hint)
+    prev = world.objects.get(obj_id)
+    prev_dict = prev.model_dump() if prev else None
+    ev_type, event = evaluate_sighting_transition(
+        prev_obj=prev_dict,
+        prev_zone=prev.zone_name if prev else None,
+        new_pos=req.position,
+        new_zone=resolved_zone,
+        actor_user_id=req.actor_user_id,
+        actor_name=actor_name,
+        label=req.label.strip(),
+        object_id=obj_id,
+        world_id=req.world_id,
+        ts=now,
+    )
+
+    obj = SpatialObject(
+        id=obj_id,
+        label=req.label.strip(),
+        position=[round(float(v), 3) for v in req.position[:3]],
+        seen_by=actor_name,
+        timestamp=now,
+        confidence=req.confidence,
+        world_id=req.world_id,
+        zone_name=resolved_zone,
+        owner_id=prev.owner_id if prev else req.actor_user_id,
+        audience_type=prev.audience_type if prev else req.audience_type,
+        group_ids=prev.group_ids if prev else req.group_ids,
+    )
+    world.objects[obj.id] = obj
+    db.upsert_object(obj.model_dump())
+    if event is not None:
+        db.append_object_event(event)
+    await broadcast_state()
+    return {"ok": True, "object": obj.model_dump(), "event_type": ev_type, "event": event}
+
+
+@app.get("/api/objects/history")
+async def get_object_history(
+    world_id: Optional[str] = None,
+    query: Optional[str] = None,
+    viewer_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    vid = resolve_viewer_id(viewer_id)
+    visible_obj_ids = {
+        o.id for o in world.objects.values() if can_user_view(o.model_dump(), vid, db)
+    }
+    events = db.list_object_events(world_id=world_id, limit=120)
+    filtered = [e for e in events if e["object_id"] in visible_obj_ids]
+    if query:
+        q = query.strip().lower()
+        filtered = [e for e in filtered if q in e["label"].lower() or q in e["summary"].lower()]
+    return {"events": filtered}
+
+
+class AskSpaceReq(BaseModel):
+    viewer_id: Optional[str] = None
+    wearer_id: str = "wearer-b"
+    query: str
+    world_id: Optional[str] = None
+
+
+@app.post("/api/ask")
+async def ask_space_qa(req: AskSpaceReq) -> Dict[str, Any]:
+    vid = resolve_viewer_id(req.viewer_id or WEARER_TO_USER.get(req.wearer_id))
+    visible_objs = [o for o in world.objects.values() if can_user_view(o.model_dump(), vid, db)]
+    matches = _match_objects_for_query(req.query, visible_objs)
+    if not matches:
+        return {
+            "found": False,
+            "spoken_answer": f"I haven't seen '{req.query}' in your shared spaces yet.",
+        }
+    if req.world_id:
+        matches.sort(key=lambda o: (0 if o.world_id == req.world_id else 1, -o.timestamp))
+    target = matches[0]
+    wearer_id = USER_TO_WEARER.get(vid, req.wearer_id)
+    wearer = world.wearers.get(wearer_id) or world.wearers.get(req.wearer_id)
+    nav = _compute_directions(wearer, target) if wearer else {"distance_m": 0.0, "bearing_deg": 0, "arrow": "↑", "turn": "nearby", "directions": ""}
+    events = db.list_object_events(world_id=target.world_id, object_id=target.id, limit=25)
+    zone_label = target.zone_name or "Room"
+    spoken = build_ask_answer(target.label, zone_label, nav["distance_m"], nav["turn"], events)
+    spaces_by_id = {s["world_id"]: s["display_name"] for s in db.list_spaces_meta()}
+    return {
+        "found": True,
+        "world_id": target.world_id,
+        "space_name": spaces_by_id.get(target.world_id, target.world_id),
+        "object": target.model_dump(),
+        "history": events,
+        "latest_move": next((e for e in reversed(events) if e.get("event_type") == "moved"), None),
+        "path": [wearer.position, target.position] if wearer else [target.position],
+        **nav,
+        "spoken_answer": spoken,
     }
 
 
@@ -1090,10 +1417,19 @@ async def ctrl_z_undo() -> Dict[str, Any]:
 
 @app.post("/api/pin")
 async def add_pin(pin: SpatialPin) -> Dict[str, Any]:
+    if not pin.id:
+        pin.id = f"pin-{uuid.uuid4().hex[:8]}"
+    if not pin.created_at:
+        pin.created_at = time.time()
+    if not pin.author_id:
+        matched_user = next((u for u in db.list_users() if u["name"].lower() == pin.author.lower()), None)
+        if matched_user:
+            pin.author_id = matched_user["user_id"]
     world.pins[pin.id] = pin
-    db.upsert_pin(pin.model_dump())
+    pin_dict = pin.model_dump()
+    db.upsert_pin(pin_dict)
     await broadcast_state()
-    return pin.model_dump()
+    return {"ok": True, "pin": pin_dict, **pin_dict}
 
 
 class HudPinRequest(BaseModel):
@@ -1360,18 +1696,36 @@ async def tts_endpoint(req: TtsRequest) -> Dict[str, Any]:
 @app.websocket("/ws/stream")
 async def ws_stream(websocket: WebSocket) -> None:
     await websocket.accept()
-    world.clients.append(websocket)
-    await websocket.send_text(json.dumps(world.serialize_state()))
+    qp = websocket.query_params
+    viewer_id = resolve_viewer_id(qp.get("viewer_id"))
+    world_id = qp.get("world_id") or world.active_world_id
+    world.clients[websocket] = {"viewer_id": viewer_id, "world_id": world_id}
+    await websocket.send_text(json.dumps(world.serialize_state(viewer_id=viewer_id, world_id=world_id)))
     try:
         while True:
             raw = await websocket.receive_text()
             msg = json.loads(raw)
             msg_type = msg.get("type")
 
-            if msg_type == "pose":
+            if msg_type == "set_context":
+                world.clients[websocket] = {
+                    "viewer_id": resolve_viewer_id(msg.get("viewer_id")),
+                    "world_id": msg.get("world_id") or world.active_world_id,
+                }
+                ctx = world.clients[websocket]
+                await websocket.send_text(
+                    json.dumps(world.serialize_state(viewer_id=ctx["viewer_id"], world_id=ctx["world_id"]))
+                )
+
+            elif msg_type == "pose":
+                uid = msg.get("user_id") or WEARER_TO_USER.get(msg["wearer_id"])
+                u = db.get_user(uid) if uid else None
                 w = WearerState(
                     wearer_id=msg["wearer_id"],
-                    name=msg.get("name", msg["wearer_id"]),
+                    name=msg.get("name") or (u["name"] if u else msg["wearer_id"]),
+                    user_id=uid,
+                    avatar_color=u["avatar_color"] if u else "#38bdf8",
+                    world_id=msg.get("world_id") or world.active_world_id,
                     position=msg["position"],
                     yaw=float(msg.get("yaw", 0.0)),
                     pitch=float(msg.get("pitch", 0.0)),
@@ -1397,5 +1751,4 @@ async def ws_stream(websocket: WebSocket) -> None:
                     )
                 )
     except WebSocketDisconnect:
-        if websocket in world.clients:
-            world.clients.remove(websocket)
+        world.clients.pop(websocket, None)
