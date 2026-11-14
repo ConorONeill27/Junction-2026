@@ -1,6 +1,10 @@
 package com.meta.wearable.dat.externalsampleapps.displayaccess
 
 import android.app.Application
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
+import android.speech.tts.TextToSpeech
+import android.util.Base64
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import kotlinx.coroutines.CancellationException
@@ -13,7 +17,10 @@ import kotlinx.coroutines.launch
 import org.json.JSONObject
 import java.net.HttpURLConnection
 import java.net.URI
+import java.net.URLEncoder
+import java.util.Locale
 
+data class MemoryCardState(val found: Boolean, val query: String, val summary: String, val snapshot: Bitmap? = null)
 data class YoloItem(val id: String, val label: String, val confidence: Double, val box: List<Double>, val note: String? = null) {
   val center: String get() = "(${((box[0] + box[2]) / 2).toInt()}, ${((box[1] + box[3]) / 2).toInt()}) px"
 }
@@ -127,7 +134,101 @@ class YoloViewModel(application: Application) : AndroidViewModel(application) {
   @Volatile private var serverRotatesImages = false
   private val generation = java.util.concurrent.atomic.AtomicInteger(0)
   @Volatile private var lastResult = 0L
+  private val mutableMemoryCard = MutableStateFlow<MemoryCardState?>(null)
+  val memoryCard = mutableMemoryCard.asStateFlow()
+  private val mutableMemoryPaused = MutableStateFlow(false)
+  val memoryPaused = mutableMemoryPaused.asStateFlow()
+  private val mutableTtsEnabled = MutableStateFlow(true)
+  val ttsEnabled = mutableTtsEnabled.asStateFlow()
+  private val spokenCooldown = mutableMapOf<String, Long>()
+  @Volatile private var ttsReady = false
+  private var tts: TextToSpeech? = null
+
+  private fun speakAloud(key: String, text: String) {
+    if (!mutableTtsEnabled.value || !ttsReady || text.isBlank()) return
+    val now = System.currentTimeMillis()
+    val prev = spokenCooldown[key] ?: 0L
+    if (now - prev < 6000L) return
+    spokenCooldown[key] = now
+    tts?.speak(text, TextToSpeech.QUEUE_ADD, null, key)
+  }
+
+  fun toggleTts() {
+    mutableTtsEnabled.value = !mutableTtsEnabled.value
+    if (!mutableTtsEnabled.value) tts?.stop()
+  }
+
+  fun dismissMemoryCard() { mutableMemoryCard.value = null }
+
+  fun findMemory(query: String = "bottle") {
+    val target = base.trimEnd('/')
+    viewModelScope.launch(Dispatchers.IO) {
+      runCatching {
+        val enc = URLEncoder.encode(query, "UTF-8")
+        val conn = URI("$target/api/memory/find?q=$enc").toURL().openConnection() as HttpURLConnection
+        conn.connectTimeout = 2500
+        conn.readTimeout = 2500
+        val stream = if (conn.responseCode in 200..299) conn.inputStream else conn.errorStream
+        val json = JSONObject(stream.bufferedReader().use { it.readText() })
+        conn.disconnect()
+        val found = json.optBoolean("found", false)
+        val summary = json.optString("summary", "No memory found for $query")
+        val b64 = json.optString("snapshot_b64", "")
+        val bmp = if (b64.isNotBlank()) {
+          val bytes = Base64.decode(b64, Base64.DEFAULT)
+          BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
+        } else null
+        mutableMemoryCard.value = MemoryCardState(found, query, summary, bmp)
+        speakAloud("memory-$query", summary)
+      }.onFailure {
+        mutableMemoryCard.value = MemoryCardState(false, query, "Cannot reach laptop server for $query")
+      }
+    }
+  }
+
+  fun togglePrivacyPause() {
+    val next = !mutableMemoryPaused.value
+    mutableMemoryPaused.value = next
+    val target = base.trimEnd('/')
+    viewModelScope.launch(Dispatchers.IO) {
+      runCatching {
+        val conn = URI("$target/api/privacy").toURL().openConnection() as HttpURLConnection
+        conn.connectTimeout = 2500
+        conn.readTimeout = 2500
+        conn.requestMethod = "POST"
+        conn.doOutput = true
+        conn.setRequestProperty("Content-Type", "application/json")
+        conn.outputStream.use { it.write(JSONObject().put("paused", next).toString().toByteArray()) }
+        conn.inputStream.use { it.readBytes() }
+        conn.disconnect()
+      }
+    }
+  }
+
+  fun clearMemories() {
+    mutableMemoryCard.value = null
+    val target = base.trimEnd('/')
+    viewModelScope.launch(Dispatchers.IO) {
+      for (ep in listOf("/api/memory", "/api/notes")) {
+        runCatching {
+          val conn = URI("$target$ep").toURL().openConnection() as HttpURLConnection
+          conn.connectTimeout = 2500
+          conn.readTimeout = 2500
+          conn.requestMethod = "DELETE"
+          conn.inputStream.use { it.readBytes() }
+          conn.disconnect()
+        }
+      }
+    }
+  }
+
   init {
+    tts = TextToSpeech(application) { status ->
+      if (status == TextToSpeech.SUCCESS) {
+        tts?.language = Locale.US
+        ttsReady = true
+      }
+    }
     if (!preferences.getBoolean("independent-estimate-v1", false)) {
       applyEstimatedCalibration()
       preferences.edit().putBoolean("independent-estimate-v1",true).apply()
@@ -254,6 +355,7 @@ class YoloViewModel(application: Application) : AndroidViewModel(application) {
                   val item = array.getJSONObject(index)
                   val box = item.getJSONArray("bbox_xyxy")
                   val note = item.optString("note").takeIf { it.isNotBlank() }
+                  if (note != null) speakAloud("note-${item.optString("label")}-$note", "${item.optString("label")}: $note")
                   YoloItem(item.optString("object_id", "object-$index"), item.getString("label"),
                     item.getDouble("confidence"), (0..3).map { box.getDouble(it) }, note)
                 }
@@ -330,6 +432,8 @@ class YoloViewModel(application: Application) : AndroidViewModel(application) {
 
   override fun onCleared() {
     stopCamera()
+    tts?.stop()
+    tts?.shutdown()
     cameraThread.quitSafely()
   }
 }

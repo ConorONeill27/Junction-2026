@@ -27,6 +27,7 @@ import com.meta.wearable.dat.externalsampleapps.displayaccess.YoloState
 import com.meta.wearable.dat.externalsampleapps.displayaccess.AudioClipState
 import com.meta.wearable.dat.externalsampleapps.displayaccess.HeadCursorState
 import com.meta.wearable.dat.externalsampleapps.displayaccess.LiveSpeechState
+import com.meta.wearable.dat.externalsampleapps.displayaccess.MemoryCardState
 import com.meta.wearable.dat.externalsampleapps.displayaccess.drawLiveSpeechOverlay
 import com.meta.wearable.dat.externalsampleapps.displayaccess.drawYoloOverlay
 
@@ -34,7 +35,10 @@ import com.meta.wearable.dat.externalsampleapps.displayaccess.drawYoloOverlay
 @Composable
 fun YoloScreen(state: YoloState, preview: Bitmap?, savedAddress: String, onConnect: (String) -> Unit, onPreview: () -> Unit,
   audio: AudioClipState, onAudioPinch: () -> Unit, onRetryAudio: () -> Unit,
-  cursor: HeadCursorState, onCursorPinch: () -> Unit, speech: LiveSpeechState, onNoteAction: (String) -> Unit, onStartGlasses: () -> Unit, glassesRunning: Boolean, calibration: HudCalibration, onCalibrationChange: (HudCalibration) -> Unit, onEstimate: () -> Unit) {
+  cursor: HeadCursorState, onCursorPinch: () -> Unit, speech: LiveSpeechState, onNoteAction: (String) -> Unit, onStartGlasses: () -> Unit, glassesRunning: Boolean, calibration: HudCalibration, onCalibrationChange: (HudCalibration) -> Unit, onEstimate: () -> Unit,
+  memoryCard: MemoryCardState? = null, onFindBottle: () -> Unit = {}, onDismissMemory: () -> Unit = {},
+  ttsEnabled: Boolean = true, onToggleTts: () -> Unit = {},
+  memoryPaused: Boolean = false, onTogglePrivacy: () -> Unit = {}, onClearMemories: () -> Unit = {}) {
   val latestState by rememberUpdatedState(state)
   val latestCursor by rememberUpdatedState(cursor)
   val latestSpeech by rememberUpdatedState(speech)
@@ -63,6 +67,12 @@ fun YoloScreen(state: YoloState, preview: Bitmap?, savedAddress: String, onConne
     }
     Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
       OutlinedButton(onClick = onCursorPinch) { Text(if (speech.active) "Finish speaking" else if (cursor.visible) "Pinch: select / speak" else "Pinch: show cursor") }
+      OutlinedButton(onClick = onFindBottle) { Text("Find bottle") }
+    }
+    Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+      OutlinedButton(onClick = onToggleTts) { Text(if (ttsEnabled) "Voice: ON" else "Voice: OFF") }
+      OutlinedButton(onClick = onTogglePrivacy) { Text(if (memoryPaused) "Memory: PAUSED" else "Memory: ON") }
+      TextButton(onClick = onClearMemories) { Text("Clear") }
     }
     Text(if (cursor.visible) "Move your head to aim. Pinch a label to select; pinch empty space to speak." else "Pinch to show the head-aimed cursor.", style = MaterialTheme.typography.bodySmall)
     speech.error?.let { Text(it, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall) }
@@ -115,6 +125,23 @@ fun YoloScreen(state: YoloState, preview: Bitmap?, savedAddress: String, onConne
         maxLines = 1, overflow = TextOverflow.Ellipsis,
         modifier = Modifier.align(Alignment.TopStart).fillMaxWidth()
           .background(Color.Black.copy(alpha = .65f)).padding(4.dp))
+      memoryCard?.let { card ->
+        Card(
+          modifier = Modifier.align(Alignment.BottomCenter).fillMaxWidth().padding(8.dp),
+          colors = CardDefaults.cardColors(containerColor = Color(0xEE0F172A)),
+        ) {
+          Row(Modifier.padding(10.dp), horizontalArrangement = Arrangement.spacedBy(10.dp), verticalAlignment = Alignment.CenterVertically) {
+            card.snapshot?.let { bmp ->
+              Image(bmp.asImageBitmap(), "Last seen", Modifier.size(68.dp), contentScale = ContentScale.Crop)
+            }
+            Column(Modifier.weight(1f)) {
+              Text("Find: ${card.query}", color = Color(0xFF48EBA0), style = MaterialTheme.typography.labelLarge)
+              Text(card.summary, color = Color.White, style = MaterialTheme.typography.bodySmall)
+            }
+            TextButton(onClick = onDismissMemory) { Text("Close", color = Color.White) }
+          }
+        }
+      }
     }
   }
   if (aligning) {

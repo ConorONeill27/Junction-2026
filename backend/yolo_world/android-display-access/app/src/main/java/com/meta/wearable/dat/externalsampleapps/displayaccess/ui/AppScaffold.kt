@@ -100,6 +100,9 @@ fun AppScaffold(
   val yoloState by yoloViewModel.state.collectAsStateWithLifecycle()
   val cursorState by yoloViewModel.cursor.collectAsStateWithLifecycle()
   val hudCalibration by yoloViewModel.calibration.collectAsStateWithLifecycle()
+  val memoryCard by yoloViewModel.memoryCard.collectAsStateWithLifecycle()
+  val memoryPaused by yoloViewModel.memoryPaused.collectAsStateWithLifecycle()
+  val ttsEnabled by yoloViewModel.ttsEnabled.collectAsStateWithLifecycle()
   val cameraPreview by yoloViewModel.preview.collectAsStateWithLifecycle()
   val activity = LocalActivity.current
   val setupScope = rememberCoroutineScope()
@@ -175,6 +178,7 @@ fun AppScaffold(
     }
   }
   LaunchedEffect(hudCalibration) { displayViewModel.updateCalibration(hudCalibration) }
+  LaunchedEffect(memoryPaused, memoryCard) { displayViewModel.updateMemoryOverlay(memoryPaused, memoryCard?.summary) }
   LaunchedEffect(audioState) { displayViewModel.updateAudio(audioState) }
   LaunchedEffect(cursorState) { displayViewModel.updateCursor(cursorState) }
   LaunchedEffect(speechState) { displayViewModel.updateSpeech(speechState) }
@@ -334,7 +338,10 @@ fun AppScaffold(
       composable(Routes.YOLO) {
         YoloScreen(yoloState, cameraPreview, yoloViewModel.savedAddress, { address -> yoloViewModel.connect(address); if (!yoloViewModel.usingGlassesCamera) permission.launch(android.Manifest.permission.CAMERA) }, ::openSamples,
           audioState, audioPinch, { audioViewModel.retryUploads(yoloViewModel.savedAddress) },
-          cursorState, cursorPinch, speechState, noteAction, startGlasses, displayViewModel.physicalCameraRequested, hudCalibration, yoloViewModel::updateCalibration, yoloViewModel::applyEstimatedCalibration)
+          cursorState, cursorPinch, speechState, noteAction, startGlasses, displayViewModel.physicalCameraRequested, hudCalibration, yoloViewModel::updateCalibration, yoloViewModel::applyEstimatedCalibration,
+          memoryCard, { yoloViewModel.findMemory("bottle") }, yoloViewModel::dismissMemoryCard,
+          ttsEnabled, yoloViewModel::toggleTts,
+          memoryPaused, yoloViewModel::togglePrivacyPause, yoloViewModel::clearMemories)
       }
       composable(Routes.CONNECT) {
         ConnectScreen(

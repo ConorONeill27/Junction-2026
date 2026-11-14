@@ -8,7 +8,9 @@ from pathlib import Path
 import socket
 import threading
 import time
+from urllib.parse import parse_qs, urlparse
 from audio_clips import AudioClips, DEFAULT_AUDIO_DIR, MAX_AUDIO_BYTES
+from object_memory import DEFAULT_MEMORY_DIR, ObjectMemoryStore
 from parakeet_asr import ParakeetClient, TranscriptionUnavailable, MAX_PCM_BYTES, validate_pcm
 from place_anchors import DEFAULT_PLACES_DIR, PlaceAnchorStore
 from spatial_notes import DEFAULT_NOTES_DIR, SpatialNoteStore
@@ -26,7 +28,7 @@ class CameraHTTPServer(ThreadingHTTPServer):
 
 
 class DetectionServer:
-    def __init__(self, host="0.0.0.0", port=8765, predict=None, track=None, audio_dir=DEFAULT_AUDIO_DIR, transcribe=None, notes_dir=DEFAULT_NOTES_DIR, places_dir=DEFAULT_PLACES_DIR):
+    def __init__(self, host="0.0.0.0", port=8765, predict=None, track=None, audio_dir=DEFAULT_AUDIO_DIR, transcribe=None, notes_dir=DEFAULT_NOTES_DIR, places_dir=DEFAULT_PLACES_DIR, memory_dir=DEFAULT_MEMORY_DIR):
         self.lock = threading.Lock()
         self.snapshot = {"timestamp": None, "source": "laptop_camera", "detections": []}
         owner = self
@@ -35,6 +37,7 @@ class DetectionServer:
         self.transcribe = transcribe or ParakeetClient().transcribe
         self.notes = SpatialNoteStore(notes_dir)
         self.places = PlaceAnchorStore(places_dir)
+        self.memory = ObjectMemoryStore(memory_dir)
         self.latest_frame = None
         self.latest_detections = []
 
@@ -72,6 +75,21 @@ class DetectionServer:
                 if self.path == "/api/places":
                     self._send_json({"places": owner.places.list_places()})
                     return
+                if self.path == "/api/memory":
+                    self._send_json({"memories": owner.memory.list_memories(), "paused": owner.memory.paused})
+                    return
+                if self.path.startswith("/api/memory/find"):
+                    qs = parse_qs(urlparse(self.path).query)
+                    q = (qs.get("q") or [""])[0]
+                    hit = owner.memory.find(q)
+                    if hit is None:
+                        self._send_json({"found": False, "query": q, "summary": f"No memory found for '{q}'"}, status=404)
+                    else:
+                        self._send_json({"found": True, **hit})
+                    return
+                if self.path == "/api/privacy":
+                    self._send_json({"paused": owner.memory.paused})
+                    return
                 if self.path != "/api/detections":
                     self.send_error(404)
                     return
@@ -93,6 +111,10 @@ class DetectionServer:
                     owner.places.clear()
                     self._send_json({"ok": True, "places": []})
                     return
+                if self.path == "/api/memory":
+                    owner.memory.clear()
+                    self._send_json({"ok": True, "memories": []})
+                    return
                 self.send_error(404)
 
             def do_POST(self):
@@ -104,6 +126,9 @@ class DetectionServer:
                     return
                 if self.path == "/api/places":
                     self.save_place()
+                    return
+                if self.path == "/api/privacy":
+                    self.toggle_privacy()
                     return
                 if self.path == '/api/transcribe':
                     self.transcribe_audio()
@@ -143,6 +168,7 @@ class DetectionServer:
                             raise ValueError("Invalid rotation")
                     phone_tracking = self.headers.get("X-Tracking-Mode") == "phone" and predict is not None
                     detections = predict(frame) if phone_tracking else track(frame, rotation) if track else predict(frame)
+                    owner.memory.observe(detections, frame)
                     detections = owner.notes.annotate_detections(detections, frame)
                     detections.extend(owner.places.match_frame(frame))
                     with owner.lock:
@@ -218,6 +244,15 @@ class DetectionServer:
                     self.wfile.write(data)
                 except (OSError, ValueError):
                     self.send_error(400, 'Invalid transcription audio')
+
+            def toggle_privacy(self):
+                try:
+                    length = int(self.headers.get("Content-Length", "0"))
+                    payload = json.loads(self.rfile.read(length).decode("utf-8")) if length > 0 else {}
+                    paused = owner.memory.set_paused(bool(payload.get("paused", not owner.memory.paused)))
+                    self._send_json({"ok": True, "paused": paused})
+                except (OSError, ValueError, TypeError):
+                    self.send_error(400, "Invalid privacy payload")
 
             def save_place(self):
                 try:

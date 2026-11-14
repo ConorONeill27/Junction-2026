@@ -446,8 +446,15 @@ class DisplayViewModel(
   fun interactionState(): YoloState = lastProjectedState
 
   private var hudCalibration = com.meta.wearable.dat.externalsampleapps.displayaccess.HudCalibration()
+  private var hudMemoryPaused = false
+  private var hudMemoryBanner: String? = null
   fun updateCalibration(value: com.meta.wearable.dat.externalsampleapps.displayaccess.HudCalibration) {
     hudCalibration = value
+    if (_uiState.value.displayState == DisplayState.STARTED) displayYoloScreen()
+  }
+  fun updateMemoryOverlay(paused: Boolean, banner: String?) {
+    hudMemoryPaused = paused
+    hudMemoryBanner = banner
     if (_uiState.value.displayState == DisplayState.STARTED) displayYoloScreen()
   }
   private var yoloRenderJob: Job? = null
@@ -491,6 +498,22 @@ class DisplayViewModel(
     com.meta.wearable.dat.externalsampleapps.displayaccess.drawYoloOverlay(
       hudCanvas, 600f, 600f, projected, cursorState, speechState)
     drawLiveSpeechOverlay(hudCanvas, 600f, 600f, speechState)
+    if (hudMemoryPaused) {
+      val p = android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG).apply {
+        color = android.graphics.Color.rgb(255, 190, 60); textSize = 20f
+      }
+      hudCanvas.drawText("PRIVACY: MEMORY PAUSED", 20f, 36f, p)
+    }
+    hudMemoryBanner?.takeIf { it.isNotBlank() }?.let { banner ->
+      val p = android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG).apply {
+        color = android.graphics.Color.argb(220, 12, 24, 18); style = android.graphics.Paint.Style.FILL
+      }
+      hudCanvas.drawRoundRect(20f, 520f, 580f, 584f, 10f, 10f, p)
+      p.style = android.graphics.Paint.Style.STROKE; p.strokeWidth = 2f; p.color = android.graphics.Color.rgb(72, 235, 160)
+      hudCanvas.drawRoundRect(20f, 520f, 580f, 584f, 10f, 10f, p)
+      p.style = android.graphics.Paint.Style.FILL; p.color = android.graphics.Color.WHITE; p.textSize = 20f
+      hudCanvas.drawText(banner.take(48), 32f, 558f, p)
+    }
     if (hudCalibration.showGuide) {
       val canvas = hudCanvas
       val paint = android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG).apply {
