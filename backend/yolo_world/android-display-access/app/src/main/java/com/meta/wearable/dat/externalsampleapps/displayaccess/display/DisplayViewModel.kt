@@ -48,6 +48,7 @@ import com.meta.wearable.dat.externalsampleapps.displayaccess.R
 import com.meta.wearable.dat.externalsampleapps.displayaccess.SampleApp
 import com.meta.wearable.dat.externalsampleapps.displayaccess.YoloState
 import com.meta.wearable.dat.externalsampleapps.displayaccess.AudioClipState
+import com.meta.wearable.dat.externalsampleapps.displayaccess.HeadCursorState
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.CoroutineExceptionHandler
@@ -218,6 +219,13 @@ class DisplayViewModel(
   private var yoloPage = 0
   private var audioState = AudioClipState()
   var onAudioPinch: (() -> Unit)? = null
+  var onCursorPinch: (() -> Unit)? = null
+  private var cursorState = HeadCursorState()
+
+  fun updateCursor(state: HeadCursorState) {
+    cursorState = state
+    if (_uiState.value.displayState == DisplayState.STARTED) displayYoloScreen()
+  }
 
   fun updateAudio(state: AudioClipState) {
     audioState = state
@@ -232,16 +240,21 @@ class DisplayViewModel(
   private fun displayYoloScreen() {
     val bitmap = android.graphics.Bitmap.createBitmap(600, 480, android.graphics.Bitmap.Config.ARGB_8888)
     com.meta.wearable.dat.externalsampleapps.displayaccess.drawYoloOverlay(
-      android.graphics.Canvas(bitmap), 600f, 480f, yoloState)
+      android.graphics.Canvas(bitmap), 600f, 480f, yoloState, cursorState)
     sendContent {
       flexBox(direction = Direction.COLUMN, gap = 4) {
         image(bitmap = bitmap, sizePreset = ImageSize.FILL, flexGrow = 1f)
-        text(audioState.message, style = TextStyle.META)
+        text(if (audioState.recording) "Recording - use Stop recording to finish" else
+          if (cursorState.visible) "Aim with your head. Pinch to select; empty space hides cursor." else "Pinch to show cursor", style = TextStyle.META)
         buttonGroup {
           button(
-            if (audioState.recording) "Stop recording" else if (audioState.uploading) "Saving audio..." else "Record audio",
-            onClick = { Log.i("WorldGitAudio", "Display primary action selected"); onAudioPinch?.invoke() },
+            if (cursorState.visible) "Select / hide cursor" else "Show cursor",
+            onClick = { onCursorPinch?.invoke() },
             actionRole = ActionRole.PRIMARY,
+          )
+          button(
+            if (audioState.recording) "Stop recording" else if (audioState.uploading) "Saving audio..." else "Record audio",
+            onClick = { Log.i("WorldGitAudio", "Audio control selected"); onAudioPinch?.invoke() },
           )
         }
       }

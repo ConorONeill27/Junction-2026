@@ -20,6 +20,23 @@ data class YoloItem(val id: String, val label: String, val confidence: Double, v
 data class YoloState(val status: String = "Enter your laptop address to connect", val items: List<YoloItem> = emptyList(), val sample: Boolean = false, val width: Int = 480, val height: Int = 640)
 
 class YoloViewModel(application: Application) : AndroidViewModel(application) {
+  private val cursorController = HeadCursorController()
+  private val mutableCursor = MutableStateFlow(HeadCursorState())
+  val cursor = mutableCursor.asStateFlow()
+  private var lastCursorPoseAt = 0L
+
+  private fun updateHeadCursor(rotation: FloatArray) {
+    val now = android.os.SystemClock.elapsedRealtimeNanos()
+    if (now - lastCursorPoseAt < 33_000_000L) return
+    lastCursorPoseAt = now
+    mutableCursor.value = cursorController.updatePose(rotation)
+  }
+
+  fun pinchCursor() {
+    mutableCursor.value = cursorController.pinch { x, y -> yoloLabelAt(mutableState.value, x, y) }
+    android.util.Log.i("WorldGitCursor", "Pinch: ${mutableCursor.value}")
+  }
+
   private val sensors = application.getSystemService(android.content.Context.SENSOR_SERVICE) as android.hardware.SensorManager
   @Volatile private var cameraRotation: FloatArray? = null
   @Volatile private var simulatedRotation: FloatArray? = null
@@ -27,6 +44,7 @@ class YoloViewModel(application: Application) : AndroidViewModel(application) {
   fun setSimulatedCameraRotation(rotation: FloatArray?) {
     require(rotation == null || (rotation.size == 9 && rotation.all { it.isFinite() }))
     simulatedRotation = rotation?.clone()
+    (simulatedRotation ?: cameraRotation)?.let { updateHeadCursor(it) }
   }
   private val sensorListener = object : android.hardware.SensorEventListener {
     override fun onAccuracyChanged(sensor: android.hardware.Sensor?, accuracy: Int) {}
@@ -36,6 +54,7 @@ class YoloViewModel(application: Application) : AndroidViewModel(application) {
       // Portrait JPEG camera axes: right, down, forward; Android device: right, up, out.
       for (row in 0..2) { rotation[row * 3 + 1] *= -1f; rotation[row * 3 + 2] *= -1f }
       cameraRotation = rotation
+      updateHeadCursor(simulatedRotation ?: rotation)
     }
   }
   private val preferences = application.getSharedPreferences("yolo", 0)
@@ -162,7 +181,7 @@ class YoloViewModel(application: Application) : AndroidViewModel(application) {
                 }
                 lastResult = System.currentTimeMillis()
                 if (generation.get() == requestGeneration) mutableState.value = YoloState(
-                  "60 FPS target | camera %.1f / flow %.1f FPS | YOLO 1.5s\n%s".format(captureFps, trackingFps, cameraMode),
+                  "60 FPS target | camera %.1f / flow %.1f FPS | YOLO 5 FPS target\n%s".format(captureFps, trackingFps, cameraMode),
                   items, false, frameSize.getInt(0), frameSize.getInt(1))
               } catch (error: CancellationException) { throw error
               } catch (error: Exception) {
@@ -176,6 +195,7 @@ class YoloViewModel(application: Application) : AndroidViewModel(application) {
   }
 
   fun stopCamera() {
+    mutableCursor.value = cursorController.hide()
     generation.incrementAndGet()
     sensors.unregisterListener(sensorListener)
     handler.post {

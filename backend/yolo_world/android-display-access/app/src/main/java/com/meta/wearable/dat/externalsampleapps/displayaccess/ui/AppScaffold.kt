@@ -91,6 +91,7 @@ fun AppScaffold(
   val audioViewModel: AudioClipsViewModel = viewModel()
   val audioState by audioViewModel.state.collectAsStateWithLifecycle()
   val yoloState by yoloViewModel.state.collectAsStateWithLifecycle()
+  val cursorState by yoloViewModel.cursor.collectAsStateWithLifecycle()
   val cameraPreview by yoloViewModel.preview.collectAsStateWithLifecycle()
   val context = androidx.compose.ui.platform.LocalContext.current
   val permission = androidx.activity.compose.rememberLauncherForActivityResult(
@@ -106,9 +107,14 @@ fun AppScaffold(
   }
   DisposableEffect(displayViewModel, audioPermission) {
     displayViewModel.onAudioPinch = audioPinch
-    onDispose { displayViewModel.onAudioPinch = null }
+    displayViewModel.onCursorPinch = { yoloViewModel.pinchCursor() }
+    onDispose {
+      displayViewModel.onAudioPinch = null
+      displayViewModel.onCursorPinch = null
+    }
   }
   LaunchedEffect(audioState) { displayViewModel.updateAudio(audioState) }
+  LaunchedEffect(cursorState) { displayViewModel.updateCursor(cursorState) }
   val lifecycleOwner = androidx.lifecycle.compose.LocalLifecycleOwner.current
   DisposableEffect(lifecycleOwner) {
     val observer = androidx.lifecycle.LifecycleEventObserver { _, event ->
@@ -205,7 +211,8 @@ fun AppScaffold(
     ) {
       composable(Routes.YOLO) {
         YoloScreen(yoloState, cameraPreview, yoloViewModel.savedAddress, { address -> yoloViewModel.connect(address); permission.launch(android.Manifest.permission.CAMERA) }, ::openSamples,
-          audioState, audioPinch, { audioViewModel.retryUploads(yoloViewModel.savedAddress) })
+          audioState, audioPinch, { audioViewModel.retryUploads(yoloViewModel.savedAddress) },
+          cursorState, { yoloViewModel.pinchCursor() })
       }
       composable(Routes.CONNECT) {
         ConnectScreen(

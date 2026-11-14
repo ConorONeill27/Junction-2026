@@ -65,6 +65,25 @@ class TrackingTests(unittest.TestCase):
             release.set()
             pipeline.close()
 
+    def test_five_fps_cadence_does_not_drift_with_late_camera_frames(self):
+        from unittest.mock import patch
+        calls = []
+        def detect(frame):
+            calls.append(1)
+            return []
+        pipeline = TrackingPipeline(detect, interval=0.2)
+        try:
+            with patch('flow_tracker.time.monotonic') as clock:
+                for index in range(20):
+                    clock.return_value = index * 0.055
+                    pipeline(self.frame)
+                    if pipeline.pending is not None:
+                        pipeline.pending.result(timeout=2)
+            # Detection slots at 0, .2, .4, .6, .8, 1 second, despite frame jitter.
+            self.assertEqual(len(calls), 6)
+        finally:
+            pipeline.close()
+
 
 if __name__ == '__main__':
     unittest.main()

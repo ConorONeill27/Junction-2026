@@ -2,7 +2,7 @@
 
 Run `start.cmd` on the laptop, then open the updated Display Access Android app.
 YOLO runs on the laptop; the phone sends upright rear-camera JPEGs and displays
-small labels at returned object centers. Camera capture and tracking uploads target 60 FPS; YOLO detection runs every 1.5 seconds,
+small labels at returned object centers. Camera capture and tracking uploads target 60 FPS; YOLO detection targets 5 FPS (every 0.2 seconds),
 with one request in flight and no frame queue.
 See [Android setup and Meta developer preview](android-display-access/WORLDGIT.md).
 For the previous laptop webcam behavior, pass `--source 0`.
@@ -19,7 +19,7 @@ py -3.12 yolo_world/run.py
 ```
 
 Uses laptop camera `0`, the small `yolov8s-worldv2.pt` model, CPU inference,
-and a 1.5-second start-to-start inference interval. If inference takes longer,
+and a 0.2-second (5 FPS) start-to-start inference interval. If inference takes longer,
 missed intervals are skipped. Frames are continuously read between detections
 to avoid camera buffering. A resizable desktop window shows the live camera with the latest detection boxes, labels, and confidence. Inference runs in a background thread so the window stays responsive. Boxes update every inference pass and can lag moving objects between passes.
 Press Q, Escape, or Ctrl+C to stop. Each pass prints labels, confidence, and pixel
@@ -56,7 +56,7 @@ person  320.00       240.00       0.9200      220.00  100.00  420.00  380.00
 Bounding boxes use `(x1_px, y1_px)` for the top-left corner and
 `(x2_px, y2_px)` for the bottom-right corner, in original camera-frame pixels.
 
-Updates follow the 1.5-second inference schedule; slow inference delays updates.
+Updates follow the 0.2-second inference schedule; slow inference delays updates.
 An empty detection pass replaces old objects with `# No objects detected`.
 Use `--output path/to/results.txt` to choose another output file. Restart a
 running application after updating the code to enable the new output.

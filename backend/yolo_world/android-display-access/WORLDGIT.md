@@ -26,7 +26,7 @@ uses the same aspect-preserving fit as the preview. Keep the phone upright.
 Camera2 capture requests 60 FPS (the nearest supported camera range is selected).
 Actual capture depends on the device. Tracking uploads target every 16.7 ms with
 one JPEG request in flight; frames are dropped under network or processing load.
-YOLO runs independently in one worker at 1.5-second start intervals (or slower if
+YOLO runs independently in one worker at 0.2-second start intervals (5 FPS) (or slower if
 inference exceeds that interval). Completed detections are advanced through a
 bounded frame history before use, avoiding jumps to old camera coordinates.
 Sparse OpenCV Lucas-Kanade flow moves each box between detections; forward/backward
@@ -106,10 +106,11 @@ buffers and drops old frames rather than accumulating latency.
 
 ## Pinch-to-record audio
 
-The YOLO glasses HUD includes one persistent primary **Record audio** action.
-A Neural Band select/pinch activates it; the next pinch activates **Stop recording**.
-In **Meta preview > Developer preview > In app**, tap this same control in the SDK
-simulated display to exercise the display action. The simulator uses the phone
+The YOLO glasses HUD keeps a dedicated **Record audio / Stop recording** control,
+separate from the primary cursor action. Select the audio control to record, then
+select **Stop recording** to save. The phone camera screen also retains its audio
+and retry controls. In **Meta preview > Developer preview > In app**, use the same
+audio control in the SDK simulated display. The simulator uses the phone
 microphone, and requests Android microphone permission on first use. Physical
 Neural Band hardware and a glasses microphone route have not been verified.
 
@@ -129,3 +130,27 @@ Run `python -m unittest discover -s backend/yolo_world -p "test_*.py" -v` to ver
 uploads, idempotence, invalid input, and saving while inference is busy. Build and
 install the APK, then test both recording transitions in the in-app display preview;
 confirm `WorldGitAudio` logs report positive duration and a saved laptop path.
+
+## Head-aimed cursor and object selection
+
+The primary Neural Band pinch action now controls the cursor; audio recording
+remains a separate explicit control. First pinch: show a small white circle at the
+center and set the current head pose as neutral. Move your head to aim. The next
+pinch selects the text label under the circle and fills that label blue. Pinching
+empty space clears selection and hides the circle. Pinching again shows a newly
+centered cursor. Selection follows the tracked object ID between camera frames.
+
+The mobile simulator uses the existing phone rotation-vector sensor as the head
+pose proxy. Move/tilt the phone to simulate head aiming. Its **Pinch: show cursor /
+select / hide** button exercises the same action as the display's primary button.
+The existing `setSimulatedCameraRotation` entry point also feeds head aiming.
+No touch-drag movement is used. Real glasses head-pose input is not verified.
+
+Head motion is relative to the pose at activation, with a 60-degree horizontal and
+45-degree vertical aiming span. Cursor positions, label drawing, and hit testing
+share camera-image coordinates, including letterboxing, on both phone and HUD.
+Leaving the camera view/app hides and resets the cursor. Rotation-vector updates
+commit cursor state at most 30 times per second.
+
+Head-aiming unit tests: `gradlew.bat testDebugUnitTest` (from the Android directory,
+with the same JAVA_HOME/ANDROID_HOME/GRADLE_USER_HOME used by `build_apk.py`).

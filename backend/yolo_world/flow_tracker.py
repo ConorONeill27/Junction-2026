@@ -1,5 +1,6 @@
 """Frame-rate sparse LK tracking with an optional camera-to-world rotation prior."""
 import copy
+import math
 import time
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
@@ -95,7 +96,7 @@ class BoxTracker:
 
 class TrackingPipeline:
     """One detector worker, bounded frame history, no queued inference requests."""
-    def __init__(self, predict, interval=1.5):
+    def __init__(self, predict, interval=0.2):
         self.predict, self.interval = predict, interval
         self.executor = ThreadPoolExecutor(max_workers=1)
         self.pending = None
@@ -127,7 +128,10 @@ class TrackingPipeline:
         result = self.tracker.update(frame, rotation)
         if self.pending is None and now >= self.next_detection:
             self.started = now
-            self.next_detection = now + self.interval
+            # Keep a fixed cadence: late camera frames must not add delay every pass.
+            # Skip missed slots without queueing stale frames if inference runs slowly.
+            self.next_detection = (now + self.interval if not self.next_detection else
+                self.next_detection + (math.floor((now - self.next_detection) / self.interval) + 1) * self.interval)
             self.pending = self.executor.submit(self.predict, frame.copy())
         return result
 

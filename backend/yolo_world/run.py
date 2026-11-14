@@ -14,7 +14,7 @@ from object_store import DEFAULT_OBJECTS_DIR, ObjectStore
 from detection_server import DetectionServer
 
 CAMERA_SOURCE = 0  # Laptop webcam; change to another index, video path, or RTSP URL.
-INFERENCE_INTERVAL = 1.5
+INFERENCE_INTERVAL = 0.2  # 5 YOLO detection passes per second.
 MODEL_PATH = Path(__file__).resolve().parent / "yolov8s-worldv2.pt"
 
 
@@ -86,7 +86,7 @@ def main():
         detection_server = DetectionServer(args.host, args.port, track=tracking).start()
         print(f"Phone detection API: http://<laptop-ip>:{args.port}/api/detections", flush=True)
         if args.source == "phone":
-            print("Waiting for phone camera JPEGs at /api/frame; phone detection target every 1.5 seconds.", flush=True)
+            print(f"Waiting for phone camera JPEGs at /api/frame; YOLO target {1 / args.interval:g} FPS (every {args.interval:g}s).", flush=True)
             while True:
                 time.sleep(0.1)
         source = int(args.source) if args.source.isdecimal() else args.source
