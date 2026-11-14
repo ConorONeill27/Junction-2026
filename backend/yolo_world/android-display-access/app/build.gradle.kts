@@ -38,9 +38,9 @@ android {
 
     // Meta Wearables Device Access Toolkit Setup
     manifestPlaceholders["mwdat_application_id"] =
-        localProperties.getProperty("mwdat_application_id", "")
+        localProperties.getProperty("mwdat_application_id", "0")
     manifestPlaceholders["mwdat_client_token"] =
-        localProperties.getProperty("mwdat_client_token", "")
+        localProperties.getProperty("mwdat_client_token", "0")
   }
 
   buildTypes {
@@ -70,6 +70,8 @@ dependencies {
   implementation(libs.androidx.material3)
   implementation(libs.androidx.navigation.compose)
   implementation("com.meta.wearable:mwdat-motion:1.0.1")
+  implementation("com.meta.wearable:mwdat-camera:1.0.1")
+  implementation("com.meta.wearable:mwdat-inputs:1.0.1")
   implementation(libs.mwdat.core)
   implementation(libs.mwdat.display)
   implementation(libs.mwdat.mockdevice)

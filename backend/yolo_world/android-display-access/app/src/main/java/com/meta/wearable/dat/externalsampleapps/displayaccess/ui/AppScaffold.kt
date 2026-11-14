@@ -99,7 +99,11 @@ fun AppScaffold(
   val audioState by audioViewModel.state.collectAsStateWithLifecycle()
   val yoloState by yoloViewModel.state.collectAsStateWithLifecycle()
   val cursorState by yoloViewModel.cursor.collectAsStateWithLifecycle()
+  val hudCalibration by yoloViewModel.calibration.collectAsStateWithLifecycle()
   val cameraPreview by yoloViewModel.preview.collectAsStateWithLifecycle()
+  val activity = LocalActivity.current
+  val setupScope = rememberCoroutineScope()
+  var resumeGlassesRegistration by remember { mutableStateOf(false) }
   val context = androidx.compose.ui.platform.LocalContext.current
   val permission = androidx.activity.compose.rememberLauncherForActivityResult(
     androidx.activity.result.contract.ActivityResultContracts.RequestPermission()
@@ -108,7 +112,7 @@ fun AppScaffold(
     androidx.activity.result.contract.ActivityResultContracts.RequestPermission()
   ) { granted ->
     if (permissionForSpeech) {
-      if (granted) speechViewModel.start(yoloViewModel.savedAddress, pendingNoteId)
+      if (granted) speechViewModel.start(yoloViewModel.savedAddress, pendingNoteId, yoloViewModel.usingGlassesCamera)
       else speechViewModel.unavailable("Microphone permission is needed for live transcription")
     } else {
       if (granted) audioViewModel.toggle(yoloViewModel.savedAddress) else audioViewModel.permissionDenied()
@@ -125,9 +129,13 @@ fun AppScaffold(
   }
   val startSpeechFor: (String?) -> Unit = { noteId ->
     pendingNoteId = noteId
-    if (audioViewModel.state.value.recording) speechViewModel.unavailable("Stop the audio clip recording before live transcription")
+    if (yoloViewModel.usingGlassesCamera && !displayViewModel.glassesMicrophoneEnabled)
+      speechViewModel.unavailable("Grant glasses microphone access, then restart glasses")
+    else if (yoloViewModel.usingGlassesCamera)
+      speechViewModel.start(yoloViewModel.savedAddress, noteId, externalAudio = true)
+    else if (audioViewModel.state.value.recording) speechViewModel.unavailable("Stop the audio clip recording before live transcription")
     else if (context.checkSelfPermission(android.Manifest.permission.RECORD_AUDIO) == android.content.pm.PackageManager.PERMISSION_GRANTED)
-      speechViewModel.start(yoloViewModel.savedAddress, noteId)
+      speechViewModel.start(yoloViewModel.savedAddress, noteId, yoloViewModel.usingGlassesCamera)
     else {
       permissionForSpeech = true
       audioPermission.launch(android.Manifest.permission.RECORD_AUDIO)
@@ -142,17 +150,23 @@ fun AppScaffold(
   val cursorPinch: () -> Unit = {
     val speech = speechViewModel.state.value
     val noteHit = com.meta.wearable.dat.externalsampleapps.displayaccess.yoloNoteAt(
-      yoloViewModel.state.value, yoloViewModel.cursor.value, speech)
+      if (yoloViewModel.usingGlassesCamera) displayViewModel.interactionState() else yoloViewModel.interactionState(), yoloViewModel.cursor.value, speech)
     if (speech.active) speechViewModel.finish()
     else if (noteHit != null) noteAction(noteHit)
-    else if (yoloViewModel.pinchCursor()) startSpeechFor(null)
+    else if (yoloViewModel.pinchCursor(if (yoloViewModel.usingGlassesCamera) displayViewModel.interactionState() else null)) startSpeechFor(null)
   }
   DisposableEffect(displayViewModel, audioPermission) {
+    displayViewModel.onGlassesVideo = yoloViewModel::receiveGlassesFrame
+    displayViewModel.onGlassesAudio = speechViewModel::receiveGlassesAudio
+    displayViewModel.onGlassesCameraStopped = yoloViewModel::stopCamera
     displayViewModel.onGlassesMotion = yoloViewModel::setGlassesMotion
     displayViewModel.onGlassesMotionStopped = yoloViewModel::clearGlassesMotion
     displayViewModel.onAudioPinch = audioPinch
     displayViewModel.onCursorPinch = cursorPinch
     onDispose {
+      displayViewModel.onGlassesVideo = null
+      displayViewModel.onGlassesAudio = null
+      displayViewModel.onGlassesCameraStopped = null
       displayViewModel.onGlassesMotion = null
       displayViewModel.onGlassesMotionStopped = null
       yoloViewModel.clearGlassesMotion()
@@ -160,24 +174,82 @@ fun AppScaffold(
       displayViewModel.onCursorPinch = null
     }
   }
+  LaunchedEffect(hudCalibration) { displayViewModel.updateCalibration(hudCalibration) }
   LaunchedEffect(audioState) { displayViewModel.updateAudio(audioState) }
   LaunchedEffect(cursorState) { displayViewModel.updateCursor(cursorState) }
   LaunchedEffect(speechState) { displayViewModel.updateSpeech(speechState) }
+  val launchPhysicalSession: (Boolean) -> Unit = { withAudio ->
+    setupScope.launch {
+      if (displayViewModel.stopSession()) {
+        wearablesViewModel.setDeveloperPreviewMode(null)
+        yoloViewModel.startGlassesCamera()
+        displayViewModel.startOnPhysicalGlasses(withAudio)
+      }
+    }
+  }
+  val glassesMicrophonePermission = androidx.activity.compose.rememberLauncherForActivityResult(
+    Wearables.RequestPermissionContract()
+  ) { result ->
+    result.onSuccess { status ->
+      launchPhysicalSession(status == com.meta.wearable.dat.core.types.PermissionStatus.Granted)
+    }.onFailure { error, _ -> speechViewModel.unavailable(error.description) }
+  }
+  val requestGlassesMicrophone: () -> Unit = {
+    setupScope.launch {
+      Wearables.checkPermissionStatus(com.meta.wearable.dat.core.types.Permission.MICROPHONE)
+        .onSuccess { status ->
+          if (status == com.meta.wearable.dat.core.types.PermissionStatus.Granted) launchPhysicalSession(true)
+          else glassesMicrophonePermission.launch(com.meta.wearable.dat.core.types.Permission.MICROPHONE)
+        }.onFailure { error, _ -> speechViewModel.unavailable(error.description) }
+    }
+  }
+  val glassesCameraPermission = androidx.activity.compose.rememberLauncherForActivityResult(
+    Wearables.RequestPermissionContract()
+  ) { result ->
+    result.onSuccess { status ->
+      if (status == com.meta.wearable.dat.core.types.PermissionStatus.Granted) requestGlassesMicrophone()
+      else speechViewModel.unavailable("Glasses camera permission is required")
+    }.onFailure { error, _ -> speechViewModel.unavailable(error.description) }
+  }
+  val requestGlassesCamera: () -> Unit = {
+    setupScope.launch {
+      Wearables.checkPermissionStatus(com.meta.wearable.dat.core.types.Permission.CAMERA)
+        .onSuccess { status ->
+          if (status == com.meta.wearable.dat.core.types.PermissionStatus.Granted) requestGlassesMicrophone()
+          else glassesCameraPermission.launch(com.meta.wearable.dat.core.types.Permission.CAMERA)
+        }.onFailure { error, _ -> speechViewModel.unavailable(error.description) }
+    }
+  }
+  val startGlasses: () -> Unit = {
+    if (displayViewModel.physicalCameraRequested) setupScope.launch {
+      displayViewModel.stopSession(); speechViewModel.cancel(); yoloViewModel.stopCamera()
+    } else if (wearablesState.registrationState == RegistrationState.REGISTERED) requestGlassesCamera()
+    else {
+      resumeGlassesRegistration = true
+      activity?.let { wearablesViewModel.startRegistration(it) }
+    }
+  }
+  LaunchedEffect(wearablesState.registrationState) {
+    if (resumeGlassesRegistration && wearablesState.registrationState == RegistrationState.REGISTERED) {
+      resumeGlassesRegistration = false
+      requestGlassesCamera()
+    }
+  }
   val lifecycleOwner = androidx.lifecycle.compose.LocalLifecycleOwner.current
   DisposableEffect(lifecycleOwner) {
     val observer = androidx.lifecycle.LifecycleEventObserver { _, event ->
-      if (event == androidx.lifecycle.Lifecycle.Event.ON_RESUME &&
+      if (event == androidx.lifecycle.Lifecycle.Event.ON_RESUME && !displayViewModel.physicalCameraRequested &&
           context.checkSelfPermission(android.Manifest.permission.CAMERA) == android.content.pm.PackageManager.PERMISSION_GRANTED) yoloViewModel.startCamera()
-      if (event == androidx.lifecycle.Lifecycle.Event.ON_PAUSE) yoloViewModel.stopCamera()
+      if (event == androidx.lifecycle.Lifecycle.Event.ON_PAUSE && !yoloViewModel.usingGlassesCamera) yoloViewModel.stopCamera()
       if (event == androidx.lifecycle.Lifecycle.Event.ON_STOP) {
         audioViewModel.finishRecording()
-        speechViewModel.cancel()
+        if (!yoloViewModel.usingGlassesCamera) speechViewModel.cancel()
       }
     }
     lifecycleOwner.lifecycle.addObserver(observer)
     onDispose { lifecycleOwner.lifecycle.removeObserver(observer); yoloViewModel.stopCamera() }
   }
-  LaunchedEffect(Unit) { permission.launch(android.Manifest.permission.CAMERA) }
+
   LaunchedEffect(yoloState) { displayViewModel.updateYolo(yoloState) }
   val displayState by displayViewModel.uiState.collectAsStateWithLifecycle()
   val mockGlasses by wearablesViewModel.mockDisplayGlasses.collectAsStateWithLifecycle()
@@ -198,7 +270,6 @@ fun AppScaffold(
             ?.display
       }
   val snackbarHostState = remember { SnackbarHostState() }
-  val activity = LocalActivity.current
   val backStackEntry by navController.currentBackStackEntryAsState()
   val currentRoute = backStackEntry?.destination?.route ?: Routes.CONNECT
 
@@ -261,9 +332,9 @@ fun AppScaffold(
         modifier = Modifier.fillMaxSize().padding(contentPadding),
     ) {
       composable(Routes.YOLO) {
-        YoloScreen(yoloState, cameraPreview, yoloViewModel.savedAddress, { address -> yoloViewModel.connect(address); permission.launch(android.Manifest.permission.CAMERA) }, ::openSamples,
+        YoloScreen(yoloState, cameraPreview, yoloViewModel.savedAddress, { address -> yoloViewModel.connect(address); if (!yoloViewModel.usingGlassesCamera) permission.launch(android.Manifest.permission.CAMERA) }, ::openSamples,
           audioState, audioPinch, { audioViewModel.retryUploads(yoloViewModel.savedAddress) },
-          cursorState, cursorPinch, speechState, noteAction)
+          cursorState, cursorPinch, speechState, noteAction, startGlasses, displayViewModel.physicalCameraRequested, hudCalibration, yoloViewModel::updateCalibration, yoloViewModel::applyEstimatedCalibration)
       }
       composable(Routes.CONNECT) {
         ConnectScreen(

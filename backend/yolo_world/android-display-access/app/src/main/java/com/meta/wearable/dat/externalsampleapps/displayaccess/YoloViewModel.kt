@@ -20,6 +20,9 @@ data class YoloItem(val id: String, val label: String, val confidence: Double, v
 data class YoloState(val status: String = "Enter your laptop address to connect", val items: List<YoloItem> = emptyList(), val sample: Boolean = false, val width: Int = 480, val height: Int = 640)
 
 class YoloViewModel(application: Application) : AndroidViewModel(application) {
+  @Volatile var usingGlassesCamera = false
+    private set
+  private val glassesFrameBusy = java.util.concurrent.atomic.AtomicBoolean(false)
   private val localTracker = LocalObjectTracker()
   private val phoneMotion = MotionPredictor()
   private val glassesMotion = MotionPredictor()
@@ -35,9 +38,9 @@ class YoloViewModel(application: Application) : AndroidViewModel(application) {
     mutableCursor.value = cursorController.updatePose(rotation)
   }
 
-  fun pinchCursor(): Boolean {
+  fun pinchCursor(hitState: YoloState? = null): Boolean {
     val wasVisible = mutableCursor.value.visible
-    mutableCursor.value = cursorController.pinch { x, y -> yoloLabelAt(mutableState.value, x, y) }
+    mutableCursor.value = cursorController.pinch { x, y -> yoloLabelAt(hitState ?: interactionState(), x, y) }
     android.util.Log.i("WorldGitCursor", "Pinch: ${mutableCursor.value}")
     return wasVisible && !mutableCursor.value.visible
   }
@@ -77,6 +80,19 @@ class YoloViewModel(application: Application) : AndroidViewModel(application) {
     }
   }
   private val preferences = application.getSharedPreferences("yolo", 0)
+  private val mutableCalibration = MutableStateFlow(HudCalibration(
+    preferences.getFloat("hud-size",1f), preferences.getFloat("hud-x",0f), preferences.getFloat("hud-y",0f), preferences.getFloat("hud-roll",0f)))
+  val calibration = mutableCalibration.asStateFlow()
+  fun applyEstimatedCalibration() { updateCalibration(HudAlignmentEstimate.estimate()) }
+  fun updateCalibration(value: HudCalibration) {
+    mutableCalibration.value = value
+    preferences.edit().putFloat("hud-size",value.size).putFloat("hud-x",value.horizontal)
+      .putFloat("hud-y",value.vertical).putFloat("hud-roll",value.roll).apply()
+  }
+  fun interactionState(): YoloState {
+    val current = mutableState.value
+    return if (usingGlassesCamera) HudProjection(current.width,current.height,mutableCalibration.value).state(current) else current
+  }
   val savedAddress: String get() = preferences.getString("address", "http://127.0.0.1:8765")!!
   private val mutableState = MutableStateFlow(YoloState())
   val state = mutableState.asStateFlow()
@@ -85,6 +101,10 @@ class YoloViewModel(application: Application) : AndroidViewModel(application) {
   private val generation = java.util.concurrent.atomic.AtomicInteger(0)
   @Volatile private var lastResult = 0L
   init {
+    if (!preferences.getBoolean("independent-estimate-v1", false)) {
+      applyEstimatedCalibration()
+      preferences.edit().putBoolean("independent-estimate-v1",true).apply()
+    }
     viewModelScope.launch {
       while (true) {
         delay(1000)
@@ -124,7 +144,7 @@ class YoloViewModel(application: Application) : AndroidViewModel(application) {
 
   fun startCamera() {
     handler.post {
-      if (camera != null) return@post
+      if (camera != null || usingGlassesCamera) return@post
       sensors.getDefaultSensor(android.hardware.Sensor.TYPE_GAME_ROTATION_VECTOR)?.let {
         sensors.registerListener(sensorListener, it, android.hardware.SensorManager.SENSOR_DELAY_FASTEST, handler)
       }
@@ -143,7 +163,11 @@ class YoloViewModel(application: Application) : AndroidViewModel(application) {
         sensors.unregisterListener(sensorListener)
         camera?.close(); camera = null
         mutableState.value = YoloState("Camera unavailable: $error")
-      }, onFrame = { frame ->
+      }, onFrame = ::processFrame)
+    }
+  }
+
+  private fun processFrame(frame: CameraFrame) {
           val bitmap = frame.bitmap
           // Measure delivered camera frames independently of tracking responses.
           val capturedAt = frame.timestampNanos
@@ -154,7 +178,7 @@ class YoloViewModel(application: Application) : AndroidViewModel(application) {
             captureCount = 0
           }
           mutablePreview.value = bitmap
-          val pose = simulatedRotation?.clone() ?: phoneMotion.predict(capturedAt)
+          val pose = if (usingGlassesCamera) glassesMotion.predict(capturedAt) else simulatedRotation?.clone() ?: phoneMotion.predict(capturedAt)
           val ratio = minOf(1f, 160f / maxOf(bitmap.width, bitmap.height))
           val small = android.graphics.Bitmap.createScaledBitmap(bitmap,
             (bitmap.width * ratio).toInt().coerceAtLeast(1), (bitmap.height * ratio).toInt().coerceAtLeast(1), true)
@@ -180,7 +204,7 @@ class YoloViewModel(application: Application) : AndroidViewModel(application) {
               try {
                 val encodeStarted = android.os.SystemClock.elapsedRealtimeNanos()
                 // Older laptop servers require upright JPEGs. Negotiate before using raw camera JPEGs.
-                val useCameraJpeg = serverRotatesImages
+                val useCameraJpeg = serverRotatesImages && frame.jpeg.isNotEmpty()
                 val payload = if (useCameraJpeg) frame.jpeg else java.io.ByteArrayOutputStream().also {
                   bitmap.compress(android.graphics.Bitmap.CompressFormat.JPEG, 70, it)
                 }.toByteArray()
@@ -231,11 +255,40 @@ class YoloViewModel(application: Application) : AndroidViewModel(application) {
               } finally { if (!succeeded) connection?.disconnect(); busy.set(false) }
             }
           }
-      })
+  }
+
+  fun startGlassesCamera() {
+    stopCamera()
+    usingGlassesCamera = true
+    handler.post {
+      localTracker.reset()
+      captureEpoch = android.os.SystemClock.elapsedRealtimeNanos()
+      captureCount = 0; nextUploadAt = 0L; trackingEpoch = 0L; trackingCount = 0
+      cameraMode = "Meta glasses camera"
+      mutableState.value = YoloState("Waiting for glasses camera...")
+    }
+  }
+
+  fun receiveGlassesFrame(data: ByteArray, width: Int, height: Int, receivedAt: Long) {
+    if (!usingGlassesCamera || !glassesFrameBusy.compareAndSet(false, true)) return
+    val currentGeneration = generation.get()
+    handler.post {
+      try {
+        if (!usingGlassesCamera || generation.get() != currentGeneration) return@post
+        val pixels = GlassesFramePixels.i420ToArgb(data, width, height)
+        val bitmap = android.graphics.Bitmap.createBitmap(pixels, width, height, android.graphics.Bitmap.Config.ARGB_8888)
+        // Keep gyro prediction in the same estimated camera model as HUD projection.
+        val focal = kotlin.math.hypot(width.toDouble(),height.toDouble()) / 2 / mutableCalibration.value.size.coerceIn(.2f,3f)
+        processFrame(CameraFrame(bitmap, ByteArray(0), 0, receivedAt, focal / width, focal / height))
+      } catch (error: Exception) {
+        android.util.Log.e("WorldGitCamera", "Glasses frame rejected", error)
+        mutableState.value = YoloState("Glasses video error: ${error.message}")
+      } finally { glassesFrameBusy.set(false) }
     }
   }
 
   fun stopCamera() {
+    usingGlassesCamera = false
     mutableCursor.value = cursorController.hide()
     generation.incrementAndGet()
     sensors.unregisterListener(sensorListener)

@@ -14,6 +14,8 @@ import java.util.concurrent.atomic.AtomicInteger
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -29,15 +31,19 @@ class LiveTranscriptionViewModel(application: Application) : AndroidViewModel(ap
   @Volatile private var stopRequested = false
   @Volatile private var microphone: AudioRecord? = null
   @Volatile private var connection: HttpURLConnection? = null
+  @Volatile private var externalCapture = false
+  private val externalPcm = Channel<ShortArray>(64)
   private var capture: Job? = null
   private var network: Job? = null
 
   fun unavailable(message: String) { mutableState.value = mutableState.value.copy(active = false, noteId = null, error = message) }
 
-  fun start(address: String, noteId: String? = null) {
+  fun start(address: String, noteId: String? = null, externalAudio: Boolean = false) {
     if (mutableState.value.active) return
     val current = generation.incrementAndGet()
     stopRequested = false
+    externalCapture = externalAudio
+    while (externalPcm.tryReceive().isSuccess) { /* discard audio from an earlier recording */ }
     mutableState.value = LiveSpeechState(active = true, noteId = noteId, notes = mutableState.value.notes)
     capture = viewModelScope.launch(Dispatchers.IO) {
       var recorder: AudioRecord? = null
@@ -45,22 +51,34 @@ class LiveTranscriptionViewModel(application: Application) : AndroidViewModel(ap
       val pcm = ByteArrayOutputStream()
       val endpoint = SpeechEndpoint(manualStop = noteId != null)
       try {
-        val minimum = AudioRecord.getMinBufferSize(16000, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT)
-        require(minimum > 0) { "16-kHz microphone input is unavailable" }
-        recorder = AudioRecord.Builder()
-          .setAudioSource(MediaRecorder.AudioSource.VOICE_RECOGNITION)
-          .setAudioFormat(AudioFormat.Builder().setSampleRate(16000)
-            .setChannelMask(AudioFormat.CHANNEL_IN_MONO).setEncoding(AudioFormat.ENCODING_PCM_16BIT).build())
-          .setBufferSizeInBytes(maxOf(minimum, 12800)).build()
-        require(recorder.state == AudioRecord.STATE_INITIALIZED) { "Microphone is unavailable" }
-        microphone = recorder
-        recorder.startRecording()
-        Log.i("WorldGitSpeech", "Live microphone started")
-        val audio = ShortArray(1600)
+        if (!externalAudio) {
+          val minimum = AudioRecord.getMinBufferSize(16000, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT)
+          require(minimum > 0) { "16-kHz microphone input is unavailable" }
+          recorder = AudioRecord.Builder()
+            .setAudioSource(MediaRecorder.AudioSource.VOICE_RECOGNITION)
+            .setAudioFormat(AudioFormat.Builder().setSampleRate(16000)
+              .setChannelMask(AudioFormat.CHANNEL_IN_MONO).setEncoding(AudioFormat.ENCODING_PCM_16BIT).build())
+            .setBufferSizeInBytes(maxOf(minimum, 12800)).build()
+          require(recorder.state == AudioRecord.STATE_INITIALIZED) { "Microphone is unavailable" }
+          microphone = recorder
+          recorder.startRecording()
+          Log.i("WorldGitSpeech", "Live microphone started")
+        }
+        var audio = ShortArray(1600)
+        var lastExternalAudio = android.os.SystemClock.elapsedRealtime()
         var nextPartial = 16000
         var finished = false
         while (!stopRequested && !finished && generation.get() == current) {
-          val count = recorder.read(audio, 0, audio.size, AudioRecord.READ_BLOCKING)
+          val count = if (externalAudio) {
+            val packet = withTimeoutOrNull(200) { externalPcm.receive() }
+            if (packet == null) {
+              check(android.os.SystemClock.elapsedRealtime() - lastExternalAudio < 5000) { "No audio received from glasses microphone" }
+              continue
+            }
+            lastExternalAudio = android.os.SystemClock.elapsedRealtime()
+            audio = packet
+            packet.size
+          } else recorder!!.read(audio, 0, audio.size, AudioRecord.READ_BLOCKING)
           check(count > 0) { "Microphone read failed" }
           val bytes = ByteArray(count * 2)
           for (index in 0 until count) {
@@ -92,6 +110,7 @@ class LiveTranscriptionViewModel(application: Application) : AndroidViewModel(ap
         recorder?.release()
         microphone = null
       }
+      externalCapture = false
       network?.join()
       if (generation.get() != current) return@launch
       if (error == null && endpoint.heardSpeech && pcm.size() >= 3200) {
@@ -108,7 +127,7 @@ class LiveTranscriptionViewModel(application: Application) : AndroidViewModel(ap
       if (generation.get() == current) {
         val result = mutableState.value
         val notes = if (noteId != null && result.text.isNotBlank()) result.notes + (noteId to result.text) else result.notes
-        mutableState.value = LiveSpeechState(error = error, notes = notes)
+        mutableState.value = LiveSpeechState(error = error ?: result.error, notes = notes)
       }
       Log.i("WorldGitSpeech", "Live speech finished; heardSpeech=${endpoint.heardSpeech}; error=$error")
     }
@@ -153,10 +172,22 @@ class LiveTranscriptionViewModel(application: Application) : AndroidViewModel(ap
     }
   }
 
+  fun receiveGlassesAudio(bytes: ByteArray) {
+    if (!externalCapture || !mutableState.value.active || stopRequested || bytes.size % 2 != 0) return
+    val samples = ShortArray(bytes.size / 2) { index ->
+      ((bytes[index*2].toInt() and 255) or (bytes[index*2+1].toInt() shl 8)).toShort()
+    }
+    if (samples.isNotEmpty() && externalPcm.trySend(samples).isFailure) {
+      stopRequested = true
+      mutableState.value = mutableState.value.copy(error = "Glasses audio arrived faster than it could be recorded")
+    }
+  }
+
   fun finish() { stopRequested = true; mutableState.value = mutableState.value.copy(finishing = true) }
 
   fun cancel() {
     generation.incrementAndGet()
+    externalCapture = false
     stopRequested = true
     runCatching { microphone?.stop() }
     connection?.disconnect()

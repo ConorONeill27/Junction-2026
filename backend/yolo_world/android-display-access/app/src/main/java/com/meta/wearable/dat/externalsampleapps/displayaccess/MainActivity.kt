@@ -32,8 +32,7 @@ class MainActivity : ComponentActivity() {
   private val permissionsLauncher =
       registerForActivityResult(RequestMultiplePermissions()) { results ->
         if (results.entries.all { it.value }) {
-          Wearables.initialize(this)
-          wearablesViewModel.startObserving()
+          initializeWearables()
         } else {
           Toast.makeText(this, "All permissions are required", Toast.LENGTH_SHORT).show()
         }
@@ -45,8 +44,17 @@ class MainActivity : ComponentActivity() {
     setContent { DisplayAccessTheme { AppScaffold(wearablesViewModel = wearablesViewModel) } }
   }
 
+  private fun initializeWearables() {
+    Wearables.initialize(this).onSuccess { wearablesViewModel.startObserving() }
+      .onFailure { error, _ ->
+        android.util.Log.e("WorldGitSetup", "Meta SDK initialization failed: $error")
+        Toast.makeText(this, "Meta setup failed: $error", Toast.LENGTH_LONG).show()
+      }
+  }
+
   override fun onStart() {
     super.onStart()
-    permissionsLauncher.launch(PERMISSIONS)
+    if (PERMISSIONS.all { checkSelfPermission(it) == android.content.pm.PackageManager.PERMISSION_GRANTED }) initializeWearables()
+    else permissionsLauncher.launch(PERMISSIONS)
   }
 }

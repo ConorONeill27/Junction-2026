@@ -51,6 +51,17 @@ import com.meta.wearable.dat.externalsampleapps.displayaccess.AudioClipState
 import com.meta.wearable.dat.externalsampleapps.displayaccess.HeadCursorState
 import com.meta.wearable.dat.externalsampleapps.displayaccess.LiveSpeechState
 import com.meta.wearable.dat.externalsampleapps.displayaccess.drawLiveSpeechOverlay
+import com.meta.wearable.dat.camera.Camera as MetaCamera
+import com.meta.wearable.dat.camera.addCamera
+import com.meta.wearable.dat.camera.removeCamera
+import com.meta.wearable.dat.camera.types.StreamConfiguration
+import com.meta.wearable.dat.camera.types.VideoQuality
+import com.meta.wearable.dat.camera.types.AudioCodec
+import com.meta.wearable.dat.camera.types.AudioSampleRate
+import com.meta.wearable.dat.inputs.addInputs
+import com.meta.wearable.dat.inputs.removeInputs
+import com.meta.wearable.dat.inputs.types.InputsConfiguration
+import com.meta.wearable.dat.inputs.types.InputEvent
 import com.meta.wearable.dat.motion.Motion
 import com.meta.wearable.dat.motion.addMotion
 import com.meta.wearable.dat.motion.removeMotion
@@ -63,6 +74,8 @@ import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.CoroutineExceptionHandler
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -230,6 +243,87 @@ class DisplayViewModel(
   private var audioState = AudioClipState()
   var onAudioPinch: (() -> Unit)? = null
   var onCursorPinch: (() -> Unit)? = null
+  var onGlassesVideo: ((ByteArray, Int, Int, Long) -> Unit)? = null
+  var onGlassesAudio: ((ByteArray) -> Unit)? = null
+  var onGlassesCameraStopped: (() -> Unit)? = null
+  var physicalCameraRequested = false
+    private set
+  private var glassesAudioRequested = false
+  val glassesMicrophoneEnabled: Boolean get() = physicalCameraRequested && glassesAudioRequested
+  private var glassesCamera: MetaCamera? = null
+  private var glassesCameraSession: DeviceSession? = null
+  private var glassesCameraJobs = emptyList<Job>()
+
+  fun startOnPhysicalGlasses(withAudio: Boolean) {
+    physicalCameraRequested = true
+    glassesAudioRequested = withAudio
+    sendSampleToDisplay(SampleApp.CAR_MAINTENANCE)
+    synchronized(sessionLock) { session }?.let {
+      if (it.state.value == DeviceSessionState.STARTED) attachGlassesCamera(it)
+    }
+  }
+
+  private fun attachGlassesCamera(currentSession: DeviceSession) {
+    if (!physicalCameraRequested || glassesCamera != null) return
+    currentSession.addCamera(StreamConfiguration(
+      videoQuality = VideoQuality.LOW, frameRate = 24, compressVideo = false,
+      audioCodec = if (glassesAudioRequested) AudioCodec.PCM(sampleRate = AudioSampleRate.RATE_16000, numberOfChannels = 1) else null,
+    )).fold(
+      onSuccess = { attached ->
+        glassesCamera = attached
+        glassesCameraSession = currentSession
+        glassesCameraJobs = listOf(
+          viewModelScope.launch(Dispatchers.Default + sessionObserverExceptionHandler, start = CoroutineStart.UNDISPATCHED) {
+            attached.stream.videoStream.collect { frame ->
+              if (!frame.isCompressed && !frame.isCodecConfig) {
+                val copy = frame.buffer.duplicate()
+                val bytes = ByteArray(copy.remaining())
+                copy.get(bytes)
+                onGlassesVideo?.invoke(bytes, frame.width, frame.height, android.os.SystemClock.elapsedRealtimeNanos())
+              }
+            }
+          },
+          viewModelScope.launch(Dispatchers.Default + sessionObserverExceptionHandler, start = CoroutineStart.UNDISPATCHED) {
+            attached.stream.audioStream.collect { frame ->
+              val copy = frame.buffer.duplicate()
+              val bytes = ByteArray(copy.remaining())
+              copy.get(bytes)
+              onGlassesAudio?.invoke(bytes)
+            }
+          },
+          viewModelScope.launch(sessionObserverExceptionHandler, start = CoroutineStart.UNDISPATCHED) {
+            attached.stream.state.collect { Log.i(TAG, "Glasses camera state: $it") }
+          },
+          viewModelScope.launch(sessionObserverExceptionHandler, start = CoroutineStart.UNDISPATCHED) {
+            attached.stream.errorStream.collect { error ->
+              Log.e(TAG, "Glasses camera error: ${error.description}")
+              _uiState.value = _uiState.value.copy(errorMessage = error.description, snackbarMessage = error.description)
+            }
+          },
+        )
+        attached.stream.start().onFailure { error, _ ->
+          Log.e(TAG, "Glasses stream start failed: ${error.description}")
+          _uiState.value = _uiState.value.copy(errorMessage = error.description, snackbarMessage = error.description)
+        }
+      },
+      onFailure = { error, _ ->
+        Log.e(TAG, "Glasses camera attach failed: ${error.description}")
+        _uiState.value = _uiState.value.copy(errorMessage = error.description, snackbarMessage = error.description)
+      },
+    )
+  }
+
+  private fun detachGlassesCamera() {
+    glassesCamera?.stop()
+    glassesCameraJobs.forEach { it.cancel() }
+    glassesCameraJobs = emptyList()
+    glassesCameraSession?.removeCamera()
+    glassesCamera = null
+    glassesCameraSession = null
+    physicalCameraRequested = false
+    onGlassesCameraStopped?.invoke()
+  }
+
   var onGlassesMotion: ((FloatArray?, FloatArray?) -> Unit)? = null
   var onGlassesMotionStopped: (() -> Unit)? = null
   private var motion: Motion? = null
@@ -255,6 +349,9 @@ class DisplayViewModel(
                 }
               }
               val gyro = sample.gyroscope?.let { floatArrayOf(it.x, -it.y, -it.z) }
+              val receivedAt = android.os.SystemClock.elapsedRealtimeNanos()
+              rotation?.let { hudMotion.orientation(it,receivedAt) }
+              gyro?.let { hudMotion.angularVelocity(it[0],it[1],it[2],receivedAt) }
               onGlassesMotion?.invoke(rotation, gyro)
             }
           },
@@ -309,37 +406,104 @@ class DisplayViewModel(
 
   fun updateYolo(state: YoloState) {
     yoloState = state
+    val now = android.os.SystemClock.elapsedRealtimeNanos()
+    hudPredictor.observe(state, if (physicalCameraRequested) hudMotion.predict(now) else null, now / 1e9, hudCalibration)
     if (_uiState.value.displayState == DisplayState.STARTED) displayYoloScreen()
   }
 
+  private var inputsSession: DeviceSession? = null
+  private var inputsJob: Job? = null
+  private var inputsAttached = false
+
+  private fun attachGlassesInputs(currentSession: DeviceSession) {
+    if (!physicalCameraRequested || inputsSession != null) return
+    currentSession.addInputs(InputsConfiguration()).fold(
+      onSuccess = { inputs ->
+        inputsSession = currentSession
+        inputsAttached = true
+        inputsJob = viewModelScope.launch(sessionObserverExceptionHandler, start = CoroutineStart.UNDISPATCHED) {
+          inputs.events.collect { event -> if (event is InputEvent.Select) onCursorPinch?.invoke() }
+        }
+        if (_uiState.value.displayState == DisplayState.STARTED) displayYoloScreen()
+      },
+      onFailure = { error, _ -> Log.w(TAG, "Raw input unavailable; using full-display click: ${error.description}") },
+    )
+  }
+
+  private fun detachGlassesInputs() {
+    inputsJob?.cancel(); inputsJob = null
+    inputsSession?.removeInputs()
+    inputsSession = null; inputsAttached = false
+  }
+
+  private val hudPredictor = com.meta.wearable.dat.externalsampleapps.displayaccess.HudFramePredictor()
+  private val hudMotion = com.meta.wearable.dat.externalsampleapps.displayaccess.MotionPredictor()
+  private var hudLoop: Job? = null
+  private val hudAccepted = java.util.concurrent.atomic.AtomicInteger(0)
+  private var hudSkipped = 0
+  private var hudStatsAt = 0L
+  private var lastProjectedState = YoloState()
+  fun interactionState(): YoloState = lastProjectedState
+
+  private var hudCalibration = com.meta.wearable.dat.externalsampleapps.displayaccess.HudCalibration()
+  fun updateCalibration(value: com.meta.wearable.dat.externalsampleapps.displayaccess.HudCalibration) {
+    hudCalibration = value
+    if (_uiState.value.displayState == DisplayState.STARTED) displayYoloScreen()
+  }
   private var yoloRenderJob: Job? = null
   private var lastYoloRenderAt = 0L
 
   private fun displayYoloScreen() {
+    if (hudLoop?.isActive == true || _uiState.value.displayState != DisplayState.STARTED) return
+    hudLoop = viewModelScope.launch {
+      var next = android.os.SystemClock.elapsedRealtimeNanos()
+      hudStatsAt = next
+      while (isActive && _uiState.value.displayState == DisplayState.STARTED) {
+        renderHudFrame()
+        next += 33_333_333L
+        val now = android.os.SystemClock.elapsedRealtimeNanos()
+        if (next < now) next += ((now-next)/33_333_333L+1)*33_333_333L
+        delay(((next-now+999_999L)/1_000_000L).coerceAtLeast(1L))
+      }
+    }
+  }
+
+  private fun renderHudFrame() {
     val now = android.os.SystemClock.elapsedRealtimeNanos()
     // Keep one HUD send in flight; never queue old tracking frames behind a slow display link.
-    if (yoloRenderJob?.isActive == true || now - lastYoloRenderAt < 33_000_000L) return
+    if (now-hudStatsAt >= 2_000_000_000L) {
+      val seconds = (now-hudStatsAt)/1e9
+      Log.i("WorldGitHUD", "30 FPS target; accepted %.1f FPS; busy skips=%d".format(hudAccepted.getAndSet(0)/seconds,hudSkipped))
+      hudStatsAt = now; hudSkipped = 0
+    }
+    if (yoloRenderJob?.isActive == true) { hudSkipped++; return }
     lastYoloRenderAt = now
-    val bitmap = android.graphics.Bitmap.createBitmap(600, 480, android.graphics.Bitmap.Config.ARGB_8888)
+    // The optical surface stays 600x600; send a smaller opaque-black raster to
+    // reduce Bluetooth payload. Black emits no light on the additive display.
+    val bitmap = android.graphics.Bitmap.createBitmap(200, 200, android.graphics.Bitmap.Config.ARGB_8888)
+    bitmap.eraseColor(android.graphics.Color.BLACK)
+    val hudCanvas = android.graphics.Canvas(bitmap).apply { scale(1f/3f,1f/3f) }
+    val predicted = hudPredictor.sample(if (physicalCameraRequested) hudMotion.predict(now+15_000_000L) else null,now/1e9,hudCalibration)
+    val projected = if (physicalCameraRequested)
+      com.meta.wearable.dat.externalsampleapps.displayaccess.HudProjection(predicted.width, predicted.height, hudCalibration).state(predicted)
+      else predicted
+    lastProjectedState = projected
     com.meta.wearable.dat.externalsampleapps.displayaccess.drawYoloOverlay(
-      android.graphics.Canvas(bitmap), 600f, 480f, yoloState, cursorState, speechState)
-    drawLiveSpeechOverlay(android.graphics.Canvas(bitmap), 600f, 480f, speechState)
-    yoloRenderJob = sendContent {
-      flexBox(direction = Direction.COLUMN, gap = 4) {
-        image(bitmap = bitmap, sizePreset = ImageSize.FILL, flexGrow = 1f)
-        text(if (speechState.active && speechState.noteId != null) "Recording note - pinch to stop recording" else if (speechState.active) "Listening - pause to finish, or pinch again" else if (audioState.recording) "Recording - use Stop recording to finish" else
-          if (cursorState.visible) "Aim with your head. Pinch to select; empty space starts speech." else "Pinch to show cursor", style = TextStyle.META)
-        buttonGroup {
-          button(
-            if (speechState.active && speechState.noteId != null) "stop recording" else if (speechState.active) "Finish speaking" else if (cursorState.visible) "Select / speak" else "Show cursor",
-            onClick = { onCursorPinch?.invoke() },
-            actionRole = ActionRole.PRIMARY,
-          )
-          button(
-            if (audioState.recording) "Stop recording" else if (audioState.uploading) "Saving audio..." else "Record audio",
-            onClick = { Log.i("WorldGitAudio", "Audio control selected"); onAudioPinch?.invoke() },
-          )
-        }
+      hudCanvas, 600f, 600f, projected, cursorState, speechState)
+    drawLiveSpeechOverlay(hudCanvas, 600f, 600f, speechState)
+    if (hudCalibration.showGuide) {
+      val canvas = hudCanvas
+      val paint = android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG).apply {
+        color = android.graphics.Color.WHITE; style = android.graphics.Paint.Style.STROKE; strokeWidth = 1f
+      }
+      canvas.drawRect(1f,1f,599f,599f,paint)
+      canvas.drawLine(285f,300f,315f,300f,paint)
+      canvas.drawLine(300f,285f,300f,315f,paint)
+    }
+    yoloRenderJob = sendContent(onAccepted = { hudAccepted.incrementAndGet() }) {
+      flexBox(direction = Direction.COLUMN, padding = 0, gap = 0,
+        onClick = if (inputsAttached) null else ({ onCursorPinch?.invoke() })) {
+        image(bitmap = bitmap, sizePreset = ImageSize.FILL, flexGrow = 1f, flexShrink = 0f)
       }
     }
   }
@@ -374,6 +538,8 @@ class DisplayViewModel(
                     DeviceSessionState.STARTED -> {
                       Log.i(TAG, "Session started")
                       attachMotion(newSession)
+                      attachGlassesCamera(newSession)
+                      attachGlassesInputs(newSession)
                       _uiState.value =
                           _uiState.value.copy(
                               selectedDeviceId = selectedDeviceId,
@@ -389,6 +555,8 @@ class DisplayViewModel(
                     }
                     DeviceSessionState.STOPPED -> {
                       Log.i(TAG, "Session stopped")
+                      detachGlassesInputs()
+                      detachGlassesCamera()
                       detachMotion()
                       clearPendingWork()
                       cleanupDisplay()
@@ -552,7 +720,7 @@ class DisplayViewModel(
 
   // -- Content --
 
-  private fun sendContent(content: ContentScope.() -> Unit): Job {
+  private fun sendContent(onAccepted: (() -> Unit)? = null, content: ContentScope.() -> Unit): Job {
     _uiState.value =
         _uiState.value.copy(
             isSending = true,
@@ -575,6 +743,7 @@ class DisplayViewModel(
       val result = currentDisplay.sendContent(content)
       result.fold(
           onSuccess = {
+            onAccepted?.invoke()
             _uiState.value =
                 _uiState.value.copy(
                     isSending = false,
@@ -690,6 +859,8 @@ class DisplayViewModel(
               snackbarMessage = "Stopping session...",
           )
 
+      detachGlassesInputs()
+      detachGlassesCamera()
       detachMotion()
       detachDisplay()
       clearSessionStateJob()?.cancel()
@@ -727,6 +898,9 @@ class DisplayViewModel(
   }
 
   private fun cleanupDisplay() {
+    hudLoop?.cancel(); hudLoop = null
+    hudPredictor.reset(); hudMotion.clear()
+    hudAccepted.set(0); hudSkipped = 0
     yoloRenderJob?.cancel()
     yoloRenderJob = null
     lastYoloRenderAt = 0L

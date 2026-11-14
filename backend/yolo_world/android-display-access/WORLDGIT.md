@@ -236,3 +236,58 @@ Validation: `gradlew.bat assembleDebug testDebugUnitTest` covers stationary jitt
 adaptive response, optical translation, correction blending, delayed pose replay,
 stale replies, resolution resets, and gyro prediction. Server compatibility is
 covered by `python -m unittest discover -s backend/yolo_world -p "test_*.py" -q`.
+
+
+## Physical glasses and full-display alignment
+
+On a phone paired with the glasses, enable Meta Developer Mode, install the debug
+APK, and press **Start glasses**. The app requests Meta camera/microphone access,
+then attaches camera, display, motion, and input capabilities to the same physical
+session. The source is the glasses camera; the phone camera closes. Low-quality
+360x640 decoded I420 video is processed on the phone, with bounded frame dropping,
+and GPU detections/transcription remain on the laptop at port 8765. Glasses PCM16
+mono 16-kHz audio feeds live note transcription when microphone access is granted.
+The phone remains the bridge; keep the app running during the demo. For USB use,
+run `adb reverse tcp:8765 tcp:8765` on the paired phone. The saved localhost address
+then resolves to this laptop. The GPU transcription service remains at port 8766.
+
+The physical HUD now renders a transparent **600x600** image as its sole content,
+with zero layout padding and no toolbar consuming display height. Select events
+from Meta Inputs drive pinch actions; the full image is a click fallback if the
+experimental Inputs capability cannot attach.
+
+`HudProjection` estimates the display's viewing frustum, rather than fitting all
+portrait camera detections onto the display. It uses the advertised 20-degree
+**diagonal** display FOV and an explicitly approximate 90-degree diagonal camera
+FOV. Boxes are projected with uniform angular scale and culled outside the HUD.
+Camera FOV, camera-to-eye extrinsics, eye position, and object depth are not
+supplied by this SDK's frame API; this is not factory-calibrated spatial AR.
+
+Use **Align outlines** on the phone while wearing the glasses. Adjust size,
+left/right, up/down, and rotation to match a stationary object at the intended
+working distance. The guide outlines the full 600x600 surface and shows its center.
+Settings persist in phone preferences. The same projected geometry is used for
+HUD drawing and pinch hit testing. The phone preview retains camera coordinates.
+Alignment can vary with object distance because camera-to-eye parallax is not
+recoverable from a single uncalibrated 2D frame.
+
+
+## Independent 30-Hz HUD and estimated alignment
+
+The display now has its own monotonic 33,333,333-nanosecond render loop. Camera
+frames and GPU observations update its latest state independently. The HUD samples
+bounded camera/gyro prediction and smoothly blends residual corrections between
+observations. It stops predicting missing observations after 500 ms, limits
+residual extrapolation to 100 ms / 2% of image size, and keeps one SDK send in
+flight. Slow sends skip stale slots instead of queueing frames. `WorldGitHUD` logs
+the 30-FPS target, actual SDK-accepted FPS, and busy skips every two seconds. API
+acceptance is measurable; the SDK does not expose optical presentation timestamps.
+Pinch hit testing uses the most recently rendered projected state.
+
+The independent estimate replaces the previous hand-tuned values once on upgrade:
+size 1.0, horizontal approximately -108 px, vertical approximately -30 px, roll 0.
+It assumes the 90-degree camera diagonal used by the projection model, an advertised
+20-degree display diagonal, a camera 90 mm left and 25 mm above the right eye, and a
+target distance of 2 m. Camera offsets and working distance are assumptions, not
+measured factory values. **Use estimate** restores these values without reusing
+manual calibration. Live alignment controls remain available for correction.

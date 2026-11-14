@@ -71,6 +71,11 @@ fun drawYoloOverlay(canvas: Canvas, width: Float, height: Float, state: YoloStat
   canvas.scale(scale, scale)
   yoloLabelLayouts(state).forEach { label ->
     val selected = label.item.id == cursor.selectedId
+    paint.style = Paint.Style.STROKE
+    paint.strokeWidth = 2f / scale
+    paint.color = if (selected) Color.rgb(100,165,255) else Color.GREEN
+    val box = label.item.box
+    canvas.drawRect(box[0].toFloat(), box[1].toFloat(), box[2].toFloat(), box[3].toFloat(), paint)
     paint.style = Paint.Style.FILL
     paint.color = if (selected) Color.rgb(30, 105, 245) else Color.argb(210, 0, 0, 0)
     canvas.drawRoundRect(label.bounds, 4f, 4f, paint)
