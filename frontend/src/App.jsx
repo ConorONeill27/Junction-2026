@@ -2,6 +2,13 @@ import React, { useEffect, useRef, useState } from "react";
 import * as THREE from "three";
 import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
 import { drawImageToCanvas } from "./camera3d";
+import { useMultiplayerSpace } from "./hooks/useMultiplayerSpace";
+import TopNav from "./components/TopNav";
+import SideDrawer from "./components/SideDrawer";
+import StudioDrawer from "./components/StudioDrawer";
+import NoteComposerModal from "./components/NoteComposerModal";
+import ClickActionPopover from "./components/ClickActionPopover";
+import { CloseIcon, SparkIcon } from "./components/Icons";
 
 const API_BASE = "";
 const WS_PROTO = window.location.protocol === "https:" ? "wss:" : "ws:";
@@ -98,6 +105,13 @@ export default function App() {
   const [locatingVideo, setLocatingVideo] = useState(false);
   const [glassesLive, setGlassesLive] = useState(null);
   const [latestImuSession, setLatestImuSession] = useState(null);
+  const [drawerOpen, setDrawerOpen] = useState(true);
+  const [studioOpen, setStudioOpen] = useState(false);
+  const [noteModalOpen, setNoteModalOpen] = useState(false);
+  const [noteInitPos, setNoteInitPos] = useState(null);
+  const [clickTarget, setClickTarget] = useState(null);
+
+  const mp = useMultiplayerSpace("usr-conor", "world_1");
   const [statusText, setStatusText] = useState(
     "WorldGit 3D Spatial Viewer — VGGT-1B Walk-Around Point Cloud"
   );
@@ -172,39 +186,22 @@ export default function App() {
 
   // Initial state + WebSocket live sync
   useEffect(() => {
-    fetch(`${API_BASE}/api/state`)
-      .then((r) => r.json())
-      .then((data) => {
-        applyWorldMetadata(data);
-      })
-      .catch(() => {});
-
     refreshPoints();
     refreshWorlds();
     refreshImuLatest();
-
-    const ws = new WebSocket(WS_URL);
-    ws.onmessage = (ev) => {
-      const msg = JSON.parse(ev.data);
-      if (msg.type === "world_state") {
-        applyWorldMetadata(msg);
-        if (
-          typeof msg.point_count === "number" &&
-          msg.point_count !== lastPointCountRef.current
-        ) {
-          lastPointCountRef.current = msg.point_count;
-          refreshPoints();
-        }
-      } else if (msg.type === "wearers_update" && Array.isArray(msg.wearers)) {
-        const selfW = msg.wearers.find((w) => w.wearer_id === "wearer-b");
-        if (selfW) {
-          setGlassesLive(selfW);
-          if (!selfW.sensor_active) refreshImuLatest();
-        }
-      }
-    };
-    return () => ws.close();
   }, []);
+
+  useEffect(() => {
+    if (!mp.liveState) return;
+    applyWorldMetadata(mp.liveState);
+    if (
+      typeof mp.liveState.point_count === "number" &&
+      mp.liveState.point_count !== lastPointCountRef.current
+    ) {
+      lastPointCountRef.current = mp.liveState.point_count;
+      refreshPoints();
+    }
+  }, [mp.liveState]);
 
   // 1. Initialize Persistent Three.js 3D Viewport (Laptop View)
   useEffect(() => {
@@ -281,8 +278,46 @@ export default function App() {
     };
     window.addEventListener("resize", handleResize);
 
+    const raycaster = new THREE.Raycaster();
+    raycaster.params.Points.threshold = 0.14;
+    let downPt = null;
+    const onPointerDown = (ev) => {
+      downPt = { x: ev.clientX, y: ev.clientY };
+    };
+    const onPointerUp = (ev) => {
+      if (!downPt) return;
+      const dist = Math.hypot(ev.clientX - downPt.x, ev.clientY - downPt.y);
+      downPt = null;
+      if (dist > 6) return;
+      const rect = renderer.domElement.getBoundingClientRect();
+      const ndc = new THREE.Vector2(
+        ((ev.clientX - rect.left) / rect.width) * 2 - 1,
+        -((ev.clientY - rect.top) / rect.height) * 2 + 1
+      );
+      raycaster.setFromCamera(ndc, camera);
+      const hits = raycaster.intersectObjects(pointsGroup.children, true);
+      let pos = null;
+      if (hits.length > 0) {
+        const p = hits[0].point;
+        pos = [Number(p.x.toFixed(3)), Number(p.y.toFixed(3)), Number(p.z.toFixed(3))];
+      } else {
+        const plane = new THREE.Plane(new THREE.Vector3(0, 1, 0), -0.8);
+        const hitPt = new THREE.Vector3();
+        if (raycaster.ray.intersectPlane(plane, hitPt)) {
+          pos = [Number(hitPt.x.toFixed(3)), Number(hitPt.y.toFixed(3)), Number(hitPt.z.toFixed(3))];
+        }
+      }
+      if (pos) {
+        setClickTarget({ screenX: ev.clientX, screenY: ev.clientY, worldPosition: pos });
+      }
+    };
+    renderer.domElement.addEventListener("pointerdown", onPointerDown);
+    renderer.domElement.addEventListener("pointerup", onPointerUp);
+
     return () => {
       window.removeEventListener("resize", handleResize);
+      renderer.domElement.removeEventListener("pointerdown", onPointerDown);
+      renderer.domElement.removeEventListener("pointerup", onPointerUp);
       cancelAnimationFrame(animId);
       controls.dispose();
       renderer.dispose();
@@ -674,12 +709,124 @@ export default function App() {
       }
 
       const labelTitle = item.label || item.landmark || "Detected Object";
-      const coordText = `(${ox.toFixed(2)}, ${oy.toFixed(2)}, ${oz.toFixed(2)})m • beside left bed`;
+      const zoneLabel = item.zone_name || "Room";
+      const coordText = `${zoneLabel} • ${item.last_seen_by_name || item.owner || "Wearer"}`;
       const sprite = createLabelSprite(labelTitle, coordText, "#4ade80");
       sprite.position.set(ox, oy + 0.72, oz);
       markersGroup.add(sprite);
     });
-  }, [spatialObjects, spatialPins, videoTrail, showVideoMarkers, activeWorldId]);
+
+    // 3) Render audience-scoped spatial pins & place reviews
+    const AUDIENCE_HEX = {
+      public: 0x34d399,
+      friends: 0x2997ff,
+      group: 0xa78bfa,
+      people: 0xa78bfa,
+      private: 0x94a3b8,
+    };
+    (spatialPins || []).forEach((pin) => {
+      if (!Array.isArray(pin.position) || pin.position.length < 3) return;
+      if (pin.pin_type === "bottle") return;
+      const [px, py, pz] = pin.position;
+      const hex = AUDIENCE_HEX[pin.audience_type] || 0x2997ff;
+      const hexStr = `#${hex.toString(16).padStart(6, "0")}`;
+
+      const orb = new THREE.Mesh(
+        new THREE.OctahedronGeometry(0.065, 0),
+        new THREE.MeshBasicMaterial({ color: hex })
+      );
+      orb.position.set(px, py + 0.14, pz);
+      markersGroup.add(orb);
+
+      const title = pin.place_name
+        ? `${pin.place_name}${pin.rating ? ` (${pin.rating}/5)` : ""}`
+        : pin.landmark || "Spatial Note";
+      const sprite = createLabelSprite(title, `${pin.author}: ${pin.text}`, hexStr);
+      sprite.position.set(px, py + 0.45, pz);
+      markersGroup.add(sprite);
+    });
+
+    // 4) Render Named Zones
+    (mp.zones || []).forEach((zone) => {
+      const pos = Array.isArray(zone.position)
+        ? zone.position
+        : typeof zone.x === "number"
+        ? [zone.x, zone.y ?? 0.6, zone.z ?? 0]
+        : null;
+      if (!pos || pos.length < 3) return;
+      const [zx, zy, zz] = pos;
+      const zRingGeo = new THREE.RingGeometry(0.32, 0.36, 36);
+      zRingGeo.rotateX(-Math.PI / 2);
+      const zRing = new THREE.Mesh(
+        zRingGeo,
+        new THREE.MeshBasicMaterial({
+          color: 0x38bdf8,
+          side: THREE.DoubleSide,
+          transparent: true,
+          opacity: 0.45,
+        })
+      );
+      zRing.position.set(zx, Math.max(0.02, zy - 0.35), zz);
+      markersGroup.add(zRing);
+
+      const zSprite = createLabelSprite(zone.name, "Named Zone", "#38bdf8");
+      zSprite.scale.set(0.85, 0.22, 1);
+      zSprite.position.set(zx, zy + 0.28, zz);
+      markersGroup.add(zSprite);
+    });
+
+    // 5) Render Live Multiplayer Wearer Avatars
+    const WEARER_COLORS = ["#34d399", "#2997ff", "#f59e0b", "#c084fc"];
+    (mp.liveState?.wearers || []).forEach((w, idx) => {
+      if (!Array.isArray(w.position) || w.position.length < 3) return;
+      const [wx, wy, wz] = w.position;
+      const colStr = WEARER_COLORS[idx % WEARER_COLORS.length];
+      const avatar = new THREE.Mesh(
+        new THREE.SphereGeometry(0.08, 16, 16),
+        new THREE.MeshBasicMaterial({ color: colStr })
+      );
+      avatar.position.set(wx, wy, wz);
+      markersGroup.add(avatar);
+
+      const wSprite = createLabelSprite(w.name || w.wearer_id, w.landmark || "Live", colStr);
+      wSprite.scale.set(0.8, 0.2, 1);
+      wSprite.position.set(wx, wy + 0.32, wz);
+      markersGroup.add(wSprite);
+    });
+
+    // 6) Render From -> To Movement Arc for Ask Result
+    if (mp.askResult?.path?.from_position && mp.askResult?.path?.to_position) {
+      const f = mp.askResult.path.from_position;
+      const t = mp.askResult.path.to_position;
+      const p0 = new THREE.Vector3(f[0], f[1] + 0.12, f[2]);
+      const p2 = new THREE.Vector3(t[0], t[1] + 0.12, t[2]);
+      const mid = p0.clone().add(p2).multiplyScalar(0.5);
+      mid.y += 0.45;
+      const curve = new THREE.QuadraticBezierCurve3(p0, mid, p2);
+      const arcGeom = new THREE.BufferGeometry().setFromPoints(curve.getPoints(28));
+      const arcLine = new THREE.Line(
+        arcGeom,
+        new THREE.LineBasicMaterial({ color: 0xfbbf24, transparent: true, opacity: 0.95 })
+      );
+      markersGroup.add(arcLine);
+
+      const destMarker = new THREE.Mesh(
+        new THREE.SphereGeometry(0.09, 20, 20),
+        new THREE.MeshBasicMaterial({ color: 0xfbbf24 })
+      );
+      destMarker.position.copy(p2);
+      markersGroup.add(destMarker);
+    }
+  }, [
+    spatialObjects,
+    spatialPins,
+    videoTrail,
+    showVideoMarkers,
+    activeWorldId,
+    mp.zones,
+    mp.liveState,
+    mp.askResult,
+  ]);
 
   const startWebcam = async () => {
     try {
@@ -1154,275 +1301,187 @@ export default function App() {
   }
 
   // ============================================================================
-  // LAPTOP UI (http://localhost:5173/) — Full-Screen 3D Reconstruction Studio
+  // CONSUMER SPATIAL GLASS UI (http://localhost:5173/)
   // ============================================================================
-  return (
-    <div style={{ position: "relative", width: "100vw", height: "100vh", overflow: "hidden", background: "#050811", color: "#f8fafc", fontFamily: "system-ui, sans-serif" }}>
-      {/* Full-Screen Three.js 3D Viewport */}
-      <div ref={mountRef} style={{ width: "100%", height: "100%" }} />
+  const handleSelectSpace = async (newWorldId) => {
+    mp.setWorldId(newWorldId);
+    if (newWorldId !== activeWorldId) {
+      await activateWorld(newWorldId);
+    }
+    mp.refreshAll(mp.viewerId, newWorldId);
+  };
 
-      {/* Stacked Top HUD (Telemetry Bar + Multi-World Selector) — never overlaps */}
-      <div
-        style={{
-          position: "absolute",
-          top: 16,
-          left: 16,
-          right: 16,
-          display: "flex",
-          flexDirection: "column",
-          gap: 8,
-          pointerEvents: "none",
-          zIndex: 10,
+  const handleFocusBottle = async () => {
+    const res = await fetch(`${API_BASE}/api/ctrl-f`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ wearer_id: "wearer-a", query: "water bottle", world_id: mp.worldId }),
+    });
+    const data = await res.json();
+    if (data.found && data.object?.position) {
+      focusCameraOnTarget(data.object.position);
+      setStatusText(`Focused ${data.object.label}: ${data.directions}`);
+    } else {
+      setStatusText("Water bottle not found in this space yet.");
+    }
+  };
+
+  return (
+    <div className="wg-root">
+      {/* Full-Bleed 3D Spatial Canvas */}
+      <div ref={mountRef} className="wg-canvas-host" />
+
+      {/* Floating Top Bar */}
+      <TopNav
+        viewerId={mp.viewerId}
+        onChangeViewer={mp.setViewerId}
+        users={mp.bootstrap.users}
+        worldId={mp.worldId}
+        onChangeWorld={handleSelectSpace}
+        spaces={mp.bootstrap.spaces}
+        onAsk={async (q) => {
+          const ans = await mp.askWhere(q);
+          if (ans?.object?.position) {
+            focusCameraOnTarget(ans.object.position);
+          }
         }}
-      >
-        <div
-          style={{
-            display: "flex",
-            justifyContent: "space-between",
-            alignItems: "center",
-            flexWrap: "wrap",
-            gap: 10,
-            background: "rgba(15, 23, 42, 0.85)",
-            backdropFilter: "blur(8px)",
-            padding: "10px 18px",
-            borderRadius: 12,
-            border: "1px solid #1e293b",
-            pointerEvents: "auto",
-          }}
-        >
-          <div style={{ display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap" }}>
-            <strong style={{ fontSize: 16 }}>WorldGit 3D Reconstruction Studio</strong>
-            <span style={{ fontSize: 13, color: "#38bdf8", background: "#0f172a", padding: "4px 10px", borderRadius: 6 }}>
-              Keyframes: <b>{keyframes.length}</b>
-            </span>
-            <span style={{ fontSize: 13, color: "#4ade80", background: "#0f172a", padding: "4px 10px", borderRadius: 6 }}>
-              3D Points: <b>{pointCount.toLocaleString()}</b>
-            </span>
-            <span
-              style={{
-                fontSize: 12,
-                color: glassesLive?.sensor_active ? "#4ade80" : latestImuSession ? "#c084fc" : "#94a3b8",
-                background: "#0f172a",
-                padding: "4px 10px",
-                borderRadius: 6,
-                border: glassesLive?.sensor_active ? "1px solid #16a34a" : "1px solid #334155",
-              }}
-            >
-              {glassesLive?.sensor_active
-                ? `Glasses IMU LIVE: ${glassesLive.compass_abs ?? glassesLive.yaw}° • ${glassesLive.steps ?? 0} steps`
-                : latestImuSession
-                  ? `IMU Log Ready (${latestImuSession.duration_s}s • ${latestImuSession.step_count} steps)`
-                  : "Glasses IMU: Stand by"}
-            </span>
+        onOpenNoteModal={() => {
+          setNoteInitPos(null);
+          setNoteModalOpen(true);
+        }}
+        drawerOpen={drawerOpen}
+        onToggleDrawer={() => setDrawerOpen((v) => !v)}
+        studioOpen={studioOpen}
+        onToggleStudio={() => setStudioOpen((v) => !v)}
+        wsConnected={mp.wsConnected}
+      />
+
+      {/* Ask / Movement Answer Banner */}
+      {mp.askResult && (
+        <div className="wg-answer-banner wg-glass" role="status">
+          <div style={{ display: "flex", gap: 10, alignItems: "flex-start" }}>
+            <SparkIcon size={18} />
+            <div>
+              <div style={{ fontSize: 13.5, fontWeight: 600 }}>
+                {mp.askResult.spoken_answer}
+              </div>
+              {mp.askResult.directions && (
+                <div style={{ fontSize: 12, color: "var(--text-secondary)", marginTop: 3 }}>
+                  {mp.askResult.directions}
+                </div>
+              )}
+            </div>
           </div>
-          <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
-            <button
-              onClick={locateCapturedVideo}
-              disabled={locatingVideo}
-              style={{
-                padding: "7px 14px",
-                borderRadius: 8,
-                background: locatingVideo ? "#334155" : "#059669",
-                color: "#fff",
-                border: "none",
-                fontWeight: 600,
-                whiteSpace: "nowrap",
-                cursor: locatingVideo ? "wait" : "pointer",
-              }}
-            >
-              {locatingVideo ? "Locating Video..." : "Locate Video on 3D Map"}
-            </button>
-            {spatialObjects[0]?.position && (
+          <div style={{ display: "flex", gap: 6 }}>
+            {mp.askResult.object?.position && (
               <button
-                onClick={() => focusCameraOnTarget(spatialObjects[0].position)}
-                style={{
-                  padding: "7px 12px",
-                  borderRadius: 8,
-                  background: "#0f766e",
-                  color: "#ecfdf5",
-                  border: "1px solid #14b8a6",
-                  fontWeight: 600,
-                  whiteSpace: "nowrap",
-                  cursor: "pointer",
-                }}
+                type="button"
+                className="wg-btn wg-btn-emerald"
+                style={{ minHeight: 34 }}
+                onClick={() => focusCameraOnTarget(mp.askResult.object.position)}
               >
-                Focus Bottle
+                Focus
               </button>
             )}
             <button
-              onClick={loadVggtModel}
-              style={{
-                padding: "7px 14px",
-                borderRadius: 8,
-                background: "#7c3aed",
-                color: "#fff",
-                border: "none",
-                fontWeight: 600,
-                whiteSpace: "nowrap",
-                cursor: "pointer",
-              }}
+              type="button"
+              className="wg-btn wg-btn-ghost wg-btn-icon"
+              style={{ minHeight: 34, width: 34, minWidth: 34 }}
+              onClick={() => mp.setAskResult(null)}
+              aria-label="Dismiss answer"
             >
-              Load VGGT Walk-Around
-            </button>
-            <label
-              style={{
-                padding: "7px 14px",
-                borderRadius: 8,
-                background: "#4f46e5",
-                color: "#fff",
-                fontWeight: 600,
-                fontSize: 13,
-                whiteSpace: "nowrap",
-                cursor: "pointer",
-              }}
-            >
-              Upload .MP4 (VGGT)
-              <input type="file" accept="video/*" onChange={uploadWalkthroughVideo} style={{ display: "none" }} />
-            </label>
-            <button
-              onClick={clearScan}
-              style={{
-                padding: "7px 14px",
-                borderRadius: 8,
-                background: "#dc2626",
-                color: "#fff",
-                border: "none",
-                fontWeight: 600,
-                whiteSpace: "nowrap",
-                cursor: "pointer",
-              }}
-            >
-              Clear / Reset 3D Map
+              <CloseIcon size={15} />
             </button>
           </div>
         </div>
+      )}
 
-        {/* Multi-World Selector Strip (Spliced vs Separate Worlds) */}
-        {worlds.length > 0 && (
-          <div
-            style={{
-              display: "flex",
-              alignItems: "center",
-              gap: 8,
-              flexWrap: "wrap",
-              background: "rgba(15, 23, 42, 0.82)",
-              backdropFilter: "blur(8px)",
-              padding: "8px 14px",
-              borderRadius: 10,
-              border: "1px solid #1e293b",
-              fontSize: 12,
-              pointerEvents: "auto",
-            }}
-          >
-            <span style={{ color: "#94a3b8", fontWeight: 600, marginRight: 4 }}>
-              Worlds ({worlds.length}):
-            </span>
-            {worlds.map((w) => {
-              const isAct = activeWorldId === w.world_id;
-              const isSpliced = w.status === "spliced";
-              return (
-                <button
-                  key={w.world_id}
-                  onClick={() => activateWorld(w.world_id)}
-                  style={{
-                    padding: "5px 11px",
-                    borderRadius: 7,
-                    border: isAct ? "1px solid #f0abfc" : "1px solid #334155",
-                    background: isAct ? (isSpliced ? "#7e22ce" : "#0369a1") : "#0f172a",
-                    color: "#f8fafc",
-                    fontWeight: isAct ? 700 : 500,
-                    cursor: "pointer",
-                  }}
-                >
-                  {isSpliced ? "🔗 " : "🌐 "}
-                  {w.label} • {w.point_count?.toLocaleString()} pts
-                </button>
-              );
-            })}
-          </div>
-        )}
-      </div>
+      {/* Left Collapsible Scan & Studio Tools Drawer */}
+      <StudioDrawer
+        open={studioOpen}
+        onClose={() => setStudioOpen(false)}
+        pointCount={pointCount}
+        rawPointCount={rawPointCount}
+        worlds={worlds}
+        activeWorldId={activeWorldId}
+        onSelectWorld={handleSelectSpace}
+        showPointCloud={showPointCloud}
+        setShowPointCloud={setShowPointCloud}
+        showFrustums={showFrustums}
+        setShowFrustums={setShowFrustums}
+        autoOrbit={autoOrbit}
+        setAutoOrbit={setAutoOrbit}
+        splatSize={splatSize}
+        setSplatSize={setSplatSize}
+        onFocusBottle={handleFocusBottle}
+        onLocateCapturedVideo={locateCapturedVideo}
+        locatingVideo={locatingVideo}
+        onUploadWalkthrough={uploadWalkthroughVideo}
+        scanJobs={mp.bootstrap.scan_jobs}
+        statusText={statusText}
+      />
 
-      {/* Minimal Bottom View Controls */}
-      <div
-        style={{
-          position: "absolute",
-          bottom: 16,
-          left: 16,
-          background: "rgba(15, 23, 42, 0.88)",
-          backdropFilter: "blur(8px)",
-          padding: "10px 16px",
-          borderRadius: 12,
-          border: "1px solid #1e293b",
-          display: "flex",
-          alignItems: "center",
-          gap: 18,
-          fontSize: 13,
+      {/* Right Consumer Space Feed Drawer */}
+      <SideDrawer
+        open={drawerOpen}
+        objects={spatialObjects}
+        zones={mp.zones}
+        history={mp.history}
+        pins={spatialPins}
+        bootstrap={mp.bootstrap}
+        worldId={mp.worldId}
+        onFocusPosition={focusCameraOnTarget}
+        onOpenNoteModal={() => {
+          setNoteInitPos(null);
+          setNoteModalOpen(true);
         }}
-      >
-        <label style={{ display: "flex", alignItems: "center", gap: 6, cursor: "pointer" }}>
-          <input
-            type="checkbox"
-            checked={showPointCloud}
-            onChange={(e) => setShowPointCloud(e.target.checked)}
-          />
-          3D Point Cloud ({(showAiFill || rawPointCount <= 0 || rawPointCount >= pointCount ? pointCount : rawPointCount).toLocaleString()})
-        </label>
-        <label style={{ display: "flex", alignItems: "center", gap: 6, cursor: "pointer", color: "#34d399" }}>
-          <input
-            type="checkbox"
-            checked={showAiFill}
-            onChange={(e) => setShowAiFill(e.target.checked)}
-          />
-          AI Surface Fill ({(rawPointCount > 0 && pointCount >= rawPointCount ? pointCount - rawPointCount : 0).toLocaleString()})
-        </label>
-        <label style={{ display: "flex", alignItems: "center", gap: 6, cursor: "pointer", color: "#cbd5e1" }}>
-          <input
-            type="checkbox"
-            checked={showPredictedWalls}
-            onChange={(e) => setShowPredictedWalls(e.target.checked)}
-          />
-          Architectural Shell ({wallSegments.length}W • {predictedOpenings.length}D)
-        </label>
-        <label style={{ display: "flex", alignItems: "center", gap: 8 }}>
-          Point Size:
-          <input
-            type="range"
-            min={0.008}
-            max={0.08}
-            step={0.002}
-            value={splatSize}
-            onChange={(e) => setSplatSize(Number(e.target.value))}
-            style={{ width: 95 }}
-          />
-        </label>
-        <label style={{ display: "flex", alignItems: "center", gap: 6, cursor: "pointer" }}>
-          <input
-            type="checkbox"
-            checked={showFrustums}
-            onChange={(e) => setShowFrustums(e.target.checked)}
-          />
-          Camera Path
-        </label>
-        <label style={{ display: "flex", alignItems: "center", gap: 6, cursor: "pointer", color: "#4ade80" }}>
-          <input
-            type="checkbox"
-            checked={showVideoMarkers}
-            onChange={(e) => setShowVideoMarkers(e.target.checked)}
-          />
-          Video Pins ({spatialObjects.length})
-        </label>
-        <label style={{ display: "flex", alignItems: "center", gap: 6, cursor: "pointer" }}>
-          <input
-            type="checkbox"
-            checked={autoOrbit}
-            onChange={(e) => setAutoOrbit(e.target.checked)}
-          />
-          Auto-Turntable
-        </label>
-        <span style={{ color: "#94a3b8", fontSize: 12 }}>
-          Left-Drag: Orbit • Right-Drag: Pan • Scroll: Zoom
-        </span>
+        onCreateZone={mp.createZone}
+        onReportSighting={mp.reportSighting}
+        onAddFriend={mp.addFriend}
+        onCreateGroup={mp.createGroup}
+        onJoinGroup={mp.joinGroup}
+        onShareSpace={mp.shareSpace}
+      />
+
+      {/* Click-to-Act 3D Point Popover */}
+      <ClickActionPopover
+        target={clickTarget}
+        onClose={() => setClickTarget(null)}
+        onDropNoteHere={(pos) => {
+          setNoteInitPos(pos);
+          setNoteModalOpen(true);
+        }}
+        onNameZoneHere={async (pos) => {
+          const name = window.prompt("Name this zone (e.g. Bedside Table, Hotel Desk):");
+          if (name && name.trim()) {
+            await mp.createZone({ name: name.trim(), position: pos });
+          }
+        }}
+        onRecordObjectHere={async (pos) => {
+          const label = window.prompt("What item is here? (e.g. Phone Charger, House Keys):");
+          if (label && label.trim()) {
+            await mp.reportSighting({ label: label.trim(), position: pos });
+          }
+        }}
+      />
+
+      {/* Note & Place Review Composer Modal */}
+      <NoteComposerModal
+        open={noteModalOpen}
+        onClose={() => setNoteModalOpen(false)}
+        initialPosition={noteInitPos}
+        groups={mp.bootstrap.groups}
+        friends={mp.bootstrap.friends}
+        onSubmit={mp.createPin}
+      />
+
+      {/* Minimal Bottom Status Pill */}
+      <div className="wg-bottom-pill wg-glass">
+        <span>{pointCount.toLocaleString()} splats</span>
+        <span>&bull;</span>
+        <span>{spatialObjects.length} tracked items</span>
+        <span>&bull;</span>
+        <span>Click 3D space to pin note or zone</span>
       </div>
     </div>
   );

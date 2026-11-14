@@ -17,8 +17,7 @@ LEGACY_INDUSTRIAL_PIN_IDS = {"pin-1", "pin-2"}
 
 WEARER_TO_USER: Dict[str, str] = {
     "wearer-b": "usr-conor",
-    "wearer-a": "usr-alex",
-    "wearer-c": "usr-mum",
+    "wearer-a": "usr-alec",
 }
 USER_TO_WEARER: Dict[str, str] = {v: k for k, v in WEARER_TO_USER.items()}
 
@@ -187,55 +186,40 @@ def build_ask_answer(
 
 
 def seed_everyday_social_data(db: Any) -> None:
-    """Idempotently seed everyday household/friend profiles, groups, and room zones."""
+    """Idempotently seed Conor and Alec profiles, shared hotel room group, and zones."""
     now = time.time()
     default_users = [
         {"user_id": "usr-conor", "name": "Conor", "handle": "@conor", "avatar_color": "#2997ff", "friend_code": "CONOR1"},
-        {"user_id": "usr-mum", "name": "Mum", "handle": "@mum", "avatar_color": "#34d399", "friend_code": "MUM202"},
-        {"user_id": "usr-dad", "name": "Dad", "handle": "@dad", "avatar_color": "#f59e0b", "friend_code": "DAD303"},
-        {"user_id": "usr-alex", "name": "Alex", "handle": "@alex", "avatar_color": "#a78bfa", "friend_code": "ALEX44"},
-        {"user_id": "usr-sarah", "name": "Sarah", "handle": "@sarah", "avatar_color": "#f472b6", "friend_code": "SARA55"},
+        {"user_id": "usr-alec", "name": "Alec", "handle": "@alec", "avatar_color": "#34d399", "friend_code": "ALEC22"},
     ]
     existing_users = {u["user_id"] for u in db.list_users()}
     for u in default_users:
         if u["user_id"] not in existing_users:
             db.upsert_user(u)
 
-    # Family & friend edges
-    if not db.list_friend_ids("usr-conor"):
-        for fid in ("usr-mum", "usr-dad", "usr-alex", "usr-sarah"):
-            db.add_friendship("usr-conor", fid)
-        db.add_friendship("usr-mum", "usr-dad")
-        db.add_friendship("usr-alex", "usr-sarah")
+    # Friendship edge between Conor and Alec
+    if "usr-alec" not in set(db.list_friend_ids("usr-conor")):
+        db.add_friendship("usr-conor", "usr-alec")
 
     existing_groups = {g["group_id"] for g in db.list_groups()}
-    if "grp-family" not in existing_groups:
+    if "grp-room" not in existing_groups:
         db.create_group({
-            "group_id": "grp-family",
-            "name": "Family",
-            "kind": "family",
+            "group_id": "grp-room",
+            "name": "Hotel Room",
+            "kind": "roommates",
             "owner_id": "usr-conor",
-            "invite_code": "FAM-HOME",
-            "member_ids": ["usr-conor", "usr-mum", "usr-dad"],
-        })
-    if "grp-otaniemi" not in existing_groups:
-        db.create_group({
-            "group_id": "grp-otaniemi",
-            "name": "Otaniemi Foodies",
-            "kind": "friends",
-            "owner_id": "usr-alex",
-            "invite_code": "FOOD-26",
-            "member_ids": ["usr-conor", "usr-alex", "usr-sarah"],
+            "invite_code": "ROOM-01",
+            "member_ids": ["usr-conor", "usr-alec"],
         })
 
     existing_spaces = {s["world_id"] for s in db.list_spaces_meta()}
     if "world_1" not in existing_spaces:
         db.upsert_space_meta({
             "world_id": "world_1",
-            "display_name": "Room Scan",
+            "display_name": "Hotel Room",
             "owner_id": "usr-conor",
             "audience_type": "group",
-            "group_ids": ["grp-family"],
+            "group_ids": ["grp-room"],
         })
 
     if not db.list_zones("world_1"):
@@ -264,8 +248,8 @@ def seed_everyday_social_data(db: Any) -> None:
     if not db.list_pins():
         db.upsert_pin({
             "id": "pin-subway-review",
-            "author": "Alex",
-            "author_id": "usr-alex",
+            "author": "Alec",
+            "author_id": "usr-alec",
             "text": "Great Italian BMT and fresh cookies — fast lunch stop.",
             "pin_type": "friend_memory",
             "position": [0.0, 1.2, 0.0],
@@ -275,16 +259,16 @@ def seed_everyday_social_data(db: Any) -> None:
             "created_at": now - 7200,
             "age_label": "2h ago",
             "world_id": None,
-            "audience_type": "group",
-            "group_ids": ["grp-otaniemi"],
+            "audience_type": "friends",
+            "group_ids": [],
             "target_user_ids": [],
             "lat": 60.1841,
             "lon": 24.8301,
         })
         db.upsert_pin({
             "id": "pin-espresso-public",
-            "author": "Sarah",
-            "author_id": "usr-sarah",
+            "author": "Conor",
+            "author_id": "usr-conor",
             "text": "Best flat white & cardamom bun near campus.",
             "pin_type": "friend_memory",
             "position": [0.0, 1.2, 0.0],

@@ -21,10 +21,11 @@ class SocialStoreTests(unittest.TestCase):
         self.tmp.cleanup()
 
     def test_visibility_scopes_and_guest_isolation(self):
-        fam_pin = {
-            "author_id": "usr-mum",
+        self.db.upsert_user({"user_id": "usr-outsider", "name": "Outsider", "handle": "@out", "avatar_color": "#64748b", "friend_code": "OUT99"})
+        room_pin = {
+            "author_id": "usr-alec",
             "audience_type": "group",
-            "group_ids": ["grp-family"],
+            "group_ids": ["grp-room"],
             "target_user_ids": [],
         }
         priv_pin = {
@@ -34,7 +35,7 @@ class SocialStoreTests(unittest.TestCase):
             "target_user_ids": [],
         }
         friend_pin = {
-            "author_id": "usr-alex",
+            "author_id": "usr-alec",
             "audience_type": "friends",
             "group_ids": [],
             "target_user_ids": [],
@@ -43,31 +44,31 @@ class SocialStoreTests(unittest.TestCase):
             "author_id": "usr-conor",
             "audience_type": "people",
             "group_ids": [],
-            "target_user_ids": ["usr-sarah"],
+            "target_user_ids": ["usr-alec"],
         }
         pub_pin = {
-            "author_id": "usr-alex",
+            "author_id": "usr-alec",
             "audience_type": "public",
             "group_ids": [],
             "target_user_ids": [],
         }
 
-        self.assertTrue(can_user_view(fam_pin, "usr-conor", self.db))
-        self.assertFalse(can_user_view(fam_pin, "usr-alex", self.db))
-        self.assertFalse(can_user_view(priv_pin, "usr-mum", self.db))
+        self.assertTrue(can_user_view(room_pin, "usr-conor", self.db))
+        self.assertFalse(can_user_view(room_pin, "usr-outsider", self.db))
+        self.assertFalse(can_user_view(priv_pin, "usr-alec", self.db))
         self.assertTrue(can_user_view(friend_pin, "usr-conor", self.db))
         self.assertFalse(can_user_view(friend_pin, "guest", self.db))
-        self.assertTrue(can_user_view(direct_pin, "usr-sarah", self.db))
-        self.assertFalse(can_user_view(direct_pin, "usr-alex", self.db))
+        self.assertTrue(can_user_view(direct_pin, "usr-alec", self.db))
+        self.assertFalse(can_user_view(direct_pin, "usr-outsider", self.db))
         self.assertTrue(can_user_view(pub_pin, "guest", self.db))
 
     def test_moved_vs_seen_prevents_false_moves(self):
         ev_type, ev = evaluate_sighting_transition(
             prev_obj={"position": [0.0, 0.8, 0.0], "seen_by": "Conor"},
-            prev_zone="Kitchen Table",
+            prev_zone="Bedside Table",
             new_pos=[0.05, 0.8, 0.05],
-            new_zone="Kitchen Table",
-            actor_user_id="usr-mum",
+            new_zone="Bedside Table",
+            actor_user_id="usr-alec",
             actor_name="Mum",
             label="Phone Charger",
             object_id="obj-charger",
