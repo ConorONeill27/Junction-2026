@@ -1,0 +1,2 @@
+# Pinned NVIDIA source: PyPI NeMo 2.7.3 lacks the Unified encoder configuration.
+nemo_toolkit[asr] @ https://github.com/NVIDIA-NeMo/NeMo/archive/a039a6cfce00aa57a6a8cd8e96166c1379f903e8.zip
