@@ -52,6 +52,25 @@ fun drawYoloOverlay(canvas: Canvas, width: Float, height: Float, state: YoloStat
     paint.color = Color.WHITE
     canvas.drawText(label.text, label.bounds.left + 6f, label.bounds.bottom - 6f, paint)
   }
+  // Draw last so other object labels cannot cover the selected object's prompt.
+  yoloLabelLayouts(state).lastOrNull { it.item.id == cursor.selectedId }?.let { label ->
+    val title = "add note?"
+    val promptWidth = maxOf(label.bounds.width(), paint.measureText(title) + 12f)
+      .coerceAtMost(state.width.toFloat())
+    val x = label.bounds.left.coerceAtMost(state.width - promptWidth)
+    val y = label.bounds.bottom + 4f
+    val bounds = RectF(x, y, x + promptWidth, y + label.bounds.height())
+    paint.style = Paint.Style.FILL
+    paint.color = Color.argb(230, 0, 0, 0)
+    canvas.drawRoundRect(bounds, 4f, 4f, paint)
+    paint.style = Paint.Style.STROKE
+    paint.strokeWidth = 1f
+    paint.color = Color.rgb(100, 165, 255)
+    canvas.drawRoundRect(bounds, 4f, 4f, paint)
+    paint.style = Paint.Style.FILL
+    paint.color = Color.WHITE
+    canvas.drawText(title, bounds.left + 6f, bounds.bottom - 6f, paint)
+  }
   if (cursor.visible) {
     val radius = 6f
     val x = (cursor.x * state.width).coerceIn(radius, maxOf(radius, state.width - radius))
