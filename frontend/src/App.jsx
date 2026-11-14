@@ -28,6 +28,34 @@ function getGaussianSplatTexture() {
   return cachedSplatTexture;
 }
 
+function createLabelSprite(title, subtitle = "", accent = "#22c55e") {
+  const canvas = document.createElement("canvas");
+  canvas.width = 512;
+  canvas.height = 128;
+  const ctx = canvas.getContext("2d");
+  ctx.fillStyle = "rgba(8, 15, 30, 0.90)";
+  ctx.strokeStyle = accent;
+  ctx.lineWidth = 4;
+  ctx.beginPath();
+  ctx.roundRect(8, 8, 496, 112, 18);
+  ctx.fill();
+  ctx.stroke();
+
+  ctx.fillStyle = accent;
+  ctx.font = "bold 30px system-ui, sans-serif";
+  ctx.fillText(title, 28, 52);
+  if (subtitle) {
+    ctx.fillStyle = "#e2e8f0";
+    ctx.font = "22px system-ui, sans-serif";
+    ctx.fillText(subtitle.slice(0, 42), 28, 92);
+  }
+  const tex = new THREE.CanvasTexture(canvas);
+  const mat = new THREE.SpriteMaterial({ map: tex, transparent: true, depthTest: false });
+  const sprite = new THREE.Sprite(mat);
+  sprite.scale.set(1.15, 0.29, 1);
+  return sprite;
+}
+
 export default function App() {
   const mountRef = useRef(null);
   const threeRef = useRef(null);
@@ -62,7 +90,12 @@ export default function App() {
   const [splatSize, setSplatSize] = useState(0.022);
   const [showPointCloud, setShowPointCloud] = useState(true);
   const [showFrustums, setShowFrustums] = useState(true);
+  const [showVideoMarkers, setShowVideoMarkers] = useState(true);
   const [autoOrbit, setAutoOrbit] = useState(true);
+  const [spatialObjects, setSpatialObjects] = useState([]);
+  const [spatialPins, setSpatialPins] = useState([]);
+  const [videoTrail, setVideoTrail] = useState([]);
+  const [locatingVideo, setLocatingVideo] = useState(false);
   const [glassesLive, setGlassesLive] = useState(null);
   const [latestImuSession, setLatestImuSession] = useState(null);
   const [statusText, setStatusText] = useState(
@@ -128,6 +161,9 @@ export default function App() {
     if (Array.isArray(data.predicted_openings)) setPredictedOpenings(data.predicted_openings);
     if ("room_envelope" in data) setRoomEnvelope(data.room_envelope || null);
     if (typeof data.raw_point_count === "number") setRawPointCount(data.raw_point_count);
+    if (Array.isArray(data.objects)) setSpatialObjects(data.objects);
+    if (Array.isArray(data.pins)) setSpatialPins(data.pins);
+    if (Array.isArray(data.video_trail)) setVideoTrail(data.video_trail);
     if (Array.isArray(data.wearers)) {
       const selfW = data.wearers.find((w) => w.wearer_id === "wearer-b");
       if (selfW) setGlassesLive(selfW);
@@ -221,11 +257,13 @@ export default function App() {
     const pointsGroup = new THREE.Group();
     const frustumsGroup = new THREE.Group();
     const wallsGroup = new THREE.Group();
+    const markersGroup = new THREE.Group();
     scene.add(pointsGroup);
     scene.add(frustumsGroup);
     scene.add(wallsGroup);
+    scene.add(markersGroup);
 
-    threeRef.current = { scene, camera, renderer, controls, pointsGroup, frustumsGroup, wallsGroup, grid, ring };
+    threeRef.current = { scene, camera, renderer, controls, pointsGroup, frustumsGroup, wallsGroup, markersGroup, grid, ring };
 
     let animId;
     const animate = () => {
@@ -527,6 +565,122 @@ export default function App() {
     activeWorldId,
   ]);
 
+  // 2b. Render Localized 3D Objects, Pins & Video Walking Path
+  useEffect(() => {
+    const ctx3d = threeRef.current;
+    if (!ctx3d || !ctx3d.markersGroup) return;
+    const { markersGroup } = ctx3d;
+    markersGroup.clear();
+    if (!showVideoMarkers) return;
+
+    // 1) Walking trail from relocalized video frames
+    if (Array.isArray(videoTrail) && videoTrail.length > 0) {
+      const pts = videoTrail
+        .filter((wp) => Array.isArray(wp.pose) && wp.pose.length >= 3)
+        .map((wp) => new THREE.Vector3(wp.pose[0], wp.pose[1], wp.pose[2]));
+
+      if (pts.length >= 2) {
+        const lineGeom = new THREE.BufferGeometry().setFromPoints(pts);
+        markersGroup.add(
+          new THREE.Line(
+            lineGeom,
+            new THREE.LineBasicMaterial({ color: 0x38bdf8, transparent: true, opacity: 0.9 })
+          )
+        );
+      }
+
+      videoTrail.forEach((wp) => {
+        if (!Array.isArray(wp.pose) || wp.pose.length < 3) return;
+        const isTarget = Boolean(wp.is_target_view);
+        const node = new THREE.Mesh(
+          new THREE.SphereGeometry(isTarget ? 0.065 : 0.038, 16, 16),
+          new THREE.MeshBasicMaterial({ color: isTarget ? 0xf59e0b : 0x38bdf8 })
+        );
+        node.position.set(wp.pose[0], wp.pose[1], wp.pose[2]);
+        markersGroup.add(node);
+        if (isTarget) {
+          const camLbl = createLabelSprite(
+            `Video Sighting (t=${wp.t}s)`,
+            `KF #${(wp.kf_index ?? 0) + 1} • ${wp.inliers ?? 0} inliers`,
+            "#f59e0b"
+          );
+          camLbl.position.set(wp.pose[0] + 0.22, wp.pose[1] + 0.55, wp.pose[2] - 0.15);
+          markersGroup.add(camLbl);
+        }
+      });
+    }
+
+    // 2) Render localized SpatialObjects & bottle/user pins
+    const bottlePins = (spatialPins || []).filter(
+      (p) => p.pin_type === "bottle" || String(p.id || "").includes("water-bottle")
+    );
+    const itemsToShow = spatialObjects.length > 0 ? spatialObjects : bottlePins;
+
+    const targetView = (videoTrail || []).find((wp) => wp.is_target_view);
+
+    itemsToShow.forEach((item) => {
+      if (!Array.isArray(item.position) || item.position.length < 3) return;
+      const [ox, oy, oz] = item.position;
+      const accentHex = 0x22c55e;
+
+      // Glowing sphere on exact 3D bottle location
+      const beacon = new THREE.Mesh(
+        new THREE.SphereGeometry(0.075, 24, 24),
+        new THREE.MeshBasicMaterial({ color: accentHex })
+      );
+      beacon.position.set(ox, oy + 0.08, oz);
+      markersGroup.add(beacon);
+
+      // Ground target ring
+      const ringGeo = new THREE.RingGeometry(0.11, 0.16, 32);
+      ringGeo.rotateX(-Math.PI / 2);
+      const ringMesh = new THREE.Mesh(
+        ringGeo,
+        new THREE.MeshBasicMaterial({
+          color: accentHex,
+          side: THREE.DoubleSide,
+          transparent: true,
+          opacity: 0.9,
+        })
+      );
+      ringMesh.position.set(ox, oy + 0.015, oz);
+      markersGroup.add(ringMesh);
+
+      // Vertical locator beam
+      const beamGeom = new THREE.BufferGeometry().setFromPoints([
+        new THREE.Vector3(ox, oy + 0.02, oz),
+        new THREE.Vector3(ox, oy + 0.58, oz),
+      ]);
+      markersGroup.add(
+        new THREE.Line(
+          beamGeom,
+          new THREE.LineBasicMaterial({ color: 0x4ade80, transparent: true, opacity: 0.9 })
+        )
+      );
+
+      // Line from camera sighting pose directly to the bottle
+      if (targetView && Array.isArray(targetView.pose)) {
+        const [cx, cy, cz] = targetView.pose;
+        const rayGeom = new THREE.BufferGeometry().setFromPoints([
+          new THREE.Vector3(cx, cy, cz),
+          new THREE.Vector3(ox, oy + 0.08, oz),
+        ]);
+        markersGroup.add(
+          new THREE.Line(
+            rayGeom,
+            new THREE.LineBasicMaterial({ color: 0xf59e0b, transparent: true, opacity: 0.85 })
+          )
+        );
+      }
+
+      const labelTitle = item.label || item.landmark || "Detected Object";
+      const coordText = `(${ox.toFixed(2)}, ${oy.toFixed(2)}, ${oz.toFixed(2)})m • beside left bed`;
+      const sprite = createLabelSprite(labelTitle, coordText, "#4ade80");
+      sprite.position.set(ox, oy + 0.72, oz);
+      markersGroup.add(sprite);
+    });
+  }, [spatialObjects, spatialPins, videoTrail, showVideoMarkers, activeWorldId]);
+
   const startWebcam = async () => {
     try {
       const stream = await navigator.mediaDevices.getUserMedia({
@@ -745,6 +899,40 @@ export default function App() {
       setStatusText(data.error || "VGGT reconstruction failed");
     }
     e.target.value = "";
+  };
+
+  const focusCameraOnTarget = (pos) => {
+    const ctx3d = threeRef.current;
+    if (!ctx3d || !Array.isArray(pos) || pos.length < 3) return;
+    setAutoOrbit(false);
+    ctx3d.controls.target.set(pos[0], pos[1] + 0.2, pos[2]);
+    ctx3d.camera.position.set(pos[0] + 1.35, pos[1] + 1.25, pos[2] + 1.15);
+    ctx3d.controls.update();
+  };
+
+  const locateCapturedVideo = async () => {
+    setLocatingVideo(true);
+    setStatusText("Matching video frames to 3D room map & raycasting bottle...");
+    try {
+      const res = await fetch(`${API_BASE}/api/localize-video`, { method: "POST" });
+      const data = await res.json();
+      if (data.ok) {
+        if (data.object) setSpatialObjects([data.object]);
+        if (data.pin) setSpatialPins((prev) => [...prev.filter((p) => p.id !== data.pin.id), data.pin]);
+        if (Array.isArray(data.video_trail)) setVideoTrail(data.video_trail);
+        setShowVideoMarkers(true);
+        focusCameraOnTarget(data.target_position);
+        setStatusText(
+          `Located ${data.target_label} at [${data.target_position.join(", ")}] (t=${data.target_t}s, KF #${data.matched_keyframe + 1}, ${data.sift_inliers} inliers)`
+        );
+      } else {
+        setStatusText(data.error || "Could not localize video onto 3D map");
+      }
+    } catch {
+      setStatusText("Video localization request failed");
+    } finally {
+      setLocatingVideo(false);
+    }
   };
 
   // ============================================================================
@@ -973,7 +1161,7 @@ export default function App() {
       {/* Full-Screen Three.js 3D Viewport */}
       <div ref={mountRef} style={{ width: "100%", height: "100%" }} />
 
-      {/* Minimal Top Telemetry Bar */}
+      {/* Stacked Top HUD (Telemetry Bar + Multi-World Selector) — never overlaps */}
       <div
         style={{
           position: "absolute",
@@ -981,134 +1169,179 @@ export default function App() {
           left: 16,
           right: 16,
           display: "flex",
-          justifyContent: "space-between",
-          alignItems: "center",
-          background: "rgba(15, 23, 42, 0.85)",
-          backdropFilter: "blur(8px)",
-          padding: "10px 18px",
-          borderRadius: 12,
-          border: "1px solid #1e293b",
-          pointerEvents: "auto",
+          flexDirection: "column",
+          gap: 8,
+          pointerEvents: "none",
+          zIndex: 10,
         }}
       >
-        <div style={{ display: "flex", alignItems: "center", gap: 14, flexWrap: "wrap" }}>
-          <strong style={{ fontSize: 16 }}>WorldGit 3D Reconstruction Studio</strong>
-          <span style={{ fontSize: 13, color: "#38bdf8", background: "#0f172a", padding: "4px 10px", borderRadius: 6 }}>
-            Keyframes: <b>{keyframes.length}</b>
-          </span>
-          <span style={{ fontSize: 13, color: "#4ade80", background: "#0f172a", padding: "4px 10px", borderRadius: 6 }}>
-            3D Points: <b>{pointCount.toLocaleString()}</b>
-          </span>
-          <span
-            style={{
-              fontSize: 12,
-              color: glassesLive?.sensor_active ? "#4ade80" : latestImuSession ? "#c084fc" : "#94a3b8",
-              background: "#0f172a",
-              padding: "4px 10px",
-              borderRadius: 6,
-              border: glassesLive?.sensor_active ? "1px solid #16a34a" : "1px solid #334155",
-            }}
-          >
-            {glassesLive?.sensor_active
-              ? `Glasses IMU LIVE: ${glassesLive.compass_abs ?? glassesLive.yaw}° • ${glassesLive.steps ?? 0} steps`
-              : latestImuSession
-                ? `IMU Log Ready (${latestImuSession.duration_s}s • ${latestImuSession.step_count} steps)`
-                : "Glasses IMU: Stand by"}
-          </span>
-        </div>
-        <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
-          <button
-            onClick={loadVggtModel}
-            style={{
-              padding: "7px 14px",
-              borderRadius: 8,
-              background: "#7c3aed",
-              color: "#fff",
-              border: "none",
-              fontWeight: 600,
-              cursor: "pointer",
-            }}
-          >
-            Load VGGT Walk-Around
-          </button>
-          <label
-            style={{
-              padding: "7px 14px",
-              borderRadius: 8,
-              background: "#4f46e5",
-              color: "#fff",
-              fontWeight: 600,
-              fontSize: 13,
-              cursor: "pointer",
-            }}
-          >
-            Upload .MP4 (VGGT)
-            <input type="file" accept="video/*" onChange={uploadWalkthroughVideo} style={{ display: "none" }} />
-          </label>
-          <button
-            onClick={clearScan}
-            style={{
-              padding: "7px 14px",
-              borderRadius: 8,
-              background: "#dc2626",
-              color: "#fff",
-              border: "none",
-              fontWeight: 600,
-              cursor: "pointer",
-            }}
-          >
-            Clear / Reset 3D Map
-          </button>
-        </div>
-      </div>
-
-      {/* Multi-World Selector Strip (Spliced vs Separate Worlds) */}
-      {worlds.length > 0 && (
         <div
           style={{
-            position: "absolute",
-            top: 72,
-            left: 16,
-            right: 16,
             display: "flex",
+            justifyContent: "space-between",
             alignItems: "center",
-            gap: 8,
             flexWrap: "wrap",
-            background: "rgba(15, 23, 42, 0.82)",
+            gap: 10,
+            background: "rgba(15, 23, 42, 0.85)",
             backdropFilter: "blur(8px)",
-            padding: "8px 14px",
-            borderRadius: 10,
+            padding: "10px 18px",
+            borderRadius: 12,
             border: "1px solid #1e293b",
-            fontSize: 12,
+            pointerEvents: "auto",
           }}
         >
-          <span style={{ color: "#94a3b8", fontWeight: 600, marginRight: 4 }}>
-            Worlds ({worlds.length}):
-          </span>
-          {worlds.map((w) => {
-            const isAct = activeWorldId === w.world_id;
-            const isSpliced = w.status === "spliced";
-            return (
+          <div style={{ display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap" }}>
+            <strong style={{ fontSize: 16 }}>WorldGit 3D Reconstruction Studio</strong>
+            <span style={{ fontSize: 13, color: "#38bdf8", background: "#0f172a", padding: "4px 10px", borderRadius: 6 }}>
+              Keyframes: <b>{keyframes.length}</b>
+            </span>
+            <span style={{ fontSize: 13, color: "#4ade80", background: "#0f172a", padding: "4px 10px", borderRadius: 6 }}>
+              3D Points: <b>{pointCount.toLocaleString()}</b>
+            </span>
+            <span
+              style={{
+                fontSize: 12,
+                color: glassesLive?.sensor_active ? "#4ade80" : latestImuSession ? "#c084fc" : "#94a3b8",
+                background: "#0f172a",
+                padding: "4px 10px",
+                borderRadius: 6,
+                border: glassesLive?.sensor_active ? "1px solid #16a34a" : "1px solid #334155",
+              }}
+            >
+              {glassesLive?.sensor_active
+                ? `Glasses IMU LIVE: ${glassesLive.compass_abs ?? glassesLive.yaw}° • ${glassesLive.steps ?? 0} steps`
+                : latestImuSession
+                  ? `IMU Log Ready (${latestImuSession.duration_s}s • ${latestImuSession.step_count} steps)`
+                  : "Glasses IMU: Stand by"}
+            </span>
+          </div>
+          <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
+            <button
+              onClick={locateCapturedVideo}
+              disabled={locatingVideo}
+              style={{
+                padding: "7px 14px",
+                borderRadius: 8,
+                background: locatingVideo ? "#334155" : "#059669",
+                color: "#fff",
+                border: "none",
+                fontWeight: 600,
+                whiteSpace: "nowrap",
+                cursor: locatingVideo ? "wait" : "pointer",
+              }}
+            >
+              {locatingVideo ? "Locating Video..." : "Locate Video on 3D Map"}
+            </button>
+            {spatialObjects[0]?.position && (
               <button
-                key={w.world_id}
-                onClick={() => activateWorld(w.world_id)}
+                onClick={() => focusCameraOnTarget(spatialObjects[0].position)}
                 style={{
-                  padding: "5px 11px",
-                  borderRadius: 7,
-                  border: isAct ? "1px solid #f0abfc" : "1px solid #334155",
-                  background: isAct ? (isSpliced ? "#7e22ce" : "#0369a1") : "#0f172a",
-                  color: "#f8fafc",
-                  fontWeight: isAct ? 700 : 500,
+                  padding: "7px 12px",
+                  borderRadius: 8,
+                  background: "#0f766e",
+                  color: "#ecfdf5",
+                  border: "1px solid #14b8a6",
+                  fontWeight: 600,
+                  whiteSpace: "nowrap",
                   cursor: "pointer",
                 }}
               >
-                {isSpliced ? "🔗 " : "🌐 "}
-                {w.label} • {w.point_count?.toLocaleString()} pts
+                Focus Bottle
               </button>
-            );
-          })}
+            )}
+            <button
+              onClick={loadVggtModel}
+              style={{
+                padding: "7px 14px",
+                borderRadius: 8,
+                background: "#7c3aed",
+                color: "#fff",
+                border: "none",
+                fontWeight: 600,
+                whiteSpace: "nowrap",
+                cursor: "pointer",
+              }}
+            >
+              Load VGGT Walk-Around
+            </button>
+            <label
+              style={{
+                padding: "7px 14px",
+                borderRadius: 8,
+                background: "#4f46e5",
+                color: "#fff",
+                fontWeight: 600,
+                fontSize: 13,
+                whiteSpace: "nowrap",
+                cursor: "pointer",
+              }}
+            >
+              Upload .MP4 (VGGT)
+              <input type="file" accept="video/*" onChange={uploadWalkthroughVideo} style={{ display: "none" }} />
+            </label>
+            <button
+              onClick={clearScan}
+              style={{
+                padding: "7px 14px",
+                borderRadius: 8,
+                background: "#dc2626",
+                color: "#fff",
+                border: "none",
+                fontWeight: 600,
+                whiteSpace: "nowrap",
+                cursor: "pointer",
+              }}
+            >
+              Clear / Reset 3D Map
+            </button>
+          </div>
         </div>
-      )}
+
+        {/* Multi-World Selector Strip (Spliced vs Separate Worlds) */}
+        {worlds.length > 0 && (
+          <div
+            style={{
+              display: "flex",
+              alignItems: "center",
+              gap: 8,
+              flexWrap: "wrap",
+              background: "rgba(15, 23, 42, 0.82)",
+              backdropFilter: "blur(8px)",
+              padding: "8px 14px",
+              borderRadius: 10,
+              border: "1px solid #1e293b",
+              fontSize: 12,
+              pointerEvents: "auto",
+            }}
+          >
+            <span style={{ color: "#94a3b8", fontWeight: 600, marginRight: 4 }}>
+              Worlds ({worlds.length}):
+            </span>
+            {worlds.map((w) => {
+              const isAct = activeWorldId === w.world_id;
+              const isSpliced = w.status === "spliced";
+              return (
+                <button
+                  key={w.world_id}
+                  onClick={() => activateWorld(w.world_id)}
+                  style={{
+                    padding: "5px 11px",
+                    borderRadius: 7,
+                    border: isAct ? "1px solid #f0abfc" : "1px solid #334155",
+                    background: isAct ? (isSpliced ? "#7e22ce" : "#0369a1") : "#0f172a",
+                    color: "#f8fafc",
+                    fontWeight: isAct ? 700 : 500,
+                    cursor: "pointer",
+                  }}
+                >
+                  {isSpliced ? "🔗 " : "🌐 "}
+                  {w.label} • {w.point_count?.toLocaleString()} pts
+                </button>
+              );
+            })}
+          </div>
+        )}
+      </div>
 
       {/* Minimal Bottom View Controls */}
       <div
@@ -1170,6 +1403,14 @@ export default function App() {
             onChange={(e) => setShowFrustums(e.target.checked)}
           />
           Camera Path
+        </label>
+        <label style={{ display: "flex", alignItems: "center", gap: 6, cursor: "pointer", color: "#4ade80" }}>
+          <input
+            type="checkbox"
+            checked={showVideoMarkers}
+            onChange={(e) => setShowVideoMarkers(e.target.checked)}
+          />
+          Video Pins ({spatialObjects.length})
         </label>
         <label style={{ display: "flex", alignItems: "center", gap: 6, cursor: "pointer" }}>
           <input
