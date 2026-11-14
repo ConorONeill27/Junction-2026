@@ -1,0 +1,10 @@
+[
+  {
+    "name": "bar",
+    "rating": 5,
+    "coordinates": {"latitude": 60.1567876, "longitude": 24.6304562},
+    "title": "Alec's review",
+    "review": "Really liked this bar",
+    "author": "Alec"
+  }
+]

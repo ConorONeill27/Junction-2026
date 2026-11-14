@@ -111,6 +111,9 @@ fun AppScaffold(
   val permission = androidx.activity.compose.rememberLauncherForActivityResult(
     androidx.activity.result.contract.ActivityResultContracts.RequestPermission()
   ) { granted -> if (granted) yoloViewModel.startCamera() }
+  val reviewerLocationPermission = androidx.activity.compose.rememberLauncherForActivityResult(
+    androidx.activity.result.contract.ActivityResultContracts.RequestMultiplePermissions()
+  ) { _ -> }
   val audioPermission = androidx.activity.compose.rememberLauncherForActivityResult(
     androidx.activity.result.contract.ActivityResultContracts.RequestPermission()
   ) { granted ->
@@ -336,7 +339,7 @@ fun AppScaffold(
         modifier = Modifier.fillMaxSize().padding(contentPadding),
     ) {
       composable(Routes.YOLO) {
-        YoloScreen(yoloState, cameraPreview, yoloViewModel.savedAddress, { address -> yoloViewModel.connect(address); if (!yoloViewModel.usingGlassesCamera) permission.launch(android.Manifest.permission.CAMERA) }, ::openSamples,
+        YoloScreen(yoloState, cameraPreview, yoloViewModel.savedAddress, { address -> yoloViewModel.connect(address); if (yoloViewModel.reviewerMode) reviewerLocationPermission.launch(arrayOf(android.Manifest.permission.ACCESS_FINE_LOCATION, android.Manifest.permission.ACCESS_COARSE_LOCATION)) else if (!yoloViewModel.usingGlassesCamera) permission.launch(android.Manifest.permission.CAMERA) }, ::openSamples,
           audioState, audioPinch, { audioViewModel.retryUploads(yoloViewModel.savedAddress) },
           cursorState, cursorPinch, speechState, noteAction, startGlasses, displayViewModel.physicalCameraRequested, hudCalibration, yoloViewModel::updateCalibration, yoloViewModel::applyEstimatedCalibration,
           memoryCard, { yoloViewModel.findMemory("bottle") }, yoloViewModel::dismissMemoryCard,

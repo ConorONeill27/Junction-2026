@@ -29,6 +29,10 @@ data class YoloState(val status: String = "Enter your laptop address to connect"
 class YoloViewModel(application: Application) : AndroidViewModel(application) {
   @Volatile var usingGlassesCamera = false
     private set
+  private val reviewer = ReviewerClient(application)
+  private var reviewerJob: Job? = null
+  @Volatile var reviewerMode = false
+    private set
   private val glassesFrameBusy = java.util.concurrent.atomic.AtomicBoolean(false)
   private val localTracker = LocalObjectTracker()
   private val phoneMotion = MotionPredictor()
@@ -62,13 +66,14 @@ class YoloViewModel(application: Application) : AndroidViewModel(application) {
     (simulatedRotation ?: cameraRotation)?.let { updateHeadCursor(it) }
   }
   fun setGlassesMotion(rotation: FloatArray?, gyro: FloatArray?) {
+    reviewer.orientation(rotation)
     val now = android.os.SystemClock.elapsedRealtimeNanos()
     rotation?.let { glassesMotion.orientation(it, now) }
     gyro?.takeIf { it.size == 3 }?.let { glassesMotion.angularVelocity(it[0], it[1], it[2], now) }
     glassesMotion.predict(now + 15_000_000L)?.let { updateHeadCursor(it) }
   }
 
-  fun clearGlassesMotion() { glassesMotion.clear() }
+  fun clearGlassesMotion() { glassesMotion.clear(); reviewer.orientation(null) }
 
   private val sensorListener = object : android.hardware.SensorEventListener {
     override fun onAccuracyChanged(sensor: android.hardware.Sensor?, accuracy: Int) {}
@@ -125,7 +130,7 @@ class YoloViewModel(application: Application) : AndroidViewModel(application) {
   }
   fun interactionState(): YoloState {
     val current = mutableState.value
-    return if (usingGlassesCamera) HudProjection(current.width,current.height,mutableCalibration.value).state(current) else current
+    return if (usingGlassesCamera && !reviewerMode) HudProjection(current.width,current.height,mutableCalibration.value).state(current) else current
   }
   val savedAddress: String get() = preferences.getString("address", "http://127.0.0.1:8765")!!
   private val mutableState = MutableStateFlow(YoloState())
@@ -262,6 +267,26 @@ class YoloViewModel(application: Application) : AndroidViewModel(application) {
       mutableState.value = YoloState("Enter http://<laptop-IP>:8765")
       return
     }
+    reviewerJob?.cancel()
+    reviewer.stop()
+    reviewerMode = uri!!.path.trimEnd('/') == "/reviewer"
+    if (reviewerMode) {
+      stopCamera()
+      val endpoint = uri.toString().removeSuffix("/reviewer")
+      base = endpoint
+      preferences.edit().putString("address", address).apply()
+      reviewerJob = viewModelScope.launch(Dispatchers.IO) {
+        while (true) {
+          val result = try { reviewer.poll(endpoint) }
+          catch (e: CancellationException) { throw e }
+          catch (e: Exception) { YoloState("Reviewer disconnected: ${e.message}") }
+          lastResult = System.currentTimeMillis()
+          mutableState.value = result
+          delay(250)
+        }
+      }
+      return
+    }
     generation.incrementAndGet()
     handler.post { localTracker.reset() }
     base = uri.toString()
@@ -271,6 +296,7 @@ class YoloViewModel(application: Application) : AndroidViewModel(application) {
   }
 
   fun startCamera() {
+    if (reviewerMode) return
     handler.post {
       if (camera != null || usingGlassesCamera) return@post
       sensors.getDefaultSensor(android.hardware.Sensor.TYPE_GAME_ROTATION_VECTOR)?.let {
@@ -296,6 +322,7 @@ class YoloViewModel(application: Application) : AndroidViewModel(application) {
   }
 
   private fun processFrame(frame: CameraFrame) {
+          if (reviewerMode) return
           val bitmap = frame.bitmap
           // Measure delivered camera frames independently of tracking responses.
           val capturedAt = frame.timestampNanos
@@ -390,6 +417,7 @@ class YoloViewModel(application: Application) : AndroidViewModel(application) {
   fun startGlassesCamera() {
     stopCamera()
     usingGlassesCamera = true
+    if (reviewerMode) return
     handler.post {
       localTracker.reset()
       captureEpoch = android.os.SystemClock.elapsedRealtimeNanos()
@@ -431,6 +459,8 @@ class YoloViewModel(application: Application) : AndroidViewModel(application) {
   }
 
   override fun onCleared() {
+    reviewerJob?.cancel()
+    reviewer.stop()
     stopCamera()
     tts?.stop()
     tts?.shutdown()

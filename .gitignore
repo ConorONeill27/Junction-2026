@@ -42,3 +42,4 @@ backend/static/worlds/
 meta-wearables-dat-android-ref/
 qr-*.png
 .gradle/
+backend/.env.example

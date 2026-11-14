@@ -1,0 +1,20 @@
+<!doctype html>
+<meta charset="utf-8"><title>WorldGit Reviewer simulator</title>
+<style>body{background:#182028;color:#fff;font:16px system-ui;max-width:900px;margin:30px auto}label{display:block;margin:12px}input{width:160px}#hud{position:relative;width:600px;height:600px;background:#000;margin-top:20px}#card{position:absolute;right:20px;top:180px;width:195px;padding:14px;border:1px solid #86efac;border-radius:10px;font-size:16px}#stars{color:#fde047}button{padding:10px}</style>
+<h1>Restaurant reviewer</h1>
+<p>Simulator controls also drive the Android Meta Display preview when simulation is enabled.</p>
+<label><input type="checkbox" id="simulated"> Use simulated pose (explicit demo mode)</label>
+<label>Latitude <input id="latitude" type="number" step="any" value="60.1567426"></label>
+<label>Longitude <input id="longitude" type="number" step="any" value="24.6304562"></label>
+<label>Heading ° clockwise from north <input id="heading" type="number" min="0" max="359" value="0"></label>
+<label>Glasses north calibration offset ° <input id="north_offset" type="number" value="0"></label>
+<button id="apply">Apply</button> <span id="status"></span>
+<div id="hud"><aside id="card" hidden><div id="stars"></div><strong id="name"></strong><p id="title"></p><p id="review"></p></aside></div>
+<script>
+const ids=['simulated','latitude','longitude','heading','north_offset'];
+const el=id=>document.getElementById(id);
+async function update(){try{const pose={latitude:+el('latitude').value,longitude:+el('longitude').value,heading:+el('heading').value};const r=await fetch('/api/reviews',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(pose)});if(!r.ok)throw Error('Invalid pose');const data=await r.json();const item=data.reviews[0];el('card').hidden=!item;if(item){el('stars').textContent='★'.repeat(item.rating)+' '+item.rating+'/5';for(const key of ['name','title','review'])el(key).textContent=item[key];}el('status').textContent=data.simulated?'Simulated pose active':'Local preview; Android uses phone GPS + glasses heading';}catch(e){el('card').hidden=true;el('status').textContent=e.message;}}
+el('apply').onclick=async()=>{const body=Object.fromEntries(ids.map(id=>[id,id==='simulated'?el(id).checked:+el(id).value]));const r=await fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});if(!r.ok){el('status').textContent='Invalid settings';return;}update();};
+fetch('/api/settings').then(r=>r.json()).then(data=>{ids.forEach(id=>{if(id==='simulated')el(id).checked=data[id];else el(id).value=data[id];});update();});
+setInterval(update,1000);
+</script>

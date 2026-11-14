@@ -490,8 +490,8 @@ class DisplayViewModel(
     val bitmap = android.graphics.Bitmap.createBitmap(200, 200, android.graphics.Bitmap.Config.ARGB_8888)
     bitmap.eraseColor(android.graphics.Color.BLACK)
     val hudCanvas = android.graphics.Canvas(bitmap).apply { scale(1f/3f,1f/3f) }
-    val predicted = hudPredictor.sample(if (physicalCameraRequested) hudMotion.predict(now+15_000_000L) else null,now/1e9,hudCalibration)
-    val projected = if (physicalCameraRequested)
+    val predicted = if (yoloState.status.startsWith("Reviewer")) yoloState else hudPredictor.sample(if (physicalCameraRequested) hudMotion.predict(now+15_000_000L) else null,now/1e9,hudCalibration)
+    val projected = if (physicalCameraRequested && !yoloState.status.startsWith("Reviewer"))
       com.meta.wearable.dat.externalsampleapps.displayaccess.HudProjection(predicted.width, predicted.height, hudCalibration).state(predicted)
       else predicted
     lastProjectedState = projected

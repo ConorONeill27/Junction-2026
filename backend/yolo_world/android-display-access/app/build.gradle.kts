@@ -24,6 +24,7 @@ val localProperties =
     }
 
 android {
+  sourceSets.getByName("main").java.srcDir("../../../reviewer_code")
   namespace = "com.meta.wearable.dat.externalsampleapps.displayaccess"
   compileSdk = 36
 
