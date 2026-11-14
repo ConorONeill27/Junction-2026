@@ -5,4 +5,7 @@ detections.txt
 *.tmp
 objects/
 audioClips/
+notes/
+places/
+memory/
 .venv-parakeet/

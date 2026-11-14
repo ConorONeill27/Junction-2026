@@ -127,9 +127,34 @@ class LiveTranscriptionViewModel(application: Application) : AndroidViewModel(ap
       if (generation.get() == current) {
         val result = mutableState.value
         val notes = if (noteId != null && result.text.isNotBlank()) result.notes + (noteId to result.text) else result.notes
+        if (noteId != null && result.text.isNotBlank()) {
+          persistNoteOnServer(address, noteId, result.text)
+        }
         mutableState.value = LiveSpeechState(error = error ?: result.error, notes = notes)
       }
       Log.i("WorldGitSpeech", "Live speech finished; heardSpeech=${endpoint.heardSpeech}; error=$error")
+    }
+  }
+
+  private fun persistNoteOnServer(address: String, objectId: String, text: String) {
+    viewModelScope.launch(Dispatchers.IO) {
+      runCatching {
+        val body = JSONObject()
+          .put("object_id", objectId)
+          .put("text", text)
+          .put("author", "Person A")
+          .toString()
+          .toByteArray()
+        val conn = URI("${address.trimEnd('/')}/api/notes").toURL().openConnection() as HttpURLConnection
+        conn.connectTimeout = 2500
+        conn.readTimeout = 2500
+        conn.requestMethod = "POST"
+        conn.doOutput = true
+        conn.setRequestProperty("Content-Type", "application/json")
+        conn.outputStream.use { it.write(body) }
+        conn.inputStream.use { it.readBytes() }
+        conn.disconnect()
+      }
     }
   }
 

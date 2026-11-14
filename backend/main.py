@@ -1019,6 +1019,91 @@ async def add_pin(pin: SpatialPin) -> Dict[str, Any]:
     return pin.model_dump()
 
 
+class HudPinRequest(BaseModel):
+    id: Optional[str] = None
+    label: str = "object"
+    text: str
+    author: str = "Person A"
+    center_px: Optional[List[float]] = None
+    frame_size_px: Optional[List[float]] = None
+    position_hint: Optional[List[float]] = None
+    yaw: Optional[float] = None
+    pitch: Optional[float] = None
+
+
+def _raycast_world_point(
+    origin: np.ndarray,
+    direction: np.ndarray,
+    points: List[List[float]],
+) -> List[float]:
+    """Find the nearest 3D surface point in world.points along a camera ray."""
+    if not points:
+        pt = origin + direction * 1.5
+        return [round(float(v), 3) for v in pt]
+    arr = np.asarray(points, dtype=np.float32)[:, :3]
+    rel = arr - origin[None, :]
+    proj = rel @ direction
+    mask = (proj > 0.35) & (proj < 6.0)
+    if not np.any(mask):
+        pt = origin + direction * 1.5
+        return [round(float(v), 3) for v in pt]
+    rel_m = rel[mask]
+    proj_m = proj[mask]
+    perp = np.linalg.norm(rel_m - proj_m[:, None] * direction[None, :], axis=1)
+    # Within ~6 degrees of the ray
+    cone = perp < (proj_m * 0.11)
+    if np.any(cone):
+        hits = arr[mask][cone]
+        dists = proj_m[cone]
+        near_d = float(np.percentile(dists, 15))
+        cluster = hits[dists <= near_d + 0.25]
+        pt = np.median(cluster, axis=0)
+        return [round(float(v), 3) for v in pt]
+    pt = origin + direction * 1.5
+    return [round(float(v), 3) for v in pt]
+
+
+@app.post("/api/pin-from-hud")
+async def add_pin_from_hud(req: HudPinRequest) -> Dict[str, Any]:
+    if req.position_hint and len(req.position_hint) == 3:
+        pos = [round(float(v), 3) for v in req.position_hint]
+    else:
+        wearer = world.wearers.get("wearer-b")
+        origin = np.array(wearer.position if wearer else [0.0, 1.3, 0.0], dtype=np.float32)
+        yaw_deg = float(req.yaw if req.yaw is not None else (wearer.yaw if wearer else 0.0))
+        pitch_deg = float(req.pitch if req.pitch is not None else (wearer.pitch if wearer else 0.0))
+        if req.center_px and req.frame_size_px and req.frame_size_px[0] > 0 and req.frame_size_px[1] > 0:
+            nx = (req.center_px[0] / req.frame_size_px[0]) - 0.5
+            ny = (req.center_px[1] / req.frame_size_px[1]) - 0.5
+            yaw_deg += nx * 65.0
+            pitch_deg -= ny * 50.0
+        yaw_r = math.radians(yaw_deg)
+        pitch_r = math.radians(pitch_deg)
+        direction = np.array([
+            math.sin(yaw_r) * math.cos(pitch_r),
+            math.sin(pitch_r),
+            -math.cos(yaw_r) * math.cos(pitch_r),
+        ], dtype=np.float32)
+        direction /= max(1e-6, float(np.linalg.norm(direction)))
+        pos = _raycast_world_point(origin, direction, world.points)
+
+    pin_id = req.id or f"pin-{uuid.uuid4().hex[:8]}"
+    pin = SpatialPin(
+        id=pin_id,
+        author=req.author,
+        text=req.text,
+        pin_type="note",
+        position=pos,
+        landmark=req.label,
+        created_at=time.time(),
+        age_label="just now",
+    )
+    world.pins[pin.id] = pin
+    db.upsert_pin(pin.model_dump())
+    await broadcast_state()
+    return {"ok": True, "position": pos, "pin": pin.model_dump()}
+
+
 @app.post("/api/object")
 async def upsert_object(obj: SpatialObject) -> Dict[str, Any]:
     world.objects[obj.id] = obj

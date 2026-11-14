@@ -14,7 +14,7 @@ import org.json.JSONObject
 import java.net.HttpURLConnection
 import java.net.URI
 
-data class YoloItem(val id: String, val label: String, val confidence: Double, val box: List<Double>) {
+data class YoloItem(val id: String, val label: String, val confidence: Double, val box: List<Double>, val note: String? = null) {
   val center: String get() = "(${((box[0] + box[2]) / 2).toInt()}, ${((box[1] + box[3]) / 2).toInt()}) px"
 }
 data class YoloState(val status: String = "Enter your laptop address to connect", val items: List<YoloItem> = emptyList(), val sample: Boolean = false, val width: Int = 480, val height: Int = 640)
@@ -85,9 +85,36 @@ class YoloViewModel(application: Application) : AndroidViewModel(application) {
   val calibration = mutableCalibration.asStateFlow()
   fun applyEstimatedCalibration() { updateCalibration(HudAlignmentEstimate.estimate()) }
   fun updateCalibration(value: HudCalibration) {
+    val wasGuiding = mutableCalibration.value.showGuide
     mutableCalibration.value = value
     preferences.edit().putFloat("hud-size",value.size).putFloat("hud-x",value.horizontal)
       .putFloat("hud-y",value.vertical).putFloat("hud-roll",value.roll).apply()
+    if (wasGuiding && !value.showGuide) saveCalibrationToServer()
+  }
+  fun saveCalibrationToServer(address: String = savedAddress) {
+    val cal = mutableCalibration.value
+    android.util.Log.i("WorldGitCal", "Saved HUD calibration: size=${cal.size} x=${cal.horizontal} y=${cal.vertical} roll=${cal.roll}")
+    val target = address.trim().trimEnd('/').ifBlank { savedAddress }
+    viewModelScope.launch(Dispatchers.IO) {
+      runCatching {
+        val body = JSONObject()
+          .put("size", cal.size.toDouble())
+          .put("horizontal", cal.horizontal.toDouble())
+          .put("vertical", cal.vertical.toDouble())
+          .put("roll", cal.roll.toDouble())
+          .toString()
+          .toByteArray()
+        val conn = URI("$target/api/calibration").toURL().openConnection() as HttpURLConnection
+        conn.connectTimeout = 2000
+        conn.readTimeout = 2000
+        conn.requestMethod = "POST"
+        conn.doOutput = true
+        conn.setRequestProperty("Content-Type", "application/json")
+        conn.outputStream.use { it.write(body) }
+        conn.inputStream.use { it.readBytes() }
+        conn.disconnect()
+      }
+    }
   }
   fun interactionState(): YoloState {
     val current = mutableState.value
@@ -226,8 +253,9 @@ class YoloViewModel(application: Application) : AndroidViewModel(application) {
                 val items = (0 until array.length()).map { index ->
                   val item = array.getJSONObject(index)
                   val box = item.getJSONArray("bbox_xyxy")
+                  val note = item.optString("note").takeIf { it.isNotBlank() }
                   YoloItem(item.optString("object_id", "object-$index"), item.getString("label"),
-                    item.getDouble("confidence"), (0..3).map { box.getDouble(it) })
+                    item.getDouble("confidence"), (0..3).map { box.getDouble(it) }, note)
                 }
                 val frameSize = json.getJSONArray("frame_size_px")
                 require(frameSize.getInt(0) == bitmap.width && frameSize.getInt(1) == bitmap.height) {

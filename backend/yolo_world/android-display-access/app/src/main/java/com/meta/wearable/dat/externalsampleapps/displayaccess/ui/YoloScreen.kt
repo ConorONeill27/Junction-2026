@@ -86,6 +86,29 @@ fun YoloScreen(state: YoloState, preview: Bitmap?, savedAddress: String, onConne
         }
       }) {
         drawYoloOverlay(drawContext.canvas.nativeCanvas, size.width, size.height, state, previewCursor, speech)
+        if (aligning && glassesRunning && state.width > 0 && state.height > 0) {
+          val proj = HudProjection(state.width, state.height, calibration)
+          val tl = proj.inverse(0.0, 0.0)
+          val tr = proj.inverse(600.0, 0.0)
+          val br = proj.inverse(600.0, 600.0)
+          val bl = proj.inverse(0.0, 600.0)
+          val scale = minOf(size.width / state.width, size.height / state.height)
+          val ox = (size.width - state.width * scale) / 2f
+          val oy = (size.height - state.height * scale) / 2f
+          fun sx(p: Pair<Double, Double>) = ox + p.first.toFloat() * scale
+          fun sy(p: Pair<Double, Double>) = oy + p.second.toFloat() * scale
+          val p = android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG).apply {
+            color = android.graphics.Color.CYAN; style = android.graphics.Paint.Style.STROKE; strokeWidth = 4f
+          }
+          val nc = drawContext.canvas.nativeCanvas
+          nc.drawLine(sx(tl), sy(tl), sx(tr), sy(tr), p)
+          nc.drawLine(sx(tr), sy(tr), sx(br), sy(br), p)
+          nc.drawLine(sx(br), sy(br), sx(bl), sy(bl), p)
+          nc.drawLine(sx(bl), sy(bl), sx(tl), sy(tl), p)
+          val center = proj.inverse(300.0, 300.0)
+          p.color = android.graphics.Color.WHITE
+          nc.drawCircle(sx(center), sy(center), 6f, p)
+        }
         drawLiveSpeechOverlay(drawContext.canvas.nativeCanvas, size.width, size.height, speech)
       }
       Text(state.status, style = MaterialTheme.typography.bodySmall, color = Color.White,
@@ -96,20 +119,49 @@ fun YoloScreen(state: YoloState, preview: Bitmap?, savedAddress: String, onConne
   }
   if (aligning) {
     ModalBottomSheet(onDismissRequest = { aligning = false; onCalibrationChange(calibration.copy(showGuide = false)) }) {
-      Column(Modifier.fillMaxWidth().verticalScroll(rememberScrollState()).padding(20.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-        Text("Align outlines", style = MaterialTheme.typography.titleLarge)
-        Text("Keep the glasses still and match an outline to a stationary object at your usual working distance. Changes are saved.")
-        Text("Box size: %.2fx".format(calibration.size))
-        Slider(value = calibration.size, onValueChange = { onCalibrationChange(calibration.copy(size = it)) }, valueRange = .2f..3f)
-        Text("Left / right: %.0f".format(calibration.horizontal))
+      Column(Modifier.fillMaxWidth().verticalScroll(rememberScrollState()).padding(16.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+        Text("HUD Crop Bounds", style = MaterialTheme.typography.titleLarge)
+        Text("Move & zoom the cyan box until the 4 corner brackets & center + in the glasses match the cyan box on your phone.",
+          style = MaterialTheme.typography.bodySmall)
+
+        Text("Left / right: %.0f px".format(calibration.horizontal))
         Slider(value = calibration.horizontal, onValueChange = { onCalibrationChange(calibration.copy(horizontal = it)) }, valueRange = -1500f..1500f)
-        Text("Up / down: %.0f".format(calibration.vertical))
+        Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+          OutlinedButton(onClick = { onCalibrationChange(calibration.copy(horizontal = (calibration.horizontal - 25f).coerceIn(-1500f, 1500f))) }) { Text("-25") }
+          OutlinedButton(onClick = { onCalibrationChange(calibration.copy(horizontal = (calibration.horizontal - 5f).coerceIn(-1500f, 1500f))) }) { Text("-5") }
+          OutlinedButton(onClick = { onCalibrationChange(calibration.copy(horizontal = (calibration.horizontal + 5f).coerceIn(-1500f, 1500f))) }) { Text("+5") }
+          OutlinedButton(onClick = { onCalibrationChange(calibration.copy(horizontal = (calibration.horizontal + 25f).coerceIn(-1500f, 1500f))) }) { Text("+25") }
+        }
+
+        Text("Up / down: %.0f px".format(calibration.vertical))
         Slider(value = calibration.vertical, onValueChange = { onCalibrationChange(calibration.copy(vertical = it)) }, valueRange = -1500f..1500f)
-        Text("Rotation: %.1f degrees".format(calibration.roll))
+        Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+          OutlinedButton(onClick = { onCalibrationChange(calibration.copy(vertical = (calibration.vertical - 25f).coerceIn(-1500f, 1500f))) }) { Text("-25") }
+          OutlinedButton(onClick = { onCalibrationChange(calibration.copy(vertical = (calibration.vertical - 5f).coerceIn(-1500f, 1500f))) }) { Text("-5") }
+          OutlinedButton(onClick = { onCalibrationChange(calibration.copy(vertical = (calibration.vertical + 5f).coerceIn(-1500f, 1500f))) }) { Text("+5") }
+          OutlinedButton(onClick = { onCalibrationChange(calibration.copy(vertical = (calibration.vertical + 25f).coerceIn(-1500f, 1500f))) }) { Text("+25") }
+        }
+
+        Text("Crop zoom (edges): %.2fx".format(calibration.size))
+        Slider(value = calibration.size, onValueChange = { onCalibrationChange(calibration.copy(size = it)) }, valueRange = .2f..3f)
+        Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+          OutlinedButton(onClick = { onCalibrationChange(calibration.copy(size = (calibration.size - 0.10f).coerceIn(.2f, 3f))) }) { Text("-0.10x") }
+          OutlinedButton(onClick = { onCalibrationChange(calibration.copy(size = (calibration.size - 0.02f).coerceIn(.2f, 3f))) }) { Text("-0.02x") }
+          OutlinedButton(onClick = { onCalibrationChange(calibration.copy(size = (calibration.size + 0.02f).coerceIn(.2f, 3f))) }) { Text("+0.02x") }
+          OutlinedButton(onClick = { onCalibrationChange(calibration.copy(size = (calibration.size + 0.10f).coerceIn(.2f, 3f))) }) { Text("+0.10x") }
+        }
+
+        Text("Tilt (roll): %.1f°".format(calibration.roll))
         Slider(value = calibration.roll, onValueChange = { onCalibrationChange(calibration.copy(roll = it)) }, valueRange = -15f..15f)
-        Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-          OutlinedButton(onClick = onEstimate) { Text("Use estimate") }
-          Button(onClick = { aligning = false; onCalibrationChange(calibration.copy(showGuide = false)) }) { Text("Done") }
+
+        Text("size=%.2fx | x=%.0f | y=%.0f | roll=%.1f°".format(calibration.size, calibration.horizontal, calibration.vertical, calibration.roll),
+          style = MaterialTheme.typography.bodySmall)
+        Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+          OutlinedButton(onClick = onEstimate) { Text("Reset estimate") }
+          Button(onClick = {
+            aligning = false
+            onCalibrationChange(calibration.copy(showGuide = false))
+          }) { Text("Save calibration") }
         }
       }
     }

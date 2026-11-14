@@ -494,11 +494,28 @@ class DisplayViewModel(
     if (hudCalibration.showGuide) {
       val canvas = hudCanvas
       val paint = android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG).apply {
-        color = android.graphics.Color.WHITE; style = android.graphics.Paint.Style.STROKE; strokeWidth = 1f
+        color = android.graphics.Color.CYAN; style = android.graphics.Paint.Style.STROKE; strokeWidth = 4f
       }
-      canvas.drawRect(1f,1f,599f,599f,paint)
-      canvas.drawLine(285f,300f,315f,300f,paint)
-      canvas.drawLine(300f,285f,300f,315f,paint)
+      // TV-style overscan corner brackets at the exact edges of the 600x600 glasses HUD.
+      val m = 4f
+      val len = 64f
+      // Top-left
+      canvas.drawLine(m, m, m + len, m, paint)
+      canvas.drawLine(m, m, m, m + len, paint)
+      // Top-right
+      canvas.drawLine(600f - m, m, 600f - m - len, m, paint)
+      canvas.drawLine(600f - m, m, 600f - m, m + len, paint)
+      // Bottom-left
+      canvas.drawLine(m, 600f - m, m + len, 600f - m, paint)
+      canvas.drawLine(m, 600f - m, m, 600f - m - len, paint)
+      // Bottom-right
+      canvas.drawLine(600f - m, 600f - m, 600f - m - len, 600f - m, paint)
+      canvas.drawLine(600f - m, 600f - m, 600f - m, 600f - m - len, paint)
+      // Center crosshair
+      paint.color = android.graphics.Color.WHITE
+      paint.strokeWidth = 2f
+      canvas.drawLine(280f, 300f, 320f, 300f, paint)
+      canvas.drawLine(300f, 280f, 300f, 320f, paint)
     }
     yoloRenderJob = sendContent(onAccepted = { hudAccepted.incrementAndGet() }) {
       flexBox(direction = Direction.COLUMN, padding = 0, gap = 0,

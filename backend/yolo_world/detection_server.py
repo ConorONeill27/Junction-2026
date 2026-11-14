@@ -4,11 +4,13 @@ import copy
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import os
+from pathlib import Path
 import socket
 import threading
 import time
 from audio_clips import AudioClips, DEFAULT_AUDIO_DIR, MAX_AUDIO_BYTES
 from parakeet_asr import ParakeetClient, TranscriptionUnavailable, MAX_PCM_BYTES, validate_pcm
+from spatial_notes import DEFAULT_NOTES_DIR, SpatialNoteStore
 
 
 class CameraHTTPServer(ThreadingHTTPServer):
@@ -23,16 +25,28 @@ class CameraHTTPServer(ThreadingHTTPServer):
 
 
 class DetectionServer:
-    def __init__(self, host="0.0.0.0", port=8765, predict=None, track=None, audio_dir=DEFAULT_AUDIO_DIR, transcribe=None):
+    def __init__(self, host="0.0.0.0", port=8765, predict=None, track=None, audio_dir=DEFAULT_AUDIO_DIR, transcribe=None, notes_dir=DEFAULT_NOTES_DIR):
         self.lock = threading.Lock()
         self.snapshot = {"timestamp": None, "source": "laptop_camera", "detections": []}
         owner = self
         self.inference_lock = threading.Lock()
         self.audio_clips = AudioClips(audio_dir)
         self.transcribe = transcribe or ParakeetClient().transcribe
+        self.notes = SpatialNoteStore(notes_dir)
+        self.latest_frame = None
+        self.latest_detections = []
 
         class Handler(BaseHTTPRequestHandler):
             protocol_version = "HTTP/1.1"
+
+            def _send_json(self, obj, status=200):
+                data = json.dumps(obj).encode("utf-8")
+                self.send_response(status)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Cache-Control", "no-store")
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
 
             def setup(self):
                 super().setup()
@@ -40,6 +54,19 @@ class DetectionServer:
                 self.connection.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
 
             def do_GET(self):
+                if self.path == "/api/calibration":
+                    cal_path = Path(__file__).resolve().parent / "hud_calibration.json"
+                    data = cal_path.read_bytes() if cal_path.exists() else b"{}"
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Cache-Control", "no-store")
+                    self.send_header("Content-Length", str(len(data)))
+                    self.end_headers()
+                    self.wfile.write(data)
+                    return
+                if self.path == "/api/notes":
+                    self._send_json({"notes": owner.notes.list_notes()})
+                    return
                 if self.path != "/api/detections":
                     self.send_error(404)
                     return
@@ -52,7 +79,20 @@ class DetectionServer:
                 self.end_headers()
                 self.wfile.write(data)
 
+            def do_DELETE(self):
+                if self.path == "/api/notes":
+                    owner.notes.clear()
+                    self._send_json({"ok": True, "notes": []})
+                    return
+                self.send_error(404)
+
             def do_POST(self):
+                if self.path == "/api/calibration":
+                    self.save_calibration()
+                    return
+                if self.path == "/api/notes":
+                    self.save_note()
+                    return
                 if self.path == '/api/transcribe':
                     self.transcribe_audio()
                     return
@@ -91,6 +131,10 @@ class DetectionServer:
                             raise ValueError("Invalid rotation")
                     phone_tracking = self.headers.get("X-Tracking-Mode") == "phone" and predict is not None
                     detections = predict(frame) if phone_tracking else track(frame, rotation) if track else predict(frame)
+                    detections = owner.notes.annotate_detections(detections, frame)
+                    with owner.lock:
+                        owner.latest_frame = frame.copy()
+                        owner.latest_detections = list(detections)
                     owner.publish(detections, [frame.shape[1], frame.shape[0]], "phone_camera")
                     with owner.lock:
                         owner.snapshot["processing_seconds"] = time.monotonic() - started
@@ -161,6 +205,80 @@ class DetectionServer:
                     self.wfile.write(data)
                 except (OSError, ValueError):
                     self.send_error(400, 'Invalid transcription audio')
+
+            def save_note(self):
+                try:
+                    import cv2
+                    length = int(self.headers.get("Content-Length", "0"))
+                    if not 2 <= length <= 500_000:
+                        self.send_error(400, "Invalid note payload")
+                        return
+                    payload = json.loads(self.rfile.read(length).decode("utf-8"))
+                    object_id = payload.get("object_id")
+                    label = payload.get("label") or "object"
+                    bbox = payload.get("bbox_xyxy")
+                    frame_size = payload.get("frame_size_px")
+                    crop_bgr = None
+                    with owner.lock:
+                        latest_frame = owner.latest_frame
+                        latest_dets = list(owner.latest_detections)
+                    if object_id:
+                        for d in latest_dets:
+                            if d.get("object_id") == object_id:
+                                label = payload.get("label") or d.get("label", label)
+                                bbox = bbox or d.get("bbox_xyxy")
+                                break
+                    if latest_frame is not None and bbox and len(bbox) == 4:
+                        fh, fw = latest_frame.shape[:2]
+                        frame_size = frame_size or [fw, fh]
+                        x1, y1, x2, y2 = [int(v) for v in bbox]
+                        l, t = max(0, x1), max(0, y1)
+                        r, b = min(fw, x2), min(fh, y2)
+                        if r > l and b > t:
+                            crop_bgr = latest_frame[t:b, l:r].copy()
+                    if crop_bgr is None and object_id:
+                        obj_img = Path(__file__).resolve().parent / "objects" / str(object_id) / "image.jpg"
+                        if obj_img.exists():
+                            crop_bgr = cv2.imread(str(obj_img))
+                    record = owner.notes.add_note(
+                        label=label,
+                        text=payload.get("text", ""),
+                        author=payload.get("author", "Person A"),
+                        object_id=object_id,
+                        bbox_xyxy=bbox,
+                        frame_size_px=frame_size,
+                        crop_bgr=crop_bgr,
+                        position_3d=payload.get("position_3d"),
+                    )
+                    self._send_json({"ok": True, "note": record})
+                except (OSError, ValueError, TypeError):
+                    self.send_error(400, "Invalid note request")
+
+            def save_calibration(self):
+                try:
+                    length = int(self.headers.get("Content-Length", "0"))
+                    if not 2 <= length <= 8192:
+                        self.send_error(400, "Invalid calibration payload")
+                        return
+                    payload = json.loads(self.rfile.read(length).decode("utf-8"))
+                    cal = {
+                        "size": float(payload.get("size", 1.0)),
+                        "horizontal": float(payload.get("horizontal", 0.0)),
+                        "vertical": float(payload.get("vertical", 0.0)),
+                        "roll": float(payload.get("roll", 0.0)),
+                        "saved_at": time.time(),
+                    }
+                    cal_path = Path(__file__).resolve().parent / "hud_calibration.json"
+                    cal_path.write_text(json.dumps(cal, indent=2) + "\n", encoding="utf-8")
+                    print(f"[HUD Calibration Saved] size={cal['size']:.3f} x={cal['horizontal']:.1f} y={cal['vertical']:.1f} roll={cal['roll']:.2f}", flush=True)
+                    data = json.dumps({"ok": True, "calibration": cal}).encode("utf-8")
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(data)))
+                    self.end_headers()
+                    self.wfile.write(data)
+                except (OSError, ValueError, TypeError):
+                    self.send_error(400, "Invalid calibration JSON")
 
             def log_message(self, *args):
                 pass
