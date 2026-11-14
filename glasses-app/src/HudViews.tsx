@@ -1,5 +1,5 @@
 import {TextStyle, TextView} from '@wearables-ui-toolkit/mrbd';
-import type {SpatialObject, SpatialPin, Wearer, WorldDiff} from './useWorldGit';
+import type {ImuTelemetry, SpatialObject, SpatialPin, Wearer, WorldDiff} from './useWorldGit';
 import {VOICE_HINTS, type HudMode} from './webmcp';
 
 interface HudViewsProps {
@@ -14,6 +14,7 @@ interface HudViewsProps {
   undoSteps: string[];
   wearers: Wearer[];
   selfWearer: Wearer;
+  imu: ImuTelemetry;
 }
 
 export function HudViews({
@@ -28,7 +29,34 @@ export function HudViews({
   undoSteps,
   wearers,
   selfWearer,
+  imu,
 }: HudViewsProps) {
+  const compassSummary =
+    imu.headingDeg !== null
+      ? `${imu.cardinal} ${Math.round(imu.headingDeg)}°`
+      : `Yaw ${Math.round(selfWearer.yaw)}°`;
+
+  if (mode === 'scan') {
+    const recLabel = imu.isRecording
+      ? `REC IMU • ${imu.sampleCount} pts`
+      : imu.sensorStatus === 'active'
+        ? '9-Axis Live • Idle'
+        : `Sensors ${imu.sensorStatus.toUpperCase()}`;
+    return (
+      <>
+        <TextView as="p" textStyle={TextStyle.BODY2_EMPHASIZED}>
+          {recLabel} • {compassSummary}
+        </TextView>
+        <TextView as="p" textStyle={TextStyle.BODY2}>
+          Tilt {imu.pitchDeg}°/{imu.rollDeg}° • Gyro {imu.gyroYawDeg}° • {imu.steps} steps ({imu.distanceM}m)
+        </TextView>
+        <TextView as="p" textStyle={TextStyle.META1}>
+          {imu.lastSyncNote} • {VOICE_HINTS.scan.description}
+        </TextView>
+      </>
+    );
+  }
+
   if (mode === 'ctrlf') {
     return (
       <>
@@ -39,7 +67,7 @@ export function HudViews({
           {searchMessage || localNav.text}
         </TextView>
         <TextView as="p" textStyle={TextStyle.META1}>
-          Indexed by {activeTarget.seen_by} • {objectsCount} items ({statusNote}) • {VOICE_HINTS.ctrlf.description}
+          {compassSummary} • {objectsCount} items ({statusNote}) • {VOICE_HINTS.ctrlf.description}
         </TextView>
       </>
     );
@@ -78,7 +106,7 @@ export function HudViews({
   return (
     <>
       <TextView as="p" textStyle={TextStyle.BODY2_EMPHASIZED}>
-        Live Shared Space ({wearers.length} wearers)
+        Live Shared Space ({wearers.length} wearers) • {compassSummary}
       </TextView>
       {wearers.map(w => {
         const d =
@@ -92,7 +120,7 @@ export function HudViews({
           <TextView key={w.wearer_id} as="p" textStyle={TextStyle.BODY2}>
             {w.name}:{' '}
             {w.wearer_id === 'wearer-b'
-              ? `(${w.position[0]}, ${w.position[2]}) yaw ${w.yaw}°`
+              ? `(${w.position[0]}, ${w.position[2]}) yaw ${w.yaw}° • ${imu.steps} steps`
               : `${d}m away`}
           </TextView>
         );

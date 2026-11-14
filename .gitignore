@@ -1,8 +1,11 @@
 # Dependencies
 node_modules/
 .venv/
+.venv*/
 venv/
 ENV/
+backend/moge_repo/
+backend/vggt_repo/
 
 # Python bytecode & caches
 __pycache__/
@@ -30,3 +33,12 @@ build/
 # OS / Editor metadata
 .DS_Store
 Thumbs.db
+
+# Large binary assets, raw scans, APKs, and reference clones
+backend/static/dat_scans/
+backend/static/imu_sessions/
+backend/static/worlds/
+*.apk
+meta-wearables-dat-android-ref/
+qr-*.png
+.gradle/
