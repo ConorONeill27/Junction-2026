@@ -27,6 +27,7 @@ data class LiveSpeechState(val active: Boolean = false, val text: String = "", v
 class LiveTranscriptionViewModel(application: Application) : AndroidViewModel(application) {
   private val mutableState = MutableStateFlow(LiveSpeechState())
   val state = mutableState.asStateFlow()
+  @Volatile var onQuery: ((String) -> Unit)? = null
   private val generation = AtomicInteger(0)
   @Volatile private var stopRequested = false
   @Volatile private var microphone: AudioRecord? = null
@@ -129,6 +130,8 @@ class LiveTranscriptionViewModel(application: Application) : AndroidViewModel(ap
         val notes = if (noteId != null && result.text.isNotBlank()) result.notes + (noteId to result.text) else result.notes
         if (noteId != null && result.text.isNotBlank()) {
           persistNoteOnServer(address, noteId, result.text)
+        } else if (noteId == null && result.text.isNotBlank()) {
+          onQuery?.invoke(result.text)
         }
         mutableState.value = LiveSpeechState(error = error ?: result.error, notes = notes)
       }

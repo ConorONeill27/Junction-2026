@@ -161,7 +161,8 @@ fun AppScaffold(
     else if (noteHit != null) noteAction(noteHit)
     else if (yoloViewModel.pinchCursor(if (yoloViewModel.usingGlassesCamera) displayViewModel.interactionState() else null)) startSpeechFor(null)
   }
-  DisposableEffect(displayViewModel, audioPermission) {
+  DisposableEffect(displayViewModel, speechViewModel, yoloViewModel, audioPermission) {
+    speechViewModel.onQuery = yoloViewModel::askMemory
     displayViewModel.onGlassesVideo = yoloViewModel::receiveGlassesFrame
     displayViewModel.onGlassesAudio = speechViewModel::receiveGlassesAudio
     displayViewModel.onGlassesCameraStopped = yoloViewModel::stopCamera
@@ -170,6 +171,7 @@ fun AppScaffold(
     displayViewModel.onAudioPinch = audioPinch
     displayViewModel.onCursorPinch = cursorPinch
     onDispose {
+      speechViewModel.onQuery = null
       displayViewModel.onGlassesVideo = null
       displayViewModel.onGlassesAudio = null
       displayViewModel.onGlassesCameraStopped = null
@@ -344,7 +346,9 @@ fun AppScaffold(
           cursorState, cursorPinch, speechState, noteAction, startGlasses, displayViewModel.physicalCameraRequested, hudCalibration, yoloViewModel::updateCalibration, yoloViewModel::applyEstimatedCalibration,
           memoryCard, { yoloViewModel.findMemory("bottle") }, yoloViewModel::dismissMemoryCard,
           ttsEnabled, yoloViewModel::toggleTts,
-          memoryPaused, yoloViewModel::togglePrivacyPause, yoloViewModel::clearMemories)
+          memoryPaused, yoloViewModel::togglePrivacyPause, yoloViewModel::clearMemories,
+          { if (speechState.active) speechViewModel.finish() else startSpeechFor(null) },
+          { yoloViewModel.askMemory("hey meta, have i left anything behind?") })
       }
       composable(Routes.CONNECT) {
         ConnectScreen(

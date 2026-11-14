@@ -29,6 +29,7 @@ from ai_services import (
 from db import SpatialDatabase
 from imu_fusion import ImuSessionStore
 from reconstruction import reconstructor
+from video_localizer import DEFAULT_VIDEO_PATH, localize_video_on_world
 
 load_dotenv()
 
@@ -133,6 +134,7 @@ class WorldState:
         self.room_envelope: Optional[Dict[str, Any]] = None
         self.raw_point_count: int = len(self.points)
         self.completed_point_count: int = 0
+        self.video_trail: List[Dict[str, Any]] = []
         self.clients: List[WebSocket] = []
         self._seed_demo_world()
 
@@ -341,7 +343,8 @@ class WorldState:
             "wall_segments": self.wall_segments,
             "predicted_openings": self.predicted_openings,
             "room_envelope": self.room_envelope,
-            "keyframes": reconstructor.keyframes[-36:],
+            "keyframes": reconstructor.keyframes[-120:],
+            "video_trail": self.video_trail,
             "tech_stack_status": {
                 "aiven": self.db.status(),
                 "ai": ai_status(),
@@ -950,6 +953,80 @@ async def get_model_ply() -> FileResponse:
 @app.get("/api/aiven-status")
 async def get_aiven_status() -> Dict[str, Any]:
     return db.status()
+
+
+@app.post("/api/localize-video")
+async def localize_video_endpoint(request: Request) -> Dict[str, Any]:
+    """Localize a video (uploaded .mp4 or captured hotel clip) onto the active 3D room map."""
+    tmp_vid: Optional[str] = None
+    try:
+        ctype = (request.headers.get("content-type") or "").lower()
+        body = await request.body()
+        video_path: Optional[Path] = None
+        if body and ("video/" in ctype or "application/octet-stream" in ctype or "multipart/form-data" in ctype):
+            if "multipart/form-data" in ctype:
+                form = await request.form()
+                file_item = form.get("file") or form.get("video")
+                if file_item is not None and hasattr(file_item, "read"):
+                    data = await file_item.read()
+                    if data:
+                        with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tf:
+                            tf.write(data)
+                            tmp_vid = tf.name
+                        video_path = Path(tmp_vid)
+            else:
+                with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tf:
+                    tf.write(body)
+                    tmp_vid = tf.name
+                video_path = Path(tmp_vid)
+        elif body and "application/json" in ctype:
+            payload = json.loads(body.decode("utf-8"))
+            if payload.get("video_path"):
+                video_path = Path(str(payload["video_path"]))
+
+        result = await asyncio.to_thread(
+            localize_video_on_world,
+            video_path or DEFAULT_VIDEO_PATH,
+            world.points,
+            reconstructor.keyframes,
+        )
+        if not result.get("ok"):
+            return result
+
+        pos = result["target_position"]
+        label = result.get("target_label", "Water Bottle")
+        obj = SpatialObject(
+            id="obj-water-bottle",
+            label=label,
+            position=pos,
+            seen_by=f"Video t={result['target_t']}s (KF #{result['matched_keyframe'] + 1})",
+            timestamp=time.time(),
+            confidence=float(result.get("confidence", 0.5)),
+        )
+        pin = SpatialPin(
+            id="pin-water-bottle",
+            author="Meta AI",
+            text="You left your water bottle on the ground beside the left bed.",
+            pin_type="bottle",
+            position=pos,
+            landmark=label,
+            created_at=time.time(),
+            age_label=f"t={result['target_t']}s",
+        )
+        world.objects[obj.id] = obj
+        world.pins[pin.id] = pin
+        world.video_trail = list(result.get("video_trail", []))
+        db.upsert_object(obj.model_dump())
+        db.upsert_pin(pin.model_dump())
+        await broadcast_state()
+        return {
+            **result,
+            "object": obj.model_dump(),
+            "pin": pin.model_dump(),
+        }
+    finally:
+        if tmp_vid and os.path.exists(tmp_vid):
+            os.remove(tmp_vid)
 
 
 class CtrlFQuery(BaseModel):

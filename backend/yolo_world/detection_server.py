@@ -87,6 +87,11 @@ class DetectionServer:
                     else:
                         self._send_json({"found": True, **hit})
                     return
+                if self.path.startswith("/api/memory/ask"):
+                    qs = parse_qs(urlparse(self.path).query)
+                    q = (qs.get("q") or [""])[0]
+                    self._send_json({"ok": True, **owner.memory.ask(q)})
+                    return
                 if self.path == "/api/privacy":
                     self._send_json({"paused": owner.memory.paused})
                     return
@@ -129,6 +134,9 @@ class DetectionServer:
                     return
                 if self.path == "/api/privacy":
                     self.toggle_privacy()
+                    return
+                if self.path == "/api/memory/ask":
+                    self.ask_memory()
                     return
                 if self.path == '/api/transcribe':
                     self.transcribe_audio()
@@ -253,6 +261,15 @@ class DetectionServer:
                     self._send_json({"ok": True, "paused": paused})
                 except (OSError, ValueError, TypeError):
                     self.send_error(400, "Invalid privacy payload")
+
+            def ask_memory(self):
+                try:
+                    length = int(self.headers.get("Content-Length", "0"))
+                    payload = json.loads(self.rfile.read(length).decode("utf-8")) if 0 < length <= 65536 else {}
+                    question = str(payload.get("question") or payload.get("q") or "")
+                    self._send_json({"ok": True, **owner.memory.ask(question)})
+                except (OSError, ValueError, TypeError):
+                    self.send_error(400, "Invalid memory query payload")
 
             def save_place(self):
                 try:

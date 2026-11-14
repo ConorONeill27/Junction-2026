@@ -17,6 +17,26 @@ from detection_server import DetectionServer
 CAMERA_SOURCE = 0  # Laptop webcam; change to another index, video path, or RTSP URL.
 INFERENCE_INTERVAL = 0.2  # 5 YOLO detection passes per second.
 MODEL_PATH = Path(__file__).resolve().parent / "yolov8s-worldv2.pt"
+DEFAULT_CLASSES = [
+    "water bottle",
+    "bottle",
+    "thermos",
+    "backpack",
+    "bag",
+    "keys",
+    "wallet",
+    "phone",
+    "laptop",
+    "glasses",
+    "bed",
+    "nightstand",
+    "desk",
+    "table",
+    "chair",
+    "couch",
+    "door",
+    "person",
+]
 
 
 def positive_seconds(value):
@@ -84,8 +104,7 @@ def main():
 
         from flow_tracker import TrackingPipeline
         tracking = TrackingPipeline(predict_phone, args.interval)
-        if args.classes:
-            model.set_classes(args.classes)
+        model.set_classes(args.classes or DEFAULT_CLASSES)
         detection_server = DetectionServer(args.host, args.port, predict=predict_phone, track=tracking).start()
         print(f"Phone detection API: http://<laptop-ip>:{args.port}/api/detections", flush=True)
         if args.source == "phone":

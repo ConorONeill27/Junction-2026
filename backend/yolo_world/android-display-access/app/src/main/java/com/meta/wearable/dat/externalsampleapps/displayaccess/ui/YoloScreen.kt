@@ -38,7 +38,8 @@ fun YoloScreen(state: YoloState, preview: Bitmap?, savedAddress: String, onConne
   cursor: HeadCursorState, onCursorPinch: () -> Unit, speech: LiveSpeechState, onNoteAction: (String) -> Unit, onStartGlasses: () -> Unit, glassesRunning: Boolean, calibration: HudCalibration, onCalibrationChange: (HudCalibration) -> Unit, onEstimate: () -> Unit,
   memoryCard: MemoryCardState? = null, onFindBottle: () -> Unit = {}, onDismissMemory: () -> Unit = {},
   ttsEnabled: Boolean = true, onToggleTts: () -> Unit = {},
-  memoryPaused: Boolean = false, onTogglePrivacy: () -> Unit = {}, onClearMemories: () -> Unit = {}) {
+  memoryPaused: Boolean = false, onTogglePrivacy: () -> Unit = {}, onClearMemories: () -> Unit = {},
+  onAskVoice: () -> Unit = {}, onAskLeftBehind: () -> Unit = {}) {
   val latestState by rememberUpdatedState(state)
   val latestCursor by rememberUpdatedState(cursor)
   val latestSpeech by rememberUpdatedState(speech)
@@ -65,9 +66,11 @@ fun YoloScreen(state: YoloState, preview: Bitmap?, savedAddress: String, onConne
         OutlinedButton(onClick = onRetryAudio, enabled = !audio.uploading) { Text("Retry upload") }
       }
     }
-    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-      OutlinedButton(onClick = onCursorPinch) { Text(if (speech.active) "Finish speaking" else if (cursor.visible) "Pinch: select / speak" else "Pinch: show cursor") }
-      OutlinedButton(onClick = onFindBottle) { Text("Find bottle") }
+    Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+      OutlinedButton(onClick = onCursorPinch) { Text(if (speech.active) "Finish" else if (cursor.visible) "Pinch" else "Cursor") }
+      OutlinedButton(onClick = onAskVoice) { Text(if (speech.active) "Listening..." else "Ask AI") }
+      OutlinedButton(onClick = onAskLeftBehind) { Text("Left?") }
+      OutlinedButton(onClick = onFindBottle) { Text("Bottle") }
     }
     Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
       OutlinedButton(onClick = onToggleTts) { Text(if (ttsEnabled) "Voice: ON" else "Voice: OFF") }
