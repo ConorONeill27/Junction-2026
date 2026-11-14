@@ -12,9 +12,10 @@ from typing import Any, Dict, List, Optional
 
 import httpx
 from dotenv import load_dotenv
+import numpy as np
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, Response
 from pathlib import Path
 from pydantic import BaseModel
 import tempfile
@@ -26,6 +27,7 @@ from ai_services import (
     synthesize_elevenlabs_tts,
 )
 from db import SpatialDatabase
+from imu_fusion import ImuSessionStore
 from reconstruction import reconstructor
 
 load_dotenv()
@@ -67,6 +69,10 @@ class WearerState(BaseModel):
     position: List[float]
     yaw: float = 0.0
     pitch: float = 0.0
+    roll: float = 0.0
+    compass_abs: Optional[float] = None
+    steps: int = 0
+    sensor_active: bool = False
     last_seen: float
 
 
@@ -122,6 +128,11 @@ class WorldState:
         self.pins: Dict[str, SpatialPin] = {}
         self.snapshots: List[WorldSnapshot] = []
         self.points: List[List[float]] = _generate_room_point_cloud()
+        self.wall_segments: List[List[float]] = []
+        self.predicted_openings: List[List[float]] = []
+        self.room_envelope: Optional[Dict[str, Any]] = None
+        self.raw_point_count: int = len(self.points)
+        self.completed_point_count: int = 0
         self.clients: List[WebSocket] = []
         self._seed_demo_world()
 
@@ -325,6 +336,11 @@ class WorldState:
             "snapshots": [s.model_dump() for s in self.snapshots],
             "diff": self.compute_diff(),
             "point_count": len(self.points),
+            "raw_point_count": self.raw_point_count or len(self.points),
+            "completed_point_count": self.completed_point_count,
+            "wall_segments": self.wall_segments,
+            "predicted_openings": self.predicted_openings,
+            "room_envelope": self.room_envelope,
             "keyframes": reconstructor.keyframes[-36:],
             "tech_stack_status": {
                 "aiven": self.db.status(),
@@ -338,6 +354,7 @@ world = WorldState(db=db)
 world.objects.clear()
 
 _STATIC_DIR = Path(__file__).resolve().parent / "static"
+imu_store = ImuSessionStore(_STATIC_DIR / "imu_sessions")
 
 
 def _load_oj_carton_into_world() -> int:
@@ -347,19 +364,62 @@ def _load_oj_carton_into_world() -> int:
             with open(pts_file, "r", encoding="utf-8") as f:
                 data = json.load(f)
             world.points = data.get("points", [])
+            world.raw_point_count = int(data.get("raw_point_count") or len(world.points))
+            world.completed_point_count = int(data.get("completed_point_count") or 0)
             reconstructor.keyframes = data.get("keyframes", [])
             return len(world.points)
         except Exception:
             pass
     world.points = []
+    world.raw_point_count = 0
+    world.completed_point_count = 0
     return 0
 
 
-_load_oj_carton_into_world()
+def _load_startup_world() -> None:
+    idx_path = _STATIC_DIR / "worlds" / "index.json"
+    if idx_path.exists():
+        try:
+            idx = json.loads(idx_path.read_text(encoding="utf-8"))
+            wid = idx.get("active_world_id")
+            worlds_list = idx.get("worlds", [])
+            target = next((w for w in worlds_list if w.get("world_id") == wid), worlds_list[0] if worlds_list else None)
+            if target and Path(target["json_path"]).exists():
+                data = json.loads(Path(target["json_path"]).read_text(encoding="utf-8"))
+                world.points = data.get("points", [])
+                world.raw_point_count = int(data.get("raw_point_count") or len(world.points))
+                world.completed_point_count = int(data.get("completed_point_count") or 0)
+                world.wall_segments = data.get("wall_segments", [])
+                world.predicted_openings = data.get("predicted_openings", [])
+                world.room_envelope = data.get("room_envelope")
+                reconstructor.keyframes = data.get("keyframes", [])
+                return
+        except Exception:
+            pass
+    _load_oj_carton_into_world()
+
+
+_load_startup_world()
 
 
 async def broadcast_state() -> None:
     payload = json.dumps(world.serialize_state())
+    stale: List[WebSocket] = []
+    for ws in world.clients:
+        try:
+            await ws.send_text(payload)
+        except Exception:
+            stale.append(ws)
+    for ws in stale:
+        if ws in world.clients:
+            world.clients.remove(ws)
+
+
+async def broadcast_wearers() -> None:
+    payload = json.dumps({
+        "type": "wearers_update",
+        "wearers": [w.model_dump() for w in world.wearers.values()],
+    })
     stale: List[WebSocket] = []
     for ws in world.clients:
         try:
@@ -460,6 +520,22 @@ async def get_points() -> Dict[str, Any]:
     return {"point_count": len(world.points), "points": world.points}
 
 
+@app.get("/api/points.bin")
+async def get_points_bin() -> Response:
+    """Streams [x, y, z, r, g, b] float32 tuples in compact binary for 60fps Three.js loading."""
+    if not world.points:
+        return Response(content=b"", media_type="application/octet-stream", headers={"X-Point-Count": "0"})
+    arr = np.asarray(world.points, dtype="<f4")
+    if arr.ndim != 2 or arr.shape[1] < 6:
+        return Response(content=b"", media_type="application/octet-stream", headers={"X-Point-Count": "0"})
+    arr = np.ascontiguousarray(arr[:, :6])
+    return Response(
+        content=arr.tobytes(),
+        media_type="application/octet-stream",
+        headers={"X-Point-Count": str(len(arr)), "Cache-Control": "no-store"},
+    )
+
+
 class ResetCloudRequest(BaseModel):
     empty: bool = True
 
@@ -469,6 +545,11 @@ async def reset_cloud(req: ResetCloudRequest) -> Dict[str, Any]:
     reconstructor.reset()
     if req.empty:
         world.points = []
+        world.raw_point_count = 0
+        world.completed_point_count = 0
+        world.wall_segments = []
+        world.predicted_openings = []
+        world.room_envelope = None
         world.objects.clear()
     else:
         _load_oj_carton_into_world()
@@ -496,11 +577,26 @@ async def load_vggt_model() -> Dict[str, Any]:
     with open(vggt_file, "r", encoding="utf-8") as f:
         data = json.load(f)
     world.points = data.get("points", [])
+    world.raw_point_count = int(data.get("raw_point_count") or len(world.points))
+    world.completed_point_count = int(data.get("completed_point_count") or 0)
     reconstructor.keyframes = data.get("keyframes", [])
+    segs = data.get("wall_segments")
+    if segs is None and world.points:
+        from walkthrough_vggt import predict_wall_segments
+        pts_np = np.asarray(world.points, dtype=np.float64)[:, :3]
+        segs = predict_wall_segments(pts_np, reconstructor.keyframes)
+    world.wall_segments = segs or []
+    world.predicted_openings = data.get("predicted_openings", [])
+    world.room_envelope = data.get("room_envelope")
     await broadcast_state()
     return {
         "ok": True,
         "point_count": len(world.points),
+        "raw_point_count": world.raw_point_count,
+        "completed_point_count": world.completed_point_count,
+        "wall_segments": world.wall_segments,
+        "predicted_openings": world.predicted_openings,
+        "room_envelope": world.room_envelope,
         "keyframes": reconstructor.keyframes,
         "elapsed_s": data.get("elapsed_s"),
         "device": data.get("device"),
@@ -508,6 +604,7 @@ async def load_vggt_model() -> Dict[str, Any]:
 
 
 _vggt_runner = None
+_multi_world_mgr = None
 
 
 def _get_vggt_runner():
@@ -516,6 +613,263 @@ def _get_vggt_runner():
         from walkthrough_vggt import IncrementalVGGTReconstructor
         _vggt_runner = IncrementalVGGTReconstructor()
     return _vggt_runner
+
+
+def _get_multi_world_mgr():
+    global _multi_world_mgr
+    if _multi_world_mgr is None:
+        from multi_world import MultiWorldManager
+        _multi_world_mgr = MultiWorldManager(
+            runner=_get_vggt_runner(),
+            worlds_root=_STATIC_DIR / "worlds",
+        )
+    return _multi_world_mgr
+
+
+def _load_world_json(json_path: Path) -> Dict[str, Any]:
+    with open(json_path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    world.points = data.get("points", [])
+    world.raw_point_count = int(data.get("raw_point_count") or len(world.points))
+    world.completed_point_count = int(data.get("completed_point_count") or 0)
+    world.wall_segments = data.get("wall_segments", [])
+    world.predicted_openings = data.get("predicted_openings", [])
+    world.room_envelope = data.get("room_envelope")
+    reconstructor.keyframes = data.get("keyframes", [])
+    return data
+
+
+@app.get("/api/worlds")
+async def list_worlds() -> Dict[str, Any]:
+    idx_path = _STATIC_DIR / "worlds" / "index.json"
+    if not idx_path.exists():
+        return {"worlds": [], "clips": {}, "edges": [], "active_world_id": None}
+    return json.loads(idx_path.read_text(encoding="utf-8"))
+
+
+@app.post("/api/worlds/{world_id}/activate")
+async def activate_world(world_id: str) -> Dict[str, Any]:
+    idx_path = _STATIC_DIR / "worlds" / "index.json"
+    if not idx_path.exists():
+        return {"ok": False, "error": "No worlds index built yet"}
+    idx = json.loads(idx_path.read_text(encoding="utf-8"))
+    target = next((w for w in idx.get("worlds", []) if w.get("world_id") == world_id), None)
+    if target is None:
+        return {"ok": False, "error": f"Unknown world_id: {world_id}"}
+    jpath = Path(target["json_path"])
+    if not jpath.exists():
+        return {"ok": False, "error": f"World file missing: {jpath}"}
+    _load_world_json(jpath)
+    idx["active_world_id"] = world_id
+    idx_path.write_text(json.dumps(idx, indent=2), encoding="utf-8")
+    await broadcast_state()
+    return {
+        "ok": True,
+        "world_id": world_id,
+        "label": target.get("label"),
+        "status": target.get("status"),
+        "clips": target.get("clips", []),
+        "point_count": len(world.points),
+        "raw_point_count": world.raw_point_count,
+        "completed_point_count": world.completed_point_count,
+        "wall_segments": world.wall_segments,
+        "predicted_openings": world.predicted_openings,
+        "room_envelope": world.room_envelope,
+        "keyframes": reconstructor.keyframes,
+    }
+
+
+class ImuSessionUpload(BaseModel):
+    session_id: Optional[str] = None
+    device: str = "meta-ray-ban-display"
+    started_at_ms: Optional[float] = None
+    ended_at_ms: Optional[float] = None
+    step_count: int = 0
+    samples: List[Dict[str, Any]] = []
+
+
+@app.post("/api/imu-sessions")
+async def upload_imu_session(payload: ImuSessionUpload) -> Dict[str, Any]:
+    """Stores a timestamped 9-axis IMU session captured on the Meta Ray-Ban Display glasses."""
+    summary = imu_store.save_session(payload.model_dump())
+    return {"ok": True, "session": summary}
+
+
+@app.get("/api/imu-sessions")
+async def list_imu_sessions() -> Dict[str, Any]:
+    return {"sessions": imu_store.list_sessions()}
+
+
+@app.get("/api/imu-sessions/latest")
+async def latest_imu_session(include_samples: bool = False) -> Dict[str, Any]:
+    sessions = imu_store.list_sessions()
+    if not sessions:
+        return {"session": None, "sessions_count": 0}
+    latest = imu_store.load_session(sessions[0]["session_id"]) if include_samples else sessions[0]
+    return {"session": latest, "sessions_count": len(sessions)}
+
+
+def _probe_video_duration_s(video_path: Path) -> float:
+    try:
+        import cv2
+
+        cap = cv2.VideoCapture(str(video_path))
+        total = float(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0.0)
+        fps = float(cap.get(cv2.CAP_PROP_FPS) or 30.0)
+        cap.release()
+        return total / max(1.0, fps)
+    except Exception:
+        return 0.0
+
+
+async def _background_ingest_dat_scan(saved_vid: Path, imu_session_id: str) -> None:
+    try:
+        vid_dur_s = _probe_video_duration_s(saved_vid)
+        imu_sess = imu_store.match_video_session(saved_vid, vid_dur_s, explicit_session_id=imu_session_id)
+        mgr = _get_multi_world_mgr()
+        clip_meta = await asyncio.to_thread(mgr.ingest_video, saved_vid, None, 24, 260000, True, imu_sess)
+        idx = await asyncio.to_thread(mgr.reconcile_worlds, 320000)
+        cid = clip_meta["clip_id"]
+        containing = next((w for w in idx.get("worlds", []) if cid in w.get("clips", [])), None)
+        if containing:
+            _load_world_json(Path(containing["json_path"]))
+            idx["active_world_id"] = containing["world_id"]
+            mgr.save_index(idx)
+            await broadcast_state()
+    except Exception as exc:
+        print(f"[dat-scans] background ingest error: {exc}")
+
+
+@app.post("/api/dat-scans")
+async def upload_dat_scan(
+    request: Request,
+    name: str = "scan.mp4",
+    imu_session_id: str = "auto",
+    started_at_ms: Optional[float] = None,
+    reconstruct: bool = True,
+) -> Dict[str, Any]:
+    """Saves a synchronized .mp4 + 9-axis IMU scan from the WorldGit Android DAT companion app and queues 3D reconstruction."""
+    raw_bytes = await request.body()
+    if not raw_bytes:
+        return {"ok": False, "error": "Empty video upload"}
+
+    safe_name = Path(name).name or f"scan_{int(time.time())}.mp4"
+    scans_dir = Path(__file__).parent / "static" / "dat_scans"
+    scans_dir.mkdir(parents=True, exist_ok=True)
+    saved_vid = scans_dir / safe_name
+    saved_vid.write_bytes(raw_bytes)
+
+    vid_dur_s = _probe_video_duration_s(saved_vid)
+    imu_sess = imu_store.match_video_session(saved_vid, vid_dur_s, explicit_session_id=imu_session_id)
+
+    if reconstruct:
+        asyncio.create_task(_background_ingest_dat_scan(saved_vid, imu_session_id))
+
+    return {
+        "ok": True,
+        "video_name": safe_name,
+        "video_bytes": len(raw_bytes),
+        "video_duration_s": round(vid_dur_s, 2),
+        "saved_path": str(saved_vid),
+        "reconstruct_queued": reconstruct,
+        "imu_matched": (
+            {
+                "session_id": imu_sess.get("session_id"),
+                "device": imu_sess.get("device"),
+                "sample_count": imu_sess.get("sample_count"),
+                "step_count": imu_sess.get("step_count"),
+            }
+            if imu_sess
+            else None
+        ),
+    }
+
+
+@app.get("/api/dat-scans")
+async def list_dat_scans() -> Dict[str, Any]:
+    scans_dir = Path(__file__).parent / "static" / "dat_scans"
+    scans_dir.mkdir(parents=True, exist_ok=True)
+    items = []
+    for p in sorted(scans_dir.glob("*.mp4"), key=lambda f: f.stat().st_mtime, reverse=True):
+        items.append(
+            {
+                "name": p.name,
+                "size_bytes": p.stat().st_size,
+                "mtime": p.stat().st_mtime,
+                "url": f"/static/dat_scans/{p.name}",
+            }
+        )
+    return {"scans": items}
+
+
+@app.api_route("/api/download/worldgit-dat.apk", methods=["GET", "HEAD"])
+async def download_dat_apk() -> Response:
+    apk_path = Path(__file__).parent / "static" / "worldgit-dat.apk"
+    if not apk_path.exists():
+        return Response(status_code=404, content=b"APK not built yet")
+    return FileResponse(
+        path=str(apk_path),
+        media_type="application/vnd.android.package-archive",
+        filename="worldgit-glasses.apk",
+    )
+
+
+@app.post("/api/worlds/add-video")
+async def add_video_to_worlds(
+    request: Request,
+    name: str = "upload.mp4",
+    imu_session_id: str = "auto",
+) -> Dict[str, Any]:
+    """Reconstructs an uploaded .mp4 clip, discovers intersections, and splices into matching worlds."""
+    raw_bytes = await request.body()
+    if not raw_bytes:
+        return {"ok": False, "error": "Empty video upload"}
+
+    safe_name = Path(name).name or f"clip_{int(time.time())}.mp4"
+    tmp_dir = Path(tempfile.gettempdir()) / "worldgit_uploads"
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+    tmp_vid = tmp_dir / safe_name
+    tmp_vid.write_bytes(raw_bytes)
+
+    try:
+        vid_dur_s = _probe_video_duration_s(tmp_vid)
+        imu_sess = imu_store.match_video_session(tmp_vid, vid_dur_s, explicit_session_id=imu_session_id)
+        mgr = _get_multi_world_mgr()
+        clip_meta = await asyncio.to_thread(mgr.ingest_video, tmp_vid, None, 24, 260000, True, imu_sess)
+        idx = await asyncio.to_thread(mgr.reconcile_worlds, 320000)
+        cid = clip_meta["clip_id"]
+        containing = next((w for w in idx.get("worlds", []) if cid in w.get("clips", [])), None)
+        if containing:
+            _load_world_json(Path(containing["json_path"]))
+            idx["active_world_id"] = containing["world_id"]
+            mgr.save_index(idx)
+            await broadcast_state()
+        return {
+            "ok": True,
+            "clip": clip_meta,
+            "imu_matched": (
+                {
+                    "session_id": imu_sess.get("session_id"),
+                    "sample_count": imu_sess.get("sample_count"),
+                    "step_count": imu_sess.get("step_count"),
+                }
+                if imu_sess
+                else None
+            ),
+            "active_world": containing,
+            "worlds": idx.get("worlds", []),
+            "edges": idx.get("edges", []),
+            "point_count": len(world.points),
+            "raw_point_count": world.raw_point_count,
+            "completed_point_count": world.completed_point_count,
+            "wall_segments": world.wall_segments,
+            "predicted_openings": world.predicted_openings,
+            "room_envelope": world.room_envelope,
+            "keyframes": reconstructor.keyframes,
+        }
+    finally:
+        if tmp_vid.exists():
+            tmp_vid.unlink()
 
 
 @app.post("/api/reconstruct-video-bytes")
@@ -532,20 +886,40 @@ async def reconstruct_video_bytes(request: Request) -> Dict[str, Any]:
     try:
         out_json = _STATIC_DIR / "vggt_walkthrough_points.json"
         runner = _get_vggt_runner()
+        loop = asyncio.get_running_loop()
+
+        def _on_window(msg: str, pts_list: List[List[float]], kfs: List[Dict[str, Any]]) -> None:
+            world.points = pts_list
+            reconstructor.keyframes = kfs
+            asyncio.run_coroutine_threadsafe(broadcast_state(), loop)
+
         payload = await asyncio.to_thread(
             runner.reconstruct_video_incremental,
             tmp_vid,
             out_json,
-            12,
+            8,
             3,
-            21,
+            24,
+            260000,
+            48.0,
+            _on_window,
         )
         world.points = payload.get("points", [])
+        world.raw_point_count = int(payload.get("raw_point_count") or len(world.points))
+        world.completed_point_count = int(payload.get("completed_point_count") or 0)
+        world.wall_segments = payload.get("wall_segments", [])
+        world.predicted_openings = payload.get("predicted_openings", [])
+        world.room_envelope = payload.get("room_envelope")
         reconstructor.keyframes = payload.get("keyframes", [])
         await broadcast_state()
         return {
             "ok": True,
             "point_count": len(world.points),
+            "raw_point_count": world.raw_point_count,
+            "completed_point_count": world.completed_point_count,
+            "wall_segments": world.wall_segments,
+            "predicted_openings": world.predicted_openings,
+            "room_envelope": world.room_envelope,
             "keyframes": reconstructor.keyframes,
             "elapsed_s": payload.get("elapsed_s"),
             "device": payload.get("device"),
@@ -659,6 +1033,9 @@ class FrameAnalysisRequest(BaseModel):
     pose: Optional[List[float]] = None
     yaw: Optional[float] = None
     pitch: Optional[float] = None
+    roll: Optional[float] = None
+    compass_abs: Optional[float] = None
+    steps: Optional[int] = None
     points: Optional[List[List[float]]] = None
     replace_cloud: bool = False
     skip_ai: bool = True
@@ -679,6 +1056,12 @@ async def analyze_frame(req: FrameAnalysisRequest) -> Dict[str, Any]:
             wearer.yaw = round(float(req.yaw), 1)
         if req.pitch is not None:
             wearer.pitch = round(float(req.pitch), 1)
+        if req.roll is not None:
+            wearer.roll = round(float(req.roll), 1)
+        if req.compass_abs is not None:
+            wearer.compass_abs = round(float(req.compass_abs), 1)
+        if req.steps is not None:
+            wearer.steps = int(req.steps)
         wearer.last_seen = time.time()
 
     if req.replace_cloud:
@@ -830,10 +1213,16 @@ async def ws_stream(websocket: WebSocket) -> None:
                     position=msg["position"],
                     yaw=float(msg.get("yaw", 0.0)),
                     pitch=float(msg.get("pitch", 0.0)),
+                    roll=float(msg.get("roll", 0.0)),
+                    compass_abs=(
+                        float(msg["compass_abs"]) if msg.get("compass_abs") is not None else None
+                    ),
+                    steps=int(msg.get("steps", 0)),
+                    sensor_active=bool(msg.get("sensor_active", False)),
                     last_seen=time.time(),
                 )
                 world.wearers[w.wearer_id] = w
-                await broadcast_state()
+                await broadcast_wearers()
 
             elif msg_type == "frame":
                 await websocket.send_text(

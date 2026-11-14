@@ -1,4 +1,4 @@
-export type HudMode = 'ctrlf' | 'pins' | 'ctrlz' | 'crew';
+export type HudMode = 'ctrlf' | 'pins' | 'ctrlz' | 'crew' | 'scan';
 
 export const VOICE_HINTS: Record<HudMode, {phrase: string; description: string}> = {
   ctrlf: {
@@ -16,6 +16,10 @@ export const VOICE_HINTS: Record<HudMode, {phrase: string; description: string}>
   crew: {
     phrase: 'Hey Meta, what is our WorldGit status?',
     description: 'Voice: "Hey Meta, what is our WorldGit status?"',
+  },
+  scan: {
+    phrase: 'Hey Meta, start IMU scan',
+    description: 'Voice: "Hey Meta, start IMU scan"',
   },
 };
 
@@ -46,6 +50,8 @@ export interface WebMcpHandlers {
   findObject: (query: string) => Promise<Record<string, unknown>>;
   pinMemory: (text: string, kind: string) => Promise<Record<string, unknown>>;
   runCtrlZ: () => Promise<Record<string, unknown>>;
+  startImuScan: () => Promise<Record<string, unknown>>;
+  stopImuScan: () => Promise<Record<string, unknown>>;
 }
 
 function safeRegister(ctx: ModelContext, tool: ModelContextTool, signal?: AbortSignal) {
@@ -71,7 +77,7 @@ export function registerWorldGitTools(handlers: WebMcpHandlers, signal?: AbortSi
     {
       name: 'worldgit_get_state',
       description:
-        'Read the current WorldGit HUD mode, active Ctrl+F target, nearby spatial pins, and diff count.',
+        'Read the current WorldGit HUD mode, live compass/IMU telemetry, active Ctrl+F target, nearby spatial pins, and diff count.',
       inputSchema: {
         type: 'object',
         properties: {},
@@ -171,6 +177,48 @@ export function registerWorldGitTools(handlers: WebMcpHandlers, signal?: AbortSi
         return JSON.stringify({
           ...res,
           next_action: 'Summarize the first two Ctrl+Z restore steps concisely. Stop and talk.',
+        });
+      },
+    },
+    signal,
+  );
+
+  safeRegister(
+    ctx,
+    {
+      name: 'worldgit_start_imu_scan',
+      description:
+        'Enable 9-axis glasses IMU (compass, gyro, accelerometer) tracking and start recording a motion log for video sync.',
+      inputSchema: {
+        type: 'object',
+        properties: {},
+      },
+      execute: async () => {
+        const res = await handlers.startImuScan();
+        return JSON.stringify({
+          ...res,
+          next_action: 'Confirm 9-axis IMU recording started and remind wearer to film now. Stop and talk.',
+        });
+      },
+    },
+    signal,
+  );
+
+  safeRegister(
+    ctx,
+    {
+      name: 'worldgit_stop_imu_scan',
+      description:
+        'Stop 9-axis IMU recording and upload the timestamped session to the WorldGit Hub.',
+      inputSchema: {
+        type: 'object',
+        properties: {},
+      },
+      execute: async () => {
+        const res = await handlers.stopImuScan();
+        return JSON.stringify({
+          ...res,
+          next_action: 'Confirm IMU log uploaded for auto-matching with the uploaded clip. Stop and talk.',
         });
       },
     },
