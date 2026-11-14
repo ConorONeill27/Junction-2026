@@ -182,13 +182,20 @@ def _spatial_context(target_det, target_box, detections, width: int, height: int
     return context, spatial_phrase, in_hand
 
 
+from studio_bridge import post_json_async
+
+
 class ObjectMemoryStore:
     """Stores last-seen frame, crop, and surrounding context for everyday objects."""
 
-    def __init__(self, directory=DEFAULT_MEMORY_DIR):
+    def __init__(self, directory=DEFAULT_MEMORY_DIR, save_interval_s=3.0, studio_url=None, world_id="world_1", actor_user_id="usr_conor"):
         self.directory = Path(directory)
         self.directory.mkdir(parents=True, exist_ok=True)
         self.index_path = self.directory / "memory.json"
+        self.save_interval_s = float(save_interval_s)
+        self.studio_url = studio_url.rstrip("/") if studio_url else None
+        self.world_id = world_id
+        self.actor_user_id = actor_user_id
         self.lock = threading.Lock()
         self.paused = False
         self.items = {}  # normalized label -> dict
@@ -287,6 +294,22 @@ class ObjectMemoryStore:
                 }
                 self._last_saved_at[label] = now
                 updated = True
+
+                if self.studio_url:
+                    cx = ((l + r) * 0.5 / max(1, w) - 0.5) * 2.0
+                    cy = (0.5 - (t + b) * 0.5 / max(1, h)) * 1.2 + 0.8
+                    post_json_async(
+                        self.studio_url,
+                        "/api/objects/sighting",
+                        {
+                            "world_id": self.world_id,
+                            "label": label,
+                            "position": [round(cx, 3), round(cy, 3), -1.2],
+                            "actor_user_id": self.actor_user_id,
+                            "zone_hint": spatial_phrase or context or "",
+                            "confidence": round(conf, 3),
+                        },
+                    )
 
             if updated:
                 self._save()

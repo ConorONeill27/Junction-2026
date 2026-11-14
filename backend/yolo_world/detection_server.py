@@ -14,6 +14,7 @@ from object_memory import DEFAULT_MEMORY_DIR, ObjectMemoryStore
 from parakeet_asr import ParakeetClient, TranscriptionUnavailable, MAX_PCM_BYTES, validate_pcm
 from place_anchors import DEFAULT_PLACES_DIR, PlaceAnchorStore
 from spatial_notes import DEFAULT_NOTES_DIR, SpatialNoteStore
+from studio_bridge import DEFAULT_STUDIO_URL
 
 
 class CameraHTTPServer(ThreadingHTTPServer):
@@ -28,16 +29,17 @@ class CameraHTTPServer(ThreadingHTTPServer):
 
 
 class DetectionServer:
-    def __init__(self, host="0.0.0.0", port=8765, predict=None, track=None, audio_dir=DEFAULT_AUDIO_DIR, transcribe=None, notes_dir=DEFAULT_NOTES_DIR, places_dir=DEFAULT_PLACES_DIR, memory_dir=DEFAULT_MEMORY_DIR):
+    def __init__(self, host="0.0.0.0", port=8765, predict=None, track=None, audio_dir=DEFAULT_AUDIO_DIR, transcribe=None, notes_dir=DEFAULT_NOTES_DIR, places_dir=DEFAULT_PLACES_DIR, memory_dir=DEFAULT_MEMORY_DIR, studio_url=DEFAULT_STUDIO_URL):
         self.lock = threading.Lock()
         self.snapshot = {"timestamp": None, "source": "laptop_camera", "detections": []}
         owner = self
+        self.studio_url = studio_url
         self.inference_lock = threading.Lock()
         self.audio_clips = AudioClips(audio_dir)
         self.transcribe = transcribe or ParakeetClient().transcribe
-        self.notes = SpatialNoteStore(notes_dir)
-        self.places = PlaceAnchorStore(places_dir)
-        self.memory = ObjectMemoryStore(memory_dir)
+        self.notes = SpatialNoteStore(notes_dir, studio_url=studio_url)
+        self.places = PlaceAnchorStore(places_dir, studio_url=studio_url)
+        self.memory = ObjectMemoryStore(memory_dir, studio_url=studio_url)
         self.latest_frame = None
         self.latest_detections = []
 
@@ -287,6 +289,12 @@ class DetectionServer:
                         author=payload.get("author", "Friend"),
                         image_bgr=None if payload.get("image_b64") else latest_frame,
                         image_b64=payload.get("image_b64"),
+                        audience_type=payload.get("audience_type", "friends"),
+                        group_ids=payload.get("group_ids"),
+                        target_user_ids=payload.get("target_user_ids"),
+                        lat=payload.get("lat"),
+                        lon=payload.get("lon"),
+                        world_id=payload.get("world_id", "world_1"),
                     )
                     self._send_json({"ok": True, "place": record})
                 except (OSError, ValueError, TypeError):
@@ -335,6 +343,11 @@ class DetectionServer:
                         frame_size_px=frame_size,
                         crop_bgr=crop_bgr,
                         position_3d=payload.get("position_3d"),
+                        audience_type=payload.get("audience_type", "friends"),
+                        group_ids=payload.get("group_ids"),
+                        target_user_ids=payload.get("target_user_ids"),
+                        lat=payload.get("lat"),
+                        lon=payload.get("lon"),
                     )
                     self._send_json({"ok": True, "note": record})
                 except (OSError, ValueError, TypeError):

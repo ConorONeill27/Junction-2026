@@ -10,16 +10,19 @@ from uuid import uuid4
 import cv2
 import numpy as np
 
+from studio_bridge import post_json_async
+
 DEFAULT_PLACES_DIR = Path(__file__).resolve().parent / "places"
 
 
 class PlaceAnchorStore:
     """Matches live glasses frames against saved storefront photos using ORB + homography."""
 
-    def __init__(self, directory=DEFAULT_PLACES_DIR):
+    def __init__(self, directory=DEFAULT_PLACES_DIR, studio_url=None):
         self.directory = Path(directory)
         self.directory.mkdir(parents=True, exist_ok=True)
         self.index_path = self.directory / "places.json"
+        self.studio_url = studio_url.rstrip("/") if studio_url else None
         self.lock = threading.Lock()
         self.orb = cv2.ORB_create(nfeatures=600)
         self.matcher = cv2.BFMatcher(cv2.NORM_HAMMING)
@@ -74,7 +77,21 @@ class PlaceAnchorStore:
                 p.unlink(missing_ok=True)
             self._save()
 
-    def add_place(self, name, rating, review, author="Friend", image_bgr=None, image_b64=None):
+    def add_place(
+        self,
+        name,
+        rating,
+        review,
+        author="Friend",
+        image_bgr=None,
+        image_b64=None,
+        audience_type="friends",
+        group_ids=None,
+        target_user_ids=None,
+        lat=None,
+        lon=None,
+        world_id="world_1",
+    ):
         name = (name or "").strip()
         review = (review or "").strip()
         if not name or not review:
@@ -83,18 +100,23 @@ class PlaceAnchorStore:
         if image_bgr is None and image_b64:
             raw = base64.b64decode(image_b64.split(",")[-1])
             image_bgr = cv2.imdecode(np.frombuffer(raw, dtype=np.uint8), cv2.IMREAD_COLOR)
-        if image_bgr is None or image_bgr.size == 0:
-            raise ValueError("Reference storefront image is required")
 
         pid = uuid4().hex[:12]
-        feat = self._extract_features(image_bgr)
-        cv2.imwrite(str(self.directory / f"{pid}.jpg"), image_bgr)
+        feat = None
+        if image_bgr is not None and image_bgr.size > 0:
+            feat = self._extract_features(image_bgr)
+            cv2.imwrite(str(self.directory / f"{pid}.jpg"), image_bgr)
         record = {
             "place_id": pid,
             "name": name,
             "rating": rating,
             "review": review,
             "author": author,
+            "audience_type": audience_type or "friends",
+            "group_ids": list(group_ids or []),
+            "target_user_ids": list(target_user_ids or []),
+            "lat": float(lat) if lat is not None else None,
+            "lon": float(lon) if lon is not None else None,
             "created_at": time.time(),
         }
         with self.lock:
@@ -102,6 +124,27 @@ class PlaceAnchorStore:
             if feat is not None:
                 self._features[pid] = feat
             self._save()
+        if self.studio_url:
+            post_json_async(
+                self.studio_url,
+                "/api/pin",
+                {
+                    "id": f"place-{pid}",
+                    "author": author,
+                    "text": f"{name} ({rating}/5): {review}",
+                    "pin_type": "place_review",
+                    "position": [0.0, 1.2, -1.5],
+                    "landmark": name,
+                    "world_id": world_id,
+                    "audience_type": record["audience_type"],
+                    "group_ids": record["group_ids"],
+                    "target_user_ids": record["target_user_ids"],
+                    "rating": rating,
+                    "place_name": name,
+                    "lat": record["lat"],
+                    "lon": record["lon"],
+                },
+            )
         return dict(record)
 
     def match_frame(self, frame_bgr, min_inliers=12):

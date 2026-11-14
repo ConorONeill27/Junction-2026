@@ -107,6 +107,11 @@ class SpatialNoteStore:
         crop_bgr=None,
         position_3d=None,
         sync_studio=True,
+        audience_type="friends",
+        group_ids=None,
+        target_user_ids=None,
+        lat=None,
+        lon=None,
     ):
         text = (text or "").strip()
         if not text:
@@ -114,6 +119,9 @@ class SpatialNoteStore:
         label = (label or "object").strip() or "object"
         nid = uuid4().hex[:12]
         now = time.time()
+        audience_type = audience_type or "friends"
+        group_ids = list(group_ids or [])
+        target_user_ids = list(target_user_ids or [])
 
         if crop_bgr is not None and crop_bgr.size > 0:
             cv2.imwrite(str(self.directory / f"{nid}.jpg"), crop_bgr)
@@ -136,6 +144,11 @@ class SpatialNoteStore:
                 author=author,
                 center_px=center_px,
                 frame_size_px=frame_size_px,
+                audience_type=audience_type,
+                group_ids=group_ids,
+                target_user_ids=target_user_ids,
+                lat=lat,
+                lon=lon,
             )
 
         record = {
@@ -144,6 +157,11 @@ class SpatialNoteStore:
             "label": label,
             "text": text,
             "author": author,
+            "audience_type": audience_type,
+            "group_ids": group_ids,
+            "target_user_ids": target_user_ids,
+            "lat": float(lat) if lat is not None else None,
+            "lon": float(lon) if lon is not None else None,
             "bbox_xyxy": [round(float(v), 1) for v in bbox_xyxy] if bbox_xyxy else None,
             "center_px": center_px,
             "frame_size_px": list(frame_size_px) if frame_size_px else None,
@@ -157,7 +175,20 @@ class SpatialNoteStore:
             self._save()
         return dict(record)
 
-    def _sync_to_studio(self, note_id, label, text, author, center_px, frame_size_px):
+    def _sync_to_studio(
+        self,
+        note_id,
+        label,
+        text,
+        author,
+        center_px,
+        frame_size_px,
+        audience_type="friends",
+        group_ids=None,
+        target_user_ids=None,
+        lat=None,
+        lon=None,
+    ):
         if not self.studio_url:
             return None
         payload = json.dumps({
@@ -167,6 +198,11 @@ class SpatialNoteStore:
             "author": author,
             "center_px": center_px,
             "frame_size_px": frame_size_px,
+            "audience_type": audience_type,
+            "group_ids": list(group_ids or []),
+            "target_user_ids": list(target_user_ids or []),
+            "lat": lat,
+            "lon": lon,
         }).encode("utf-8")
         req = urllib.request.Request(
             f"{self.studio_url}/api/pin-from-hud",
