@@ -20,6 +20,8 @@ export default function StudioDrawer({
   onFocusBottle,
   onLocateCapturedVideo,
   locatingVideo,
+  onAutoIndex,
+  reindexing,
   onUploadWalkthrough,
   scanJobs,
   statusText,
@@ -116,6 +118,14 @@ export default function StudioDrawer({
 
         <div className="wg-card">
           <span className="wg-section-label">Live Scan &amp; Localization</span>
+          <button
+            type="button"
+            className="wg-btn wg-btn-emerald"
+            disabled={reindexing}
+            onClick={onAutoIndex}
+          >
+            {reindexing ? "Indexing Zones & Items..." : "Re-Index Space (AI)"}
+          </button>
           <button
             type="button"
             className="wg-btn wg-btn-primary"

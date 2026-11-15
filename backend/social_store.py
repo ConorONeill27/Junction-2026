@@ -1,9 +1,18 @@
 """Everyday multiplayer domain helpers: visibility, zones, object movement ledger, and default seeds."""
 
+import json
 import math
 import time
 import uuid
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+
+LEGACY_GUESSED_ZONE_IDS = (
+    "zone-beside-left-bed",
+    "zone-right-nightstand",
+    "zone-foot-of-bed",
+    "zone-room-entrance",
+)
 
 LEGACY_INDUSTRIAL_OBJECT_IDS = {
     "obj-drill",
@@ -222,7 +231,35 @@ def seed_everyday_social_data(db: Any) -> None:
             "group_ids": ["grp-room"],
         })
 
-    if not db.list_zones("world_1"):
+    auto_index_path = Path(__file__).parent / "static" / "world_1_auto_index.json"
+    existing_zones = db.list_zones("world_1")
+    has_auto_zones = any(str(z.get("zone_id", "")).startswith("auto-zone-world_1-") for z in existing_zones)
+    if auto_index_path.exists():
+        # Purge stale manual-guess coordinates so vision-aligned rows take over cleanly
+        if hasattr(db, "delete_zone"):
+            for legacy_zid in LEGACY_GUESSED_ZONE_IDS:
+                db.delete_zone(legacy_zid)
+        if hasattr(db, "delete_object"):
+            db.delete_object("obj-water-bottle")
+        if hasattr(db, "delete_object_events_by_prefix"):
+            db.delete_object_events_by_prefix("world_1", "evt-water-bottle-")
+
+        if not has_auto_zones:
+            try:
+                from auto_indexer import persist_indexed_world
+
+                payload = json.loads(auto_index_path.read_text(encoding="utf-8"))
+                persist_indexed_world(
+                    "world_1",
+                    db,
+                    payload.get("zones", []),
+                    payload.get("objects", []),
+                    actor_user_id="usr-conor",
+                    clear_auto=True,
+                )
+            except Exception as exc:
+                print(f"[seed] failed loading {auto_index_path.name}: {exc}")
+    elif not existing_zones:
         for zid, name, x, y, z in (
             ("zone-beside-left-bed", "Beside Left Bed", -0.72, 0.06, 0.70),
             ("zone-right-nightstand", "Right Nightstand", 0.72, 0.25, 0.70),
@@ -240,40 +277,25 @@ def seed_everyday_social_data(db: Any) -> None:
                 "created_by": "usr-conor",
             })
 
-    if not db.list_objects():
-        db.upsert_object({
-            "id": "obj-water-bottle",
-            "label": "Water Bottle",
-            "category": "everyday",
-            "position": [-0.72, 0.06, 0.70],
-            "owner": "Conor",
-            "owner_id": "usr-conor",
-            "last_seen_by_id": "usr-conor",
-            "last_seen_by_name": "Conor",
-            "last_seen_at": now - 120,
-            "zone_name": "Beside Left Bed",
-            "world_id": "world_1",
-            "audience_type": "group",
-            "group_ids": ["grp-room"],
-            "timestamp": now - 120,
-            "confidence": 0.96,
-            "seen_by": "Conor",
-        })
-        db.append_object_event({
-            "event_id": "evt-water-bottle-init",
-            "object_id": "obj-water-bottle",
-            "label": "Water Bottle",
-            "world_id": "world_1",
-            "event_type": "placed",
-            "actor_user_id": "usr-conor",
-            "actor_name": "Conor",
-            "from_zone": "",
-            "from_pos": None,
-            "to_zone": "Beside Left Bed",
-            "to_pos": [-0.72, 0.06, 0.70],
-            "summary": "Conor left Water Bottle at Beside Left Bed",
-            "timestamp": now - 120,
-        })
+        if not db.list_objects():
+            db.upsert_object({
+                "id": "obj-water-bottle",
+                "label": "Water Bottle",
+                "category": "everyday",
+                "position": [-0.72, 0.06, 0.70],
+                "owner": "Conor",
+                "owner_id": "usr-conor",
+                "last_seen_by_id": "usr-conor",
+                "last_seen_by_name": "Conor",
+                "last_seen_at": now - 120,
+                "zone_name": "Beside Left Bed",
+                "world_id": "world_1",
+                "audience_type": "group",
+                "group_ids": ["grp-room"],
+                "timestamp": now - 120,
+                "confidence": 0.96,
+                "seen_by": "Conor",
+            })
 
     # Seed clean everyday friend notes if none exist
     if not db.list_pins():

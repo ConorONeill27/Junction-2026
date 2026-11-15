@@ -39,7 +39,12 @@ from social_store import (
     resolve_zone,
     seed_everyday_social_data,
 )
-from video_localizer import DEFAULT_VIDEO_PATH, localize_video_on_world
+from auto_indexer import (
+    auto_index_from_photos,
+    auto_index_from_video,
+    persist_indexed_world,
+)
+from video_localizer import DEFAULT_ROOM_PHOTOS_DIR, DEFAULT_VIDEO_PATH, localize_video_on_world
 
 load_dotenv()
 
@@ -65,7 +70,7 @@ class SpatialObject(BaseModel):
     zone_name: str = ""
     owner_id: str = "usr-conor"
     audience_type: str = "group"
-    group_ids: List[str] = ["grp-family"]
+    group_ids: List[str] = ["grp-room"]
 
 
 class SpatialPin(BaseModel):
@@ -185,20 +190,10 @@ class WorldState:
                 last_seen=now,
             ),
             WearerState(
-                wearer_id="wearer-c",
-                name="Mum",
-                user_id="usr-mum",
-                avatar_color="#34d399",
-                position=[-0.35, 1.4, -0.4],
-                yaw=120.0,
-                world_id="world_1",
-                last_seen=now,
-            ),
-            WearerState(
                 wearer_id="wearer-a",
-                name="Alex",
-                user_id="usr-alex",
-                avatar_color="#a78bfa",
+                name="Alec",
+                user_id="usr-alec",
+                avatar_color="#34d399",
                 position=[0.1, 1.4, -1.3],
                 yaw=45.0,
                 world_id="world_1",
@@ -761,8 +756,18 @@ async def _background_ingest_dat_scan(saved_vid: Path, imu_session_id: str) -> N
                 "display_name": containing.get("label") or saved_vid.stem,
                 "owner_id": "usr-conor",
                 "audience_type": "group",
-                "group_ids": ["grp-family"],
+                "group_ids": ["grp-room"],
             })
+            _iz, _io = await asyncio.to_thread(
+                auto_index_from_video,
+                list(world.points),
+                list(reconstructor.keyframes),
+                saved_vid,
+                1,
+                True,
+            )
+            if _iz or _io:
+                _apply_auto_index_result(wid, _iz, _io, actor_user_id="usr-conor")
             world.scan_jobs[job_id]["status"] = "ready"
             world.scan_jobs[job_id]["world_id"] = wid
             await broadcast_state()
@@ -873,9 +878,20 @@ async def add_video_to_worlds(
         cid = clip_meta["clip_id"]
         containing = next((w for w in idx.get("worlds", []) if cid in w.get("clips", [])), None)
         if containing:
+            wid = containing["world_id"]
             _load_world_json(Path(containing["json_path"]))
-            idx["active_world_id"] = containing["world_id"]
+            idx["active_world_id"] = wid
             mgr.save_index(idx)
+            _iz, _io = await asyncio.to_thread(
+                auto_index_from_video,
+                list(world.points),
+                list(reconstructor.keyframes),
+                tmp_vid,
+                1,
+                True,
+            )
+            if _iz or _io:
+                _apply_auto_index_result(wid, _iz, _io, actor_user_id="usr-conor")
             await broadcast_state()
         return {
             "ok": True,
@@ -1237,6 +1253,77 @@ class ShareSpaceReq(BaseModel):
     group_ids: List[str] = []
 
 
+class AutoIndexSpaceReq(BaseModel):
+    viewer_id: str = "usr-conor"
+
+
+def _apply_auto_index_result(
+    world_id: str,
+    zones: List[Dict[str, Any]],
+    objs: List[Dict[str, Any]],
+    actor_user_id: str = "usr-conor",
+) -> Dict[str, Any]:
+    """Persist auto-discovered Zones & Objects to DB and sync world.objects in memory."""
+    summary = persist_indexed_world(
+        world_id,
+        db,
+        zones,
+        objs,
+        actor_user_id=actor_user_id,
+        clear_auto=True,
+    )
+    stale_prefix = f"auto-obj-{world_id}-"
+    for oid in [k for k in list(world.objects.keys()) if k.startswith(stale_prefix)]:
+        world.objects.pop(oid, None)
+    for rec in summary.get("objects", []):
+        world.objects[rec["id"]] = SpatialObject(**rec)
+    return summary
+
+
+@app.post("/api/spaces/{world_id}/auto-index")
+async def auto_index_space_endpoint(world_id: str, req: AutoIndexSpaceReq = AutoIndexSpaceReq()) -> Dict[str, Any]:
+    """Automatically detect Zones and Tracked Objects from keyframes + 3D splat point cloud."""
+    payload = world.get_world_payload(world_id)
+    pts = payload.get("points") if payload else world.points
+    kfs = payload.get("keyframes") if payload else reconstructor.keyframes
+    if not pts or not kfs:
+        return {"ok": False, "error": f"No 3D points or keyframes available for {world_id}"}
+
+    zones: List[Dict[str, Any]] = []
+    objs: List[Dict[str, Any]] = []
+    if world_id == "world_1" and DEFAULT_ROOM_PHOTOS_DIR.exists():
+        zones, objs = await asyncio.to_thread(
+            auto_index_from_photos,
+            pts,
+            kfs,
+            DEFAULT_ROOM_PHOTOS_DIR,
+            1,
+            True,
+        )
+        if zones or objs:
+            cache_path = _STATIC_DIR / "world_1_auto_index.json"
+            cache_path.write_text(
+                json.dumps({"world_id": "world_1", "zones": zones, "objects": objs}, indent=2),
+                encoding="utf-8",
+            )
+    else:
+        scans_dir = _STATIC_DIR / "dat_scans"
+        vids = sorted(scans_dir.glob("*.mp4")) if scans_dir.exists() else []
+        if vids:
+            zones, objs = await asyncio.to_thread(
+                auto_index_from_video,
+                pts,
+                kfs,
+                vids[-1],
+                1,
+                True,
+            )
+
+    summary = _apply_auto_index_result(world_id, zones, objs, actor_user_id=req.viewer_id or "usr-conor")
+    await broadcast_state()
+    return {"ok": True, **summary}
+
+
 @app.post("/api/spaces/share")
 async def share_space_endpoint(req: ShareSpaceReq) -> Dict[str, Any]:
     existing = next((s for s in db.list_spaces_meta() if s["world_id"] == req.world_id), None)
@@ -1290,7 +1377,7 @@ class ObjectSightingReq(BaseModel):
     zone_hint: Optional[str] = None
     confidence: float = 0.9
     audience_type: str = "group"
-    group_ids: List[str] = ["grp-family"]
+    group_ids: List[str] = ["grp-room"]
 
 
 @app.post("/api/objects/sighting")

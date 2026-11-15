@@ -103,6 +103,7 @@ export default function App() {
   const [spatialPins, setSpatialPins] = useState([]);
   const [videoTrail, setVideoTrail] = useState([]);
   const [locatingVideo, setLocatingVideo] = useState(false);
+  const [reindexing, setReindexing] = useState(false);
   const [glassesLive, setGlassesLive] = useState(null);
   const [latestImuSession, setLatestImuSession] = useState(null);
   const [drawerOpen, setDrawerOpen] = useState(true);
@@ -1086,6 +1087,21 @@ export default function App() {
     }
   };
 
+  const handleAutoIndex = async () => {
+    setReindexing(true);
+    setStatusText("Auto-discovering 3D zones & tracked objects from keyframes...");
+    try {
+      const data = await mp.autoIndexSpace();
+      setStatusText(
+        `Auto-indexed ${data.zones_count ?? 0} zones & ${data.objects_count ?? 0} tracked objects`
+      );
+    } catch (e) {
+      setStatusText(e?.message || "Auto-indexing failed");
+    } finally {
+      setReindexing(false);
+    }
+  };
+
   // ============================================================================
   // PHONE UI (?mode=scan) — Simplified 360° Surround Scanner
   // ============================================================================
@@ -1421,6 +1437,8 @@ export default function App() {
         onFocusBottle={handleFocusBottle}
         onLocateCapturedVideo={locateCapturedVideo}
         locatingVideo={locatingVideo}
+        onAutoIndex={handleAutoIndex}
+        reindexing={reindexing}
         onUploadWalkthrough={uploadWalkthroughVideo}
         scanJobs={mp.bootstrap.scan_jobs}
         statusText={statusText}
@@ -1446,8 +1464,6 @@ export default function App() {
           setNoteInitObjectId(obj.id || "");
           setNoteModalOpen(true);
         }}
-        onCreateZone={mp.createZone}
-        onReportSighting={mp.reportSighting}
         onAddFriend={mp.addFriend}
         onCreateGroup={mp.createGroup}
         onJoinGroup={mp.joinGroup}

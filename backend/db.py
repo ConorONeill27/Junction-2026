@@ -88,7 +88,7 @@ class SpatialDatabase:
                 zone_name TEXT DEFAULT '',
                 owner_id TEXT DEFAULT 'usr-conor',
                 audience_type TEXT DEFAULT 'group',
-                group_ids_json TEXT DEFAULT '["grp-family"]'
+                group_ids_json TEXT DEFAULT '["grp-room"]'
             )
             """
         )
@@ -219,7 +219,7 @@ class SpatialDatabase:
             "ALTER TABLE spatial_objects ADD COLUMN zone_name TEXT DEFAULT ''",
             "ALTER TABLE spatial_objects ADD COLUMN owner_id TEXT DEFAULT 'usr-conor'",
             "ALTER TABLE spatial_objects ADD COLUMN audience_type TEXT DEFAULT 'group'",
-            "ALTER TABLE spatial_objects ADD COLUMN group_ids_json TEXT DEFAULT '[\"grp-family\"]'",
+            "ALTER TABLE spatial_objects ADD COLUMN group_ids_json TEXT DEFAULT '[\"grp-room\"]'",
             "ALTER TABLE spatial_pins ADD COLUMN world_id TEXT",
             "ALTER TABLE spatial_pins ADD COLUMN author_id TEXT",
             "ALTER TABLE spatial_pins ADD COLUMN audience_type TEXT DEFAULT 'public'",
@@ -276,7 +276,7 @@ class SpatialDatabase:
                 obj.get("zone_name") or "",
                 obj.get("owner_id") or "usr-conor",
                 obj.get("audience_type") or "group",
-                json.dumps(obj.get("group_ids") if obj.get("group_ids") is not None else ["grp-family"]),
+                json.dumps(obj.get("group_ids") if obj.get("group_ids") is not None else ["grp-room"]),
             ),
         )
 
@@ -297,7 +297,7 @@ class SpatialDatabase:
                 "zone_name": r.get("zone_name") or "",
                 "owner_id": r.get("owner_id") or "usr-conor",
                 "audience_type": r.get("audience_type") or "group",
-                "group_ids": json.loads(r.get("group_ids_json") or '["grp-family"]'),
+                "group_ids": json.loads(r.get("group_ids_json") or '["grp-room"]'),
             })
         return out
 
@@ -551,6 +551,18 @@ class SpatialDatabase:
             return self._fetchall("SELECT * FROM spatial_zones WHERE world_id = ? ORDER BY name ASC", (world_id,))
         return self._fetchall("SELECT * FROM spatial_zones ORDER BY name ASC")
 
+    def delete_zone(self, zone_id: str) -> None:
+        self._exec("DELETE FROM spatial_zones WHERE zone_id = ?", (zone_id,))
+
+    def delete_object(self, object_id: str) -> None:
+        self._exec("DELETE FROM spatial_objects WHERE id = ?", (object_id,))
+
+    def delete_object_events_by_prefix(self, world_id: str, prefix: str) -> None:
+        self._exec(
+            "DELETE FROM object_events WHERE world_id = ? AND event_id LIKE ?",
+            (world_id, f"{prefix}%"),
+        )
+
     def append_object_event(self, event: Dict[str, Any]) -> None:
         self._exec(
             """
@@ -559,6 +571,11 @@ class SpatialDatabase:
                 from_zone, from_pos_json, to_zone, to_pos_json, summary, ts
             )
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT (event_id) DO UPDATE SET
+                to_zone = excluded.to_zone,
+                to_pos_json = excluded.to_pos_json,
+                summary = excluded.summary,
+                ts = excluded.ts
             """,
             (
                 event["event_id"],

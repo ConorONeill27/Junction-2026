@@ -46,18 +46,12 @@ export default function SideDrawer({
   onFocusPosition,
   onOpenNoteModal,
   onPinToObject,
-  onCreateZone,
-  onReportSighting,
   onAddFriend,
   onCreateGroup,
   onJoinGroup,
   onShareSpace,
 }) {
   const [tab, setTab] = useState("things");
-  const [zoneName, setZoneName] = useState("");
-  const [sightingLabel, setSightingLabel] = useState("");
-  const [sightingActor, setSightingActor] = useState("usr-alec");
-  const [sightingZone, setSightingZone] = useState("");
   const [friendCode, setFriendCode] = useState("");
   const [groupName, setGroupName] = useState("");
   const [groupKind, setGroupKind] = useState("household");
@@ -138,14 +132,15 @@ export default function SideDrawer({
           <>
             <div className="wg-card">
               <div className="wg-card-row">
-                <span className="wg-section-label">Named Zones ({zones.length})</span>
+                <span className="wg-section-label">Discovered Zones ({zones.length})</span>
+                <span style={{ fontSize: 11, color: "var(--text-secondary)" }}>Auto-detected</span>
               </div>
               <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
                 {zones.map((z) => {
                   const zid = z.zone_id || z.id || z.name;
                   const zpos = Array.isArray(z.position)
                     ? z.position
-                    : [z.x ?? 0, z.y ?? 0.8, z.z ?? 0];
+                    : [z.x ?? 0, z.y ?? 0.6, z.z ?? 0];
                   return (
                     <button
                       key={zid}
@@ -160,105 +155,6 @@ export default function SideDrawer({
                   );
                 })}
               </div>
-              <form
-                style={{ display: "flex", gap: 6, marginTop: 4 }}
-                onSubmit={(e) => {
-                  e.preventDefault();
-                  if (!zoneName.trim()) return;
-                  runAction(
-                    () => onCreateZone({ name: zoneName.trim(), position: [0.6, 0.7, -0.4] }),
-                    `Zone "${zoneName.trim()}" saved`
-                  );
-                  setZoneName("");
-                }}
-              >
-                <input
-                  type="text"
-                  className="wg-input"
-                  style={{ minHeight: 38 }}
-                  placeholder="Add zone (e.g. Bedside Table, Desk)"
-                  value={zoneName}
-                  onChange={(e) => setZoneName(e.target.value)}
-                />
-                <button type="submit" className="wg-btn wg-btn-primary" style={{ minHeight: 38 }}>
-                  Add
-                </button>
-              </form>
-            </div>
-
-            <div className="wg-card">
-              <span className="wg-section-label">Log Item Sighting / Move</span>
-              <form
-                style={{ display: "flex", flexDirection: "column", gap: 6 }}
-                onSubmit={(e) => {
-                  e.preventDefault();
-                  if (!sightingLabel.trim()) return;
-                  const targetZone = zones.find(
-                    (z) => z.name.toLowerCase() === sightingZone.toLowerCase()
-                  );
-                  const pos = Array.isArray(targetZone?.position)
-                    ? targetZone.position
-                    : targetZone
-                    ? [targetZone.x ?? 0, targetZone.y ?? 0.8, targetZone.z ?? 0]
-                    : [0.5, 0.8, -0.5];
-                  runAction(
-                    () =>
-                      onReportSighting({
-                        label: sightingLabel.trim(),
-                        position: pos,
-                        actor_user_id: sightingActor,
-                        zone_hint: sightingZone,
-                      }),
-                    `Logged ${sightingLabel.trim()}`
-                  );
-                  setSightingLabel("");
-                }}
-              >
-                <input
-                  type="text"
-                  className="wg-input"
-                  style={{ minHeight: 38 }}
-                  placeholder="Item (e.g. Phone Charger)"
-                  value={sightingLabel}
-                  onChange={(e) => setSightingLabel(e.target.value)}
-                />
-                <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 6 }}>
-                  <select
-                    className="wg-select"
-                    style={{ minHeight: 38 }}
-                    value={sightingActor}
-                    onChange={(e) => setSightingActor(e.target.value)}
-                  >
-                    {users.map((u) => {
-                      const uid = u.user_id || u.id;
-                      return (
-                        <option key={uid} value={uid}>
-                          {u.name}
-                        </option>
-                      );
-                    })}
-                  </select>
-                  <select
-                    className="wg-select"
-                    style={{ minHeight: 38 }}
-                    value={sightingZone}
-                    onChange={(e) => setSightingZone(e.target.value)}
-                  >
-                    <option value="">Zone (optional)</option>
-                    {zones.map((z) => {
-                      const zid = z.zone_id || z.id || z.name;
-                      return (
-                        <option key={zid} value={z.name}>
-                          {z.name}
-                        </option>
-                      );
-                    })}
-                  </select>
-                </div>
-                <button type="submit" className="wg-btn wg-btn-emerald" style={{ minHeight: 38 }}>
-                  Record Sighting
-                </button>
-              </form>
             </div>
 
             <span className="wg-section-label" style={{ paddingLeft: 2 }}>
@@ -292,8 +188,8 @@ export default function SideDrawer({
                   </div>
                 </div>
                 <div style={{ fontSize: 12, color: "var(--text-secondary)" }}>
-                  Last seen by {obj.last_seen_by_name || obj.owner || "Wearer"} &bull;{" "}
-                  {formatAge(obj.last_seen_at)}
+                  Last seen by {obj.last_seen_by_name || obj.seen_by || obj.owner || "Conor"} &bull;{" "}
+                  {formatAge(obj.last_seen_at || obj.timestamp)}
                 </div>
               </div>
             ))}

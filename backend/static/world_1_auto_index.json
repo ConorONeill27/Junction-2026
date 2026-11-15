@@ -1,0 +1,202 @@
+{
+  "world_id": "world_1",
+  "zones": [
+    {
+      "base_label": "Lounge Chair",
+      "label": "Lounge Chair",
+      "position": [
+        0.901,
+        0.343,
+        1.25
+      ],
+      "confidence": 0.852,
+      "hits": 8,
+      "best_kf_idx": 41,
+      "raw_label": "armchair"
+    },
+    {
+      "base_label": "Bed",
+      "label": "Window Bed",
+      "position": [
+        -0.387,
+        0.245,
+        -0.172
+      ],
+      "confidence": 0.842,
+      "hits": 5,
+      "best_kf_idx": 57,
+      "raw_label": "bed"
+    },
+    {
+      "base_label": "Desk Chair",
+      "label": "Desk Chair",
+      "position": [
+        -0.444,
+        0.399,
+        1.25
+      ],
+      "confidence": 0.815,
+      "hits": 7,
+      "best_kf_idx": 68,
+      "raw_label": "chair"
+    },
+    {
+      "base_label": "Tea Counter",
+      "label": "Tea Counter",
+      "position": [
+        1.532,
+        0.49,
+        -1.263
+      ],
+      "confidence": 0.64,
+      "hits": 4,
+      "best_kf_idx": 10,
+      "raw_label": "counter"
+    },
+    {
+      "base_label": "Bed",
+      "label": "Inner Bed",
+      "position": [
+        0.023,
+        0.511,
+        -1.015
+      ],
+      "confidence": 0.815,
+      "hits": 3,
+      "best_kf_idx": 24,
+      "raw_label": "bed"
+    },
+    {
+      "base_label": "Nightstand",
+      "label": "Nightstand",
+      "position": [
+        -0.78,
+        0.415,
+        -1.173
+      ],
+      "confidence": 0.74,
+      "hits": 3,
+      "best_kf_idx": 22,
+      "raw_label": "nightstand"
+    },
+    {
+      "base_label": "Entrance Door",
+      "label": "Entrance Door",
+      "position": [
+        0.994,
+        0.652,
+        -3.017
+      ],
+      "confidence": 0.672,
+      "hits": 3,
+      "best_kf_idx": 0,
+      "raw_label": "door"
+    }
+  ],
+  "objects": [
+    {
+      "base_label": "Lamp",
+      "label": "Desk Lamp",
+      "position": [
+        -0.903,
+        0.635,
+        1.199
+      ],
+      "confidence": 0.928,
+      "hits": 8,
+      "best_kf_idx": 78,
+      "raw_label": "lamp"
+    },
+    {
+      "base_label": "Mug",
+      "label": "Tea Counter Mug",
+      "position": [
+        1.451,
+        0.532,
+        -1.269
+      ],
+      "confidence": 0.948,
+      "hits": 5,
+      "best_kf_idx": 8,
+      "raw_label": "mug"
+    },
+    {
+      "base_label": "Pillow",
+      "label": "Window Pillow",
+      "position": [
+        -0.674,
+        0.624,
+        -0.071
+      ],
+      "confidence": 0.745,
+      "hits": 5,
+      "best_kf_idx": 25,
+      "raw_label": "pillow"
+    },
+    {
+      "base_label": "Mug",
+      "label": "Desk Mug",
+      "position": [
+        -0.391,
+        0.083,
+        1.118
+      ],
+      "confidence": 0.914,
+      "hits": 4,
+      "best_kf_idx": 68,
+      "raw_label": "cup"
+    },
+    {
+      "base_label": "Pillow",
+      "label": "Nightstand Pillow",
+      "position": [
+        -0.717,
+        0.656,
+        -0.817
+      ],
+      "confidence": 0.735,
+      "hits": 4,
+      "best_kf_idx": 22,
+      "raw_label": "pillow"
+    },
+    {
+      "base_label": "Lamp",
+      "label": "Nightstand Lamp",
+      "position": [
+        -0.876,
+        0.994,
+        -0.767
+      ],
+      "confidence": 0.95,
+      "hits": 3,
+      "best_kf_idx": 61,
+      "raw_label": "lamp"
+    },
+    {
+      "base_label": "Lamp",
+      "label": "Lamp 1",
+      "position": [
+        -0.525,
+        0.731,
+        -1.327
+      ],
+      "confidence": 0.845,
+      "hits": 3,
+      "best_kf_idx": 60,
+      "raw_label": "lamp"
+    },
+    {
+      "base_label": "Bottle",
+      "label": "Bottle",
+      "position": [
+        1.527,
+        0.707,
+        -1.115
+      ],
+      "confidence": 0.689,
+      "hits": 3,
+      "best_kf_idx": 8,
+      "raw_label": "bottle"
+    }
+  ]
+}

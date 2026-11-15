@@ -203,6 +203,14 @@ export function useMultiplayerSpace(initialViewerId = "usr-conor", initialWorldI
     return data;
   }, []);
 
+  const autoIndexSpace = useCallback(async () => {
+    const data = await jsonPost(`/api/spaces/${encodeURIComponent(worldId)}/auto-index`, {
+      viewer_id: viewerId,
+    });
+    await refreshAll(viewerId, worldId);
+    return data;
+  }, [refreshAll, viewerId, worldId]);
+
   return {
     viewerId,
     setViewerId,
@@ -224,6 +232,7 @@ export function useMultiplayerSpace(initialViewerId = "usr-conor", initialWorldI
     createPin,
     createZone,
     reportSighting,
+    autoIndexSpace,
     addFriend,
     createGroup,
     joinGroup,
