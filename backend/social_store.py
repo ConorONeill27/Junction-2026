@@ -234,6 +234,41 @@ def seed_everyday_social_data(db: Any) -> None:
             "created_by": "usr-conor",
         })
 
+    if not db.list_objects():
+        db.upsert_object({
+            "id": "obj-water-bottle",
+            "label": "Water Bottle",
+            "category": "everyday",
+            "position": [-0.72, 0.06, 0.70],
+            "owner": "Conor",
+            "owner_id": "usr-conor",
+            "last_seen_by_id": "usr-conor",
+            "last_seen_by_name": "Conor",
+            "last_seen_at": now - 120,
+            "zone_name": "Beside Left Bed",
+            "world_id": "world_1",
+            "audience_type": "group",
+            "group_ids": ["grp-room"],
+            "timestamp": now - 120,
+            "confidence": 0.96,
+            "seen_by": "Conor",
+        })
+        db.append_object_event({
+            "event_id": "evt-water-bottle-init",
+            "object_id": "obj-water-bottle",
+            "label": "Water Bottle",
+            "world_id": "world_1",
+            "event_type": "placed",
+            "actor_user_id": "usr-conor",
+            "actor_name": "Conor",
+            "from_zone": "",
+            "from_pos": None,
+            "to_zone": "Beside Left Bed",
+            "to_pos": [-0.72, 0.06, 0.70],
+            "summary": "Conor left Water Bottle at Beside Left Bed",
+            "timestamp": now - 120,
+        })
+
     # Seed clean everyday friend notes if none exist
     if not db.list_pins():
         db.upsert_pin({

@@ -1479,7 +1479,7 @@ export default function App() {
       />
 
       {/* Minimal Bottom Status Pill */}
-      <div className="wg-bottom-pill wg-glass">
+      <div className="wg-bottom-pill wg-glass" style={{ left: studioOpen ? 382 : 16 }}>
         <span>{pointCount.toLocaleString()} splats</span>
         <span>&bull;</span>
         <span>{spatialObjects.length} tracked items</span>

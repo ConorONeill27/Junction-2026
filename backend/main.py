@@ -1070,9 +1070,14 @@ def _match_objects_for_query(q_raw: str, candidates: List[SpatialObject]) -> Lis
     q = q_raw.lower().strip()
     if any(p in q for p in ("left anything", "left behind", "anything behind", "forgot")):
         return sorted(candidates, key=lambda o: o.timestamp, reverse=True)
-    matches = [o for o in candidates if q in o.label.lower()]
+    matches = [o for o in candidates if q in o.label.lower() or q.rstrip("s") in o.label.lower()]
     if not matches:
-        tokens = [t for t in q.replace("?", "").replace("'", "").split() if len(t) > 2]
+        stop = {"where", "the", "find", "have", "seen", "left", "with", "for", "was", "are", "you"}
+        tokens = [
+            t.rstrip("s") if len(t) > 3 else t
+            for t in q.replace("?", "").replace("'", "").split()
+            if len(t) > 2 and t not in stop
+        ]
         matches = [o for o in candidates if any(t in o.label.lower() for t in tokens)]
     return matches
 
