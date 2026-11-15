@@ -42,7 +42,6 @@ object WorldGitHudRenderer {
       typeface = Typeface.create(Typeface.SANS_SERIF, Typeface.NORMAL)
     }
     val saved = speech.notesByObjectId[label.item.id]
-      ?: speech.notesByLabel[label.item.label.lowercase()]
       ?: label.item.note
     val text = when {
       speech.active && speech.purpose == SpeechPurpose.PIN_NOTE && speech.noteId == label.item.id ->
@@ -261,8 +260,30 @@ object WorldGitHudRenderer {
   }
 
   private fun drawAskCompassHud(canvas: Canvas, compass: CompassState) {
-    val accent = if (compass.aligned) Color.rgb(52, 211, 153) else Color.rgb(56, 189, 248)
-    drawCompassDial(canvas, compass, cx = 175f, cy = 285f, outerR = 128f)
+    val accent = when {
+      !compass.hasNavigation -> Color.rgb(148, 163, 184)
+      compass.aligned -> Color.rgb(52, 211, 153)
+      else -> Color.rgb(56, 189, 248)
+    }
+    if (compass.hasNavigation) {
+      drawCompassDial(canvas, compass, cx = 175f, cy = 285f, outerR = 128f)
+    } else {
+      val boxPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.STROKE
+        strokeWidth = 2.5f
+        color = Color.argb(90, 148, 163, 184)
+      }
+      canvas.drawCircle(175f, 285f, 112f, boxPaint)
+      val lblPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = Color.rgb(148, 163, 184)
+        textSize = 18f
+        typeface = Typeface.create(Typeface.SANS_SERIF, Typeface.BOLD)
+      }
+      drawCenteredText(canvas, "${compass.cardinal} ${compass.headingDeg.roundToInt()}°", 175f, 276f, lblPaint)
+      lblPaint.textSize = 14f
+      lblPaint.typeface = Typeface.SANS_SERIF
+      drawCenteredText(canvas, "No 3D arrow", 175f, 304f, lblPaint)
+    }
     val paint = Paint(Paint.ANTI_ALIAS_FLAG)
 
     // Right column details card
@@ -278,17 +299,17 @@ object WorldGitHudRenderer {
     paint.color = accent
     paint.textSize = 22f
     paint.typeface = Typeface.create(Typeface.SANS_SERIF, Typeface.BOLD)
-    canvas.drawText(compass.targetLabel.uppercase().take(18), 338f, 184f, paint)
+    canvas.drawText((compass.targetLabel.ifBlank { "MEMORY ASK" }).uppercase().take(18), 338f, 184f, paint)
 
     paint.color = Color.WHITE
     paint.textSize = 18f
-    canvas.drawText(compass.turnInstruction, 338f, 214f, paint)
+    canvas.drawText(compass.turnInstruction.take(26), 338f, 214f, paint)
 
     val textPaint = TextPaint(Paint.ANTI_ALIAS_FLAG).apply {
       color = Color.rgb(226, 232, 240)
       textSize = 19f
     }
-    val answer = compass.answerText.ifBlank { "Tap Ask to find an object with Gemini." }
+    val answer = compass.answerText.ifBlank { "Tap Ask to search memory or room." }
     val layout = StaticLayout.Builder.obtain(answer, 0, answer.length, textPaint, 228)
       .setMaxLines(6)
       .setEllipsize(TextUtils.TruncateAt.END)
@@ -299,9 +320,12 @@ object WorldGitHudRenderer {
     canvas.restoreToCount(ts)
 
     paint.color = Color.rgb(148, 163, 184)
-    paint.textSize = 15f
+    paint.textSize = 14f
     paint.typeface = Typeface.SANS_SERIF
-    canvas.drawText("Gemini 3.8 Flash • Single-tap Ask", 338f, 412f, paint)
+    val footer = compass.ambiguityNote?.take(34)
+      ?: compass.memoryContext?.take(34)
+      ?: "Memory + Studio Ask"
+    canvas.drawText(footer, 338f, 412f, paint)
 
     // Hint strip above rail
     paint.color = Color.argb(175, 203, 213, 225)
@@ -346,22 +370,24 @@ object WorldGitHudRenderer {
     drawCenteredText(canvas, "B", cx, cy + outerR * 0.83f, paint)
     drawCenteredText(canvas, "L", cx - outerR * 0.79f, cy + 5f, paint)
 
-    val saved = canvas.save()
-    canvas.rotate(compass.arrowAngleDeg, cx, cy)
-    val chevron = Path().apply {
-      moveTo(cx, cy - outerR + 14f)
-      lineTo(cx + 18f, cy - outerR * 0.48f)
-      lineTo(cx, cy - outerR * 0.56f)
-      lineTo(cx - 18f, cy - outerR * 0.48f)
-      close()
+    if (compass.hasNavigation) {
+      val saved = canvas.save()
+      canvas.rotate(compass.arrowAngleDeg, cx, cy)
+      val chevron = Path().apply {
+        moveTo(cx, cy - outerR + 14f)
+        lineTo(cx + 18f, cy - outerR * 0.48f)
+        lineTo(cx, cy - outerR * 0.56f)
+        lineTo(cx - 18f, cy - outerR * 0.48f)
+        close()
+      }
+      paint.color = accent
+      canvas.drawPath(chevron, paint)
+      paint.style = Paint.Style.STROKE
+      paint.strokeWidth = 5f
+      paint.strokeCap = Paint.Cap.ROUND
+      canvas.drawLine(cx, cy - outerR * 0.56f, cx, cy - outerR * 0.37f, paint)
+      canvas.restoreToCount(saved)
     }
-    paint.color = accent
-    canvas.drawPath(chevron, paint)
-    paint.style = Paint.Style.STROKE
-    paint.strokeWidth = 5f
-    paint.strokeCap = Paint.Cap.ROUND
-    canvas.drawLine(cx, cy - outerR * 0.56f, cx, cy - outerR * 0.37f, paint)
-    canvas.restoreToCount(saved)
 
     val hubR = outerR * 0.36f
     paint.style = Paint.Style.FILL
@@ -369,16 +395,22 @@ object WorldGitHudRenderer {
     canvas.drawCircle(cx, cy, hubR, paint)
     paint.style = Paint.Style.STROKE
     paint.strokeWidth = 2.5f
-    paint.color = accent
+    paint.color = if (compass.hasNavigation) accent else Color.rgb(148, 163, 184)
     canvas.drawCircle(cx, cy, hubR, paint)
 
     paint.style = Paint.Style.FILL
     paint.color = Color.WHITE
-    paint.textSize = 28f
-    drawCenteredText(canvas, compass.arrowGlyph, cx, cy + 2f, paint)
-    paint.color = accent
-    paint.textSize = 18f
-    drawCenteredText(canvas, "${compass.arrowAngleDeg.roundToInt()}°", cx, cy + 26f, paint)
+    if (compass.hasNavigation) {
+      paint.textSize = 28f
+      drawCenteredText(canvas, compass.arrowGlyph, cx, cy + 2f, paint)
+      paint.color = accent
+      paint.textSize = 18f
+      drawCenteredText(canvas, "${compass.arrowAngleDeg.roundToInt()}°", cx, cy + 26f, paint)
+    } else {
+      paint.textSize = 14f
+      paint.color = Color.rgb(148, 163, 184)
+      drawCenteredText(canvas, "NO DIR", cx, cy + 5f, paint)
+    }
   }
 
   private fun drawPinsOverlayHud(
@@ -395,10 +427,10 @@ object WorldGitHudRenderer {
       val selected = label.item.id == cursor.selectedId
       val hasNote =
         speech.notesByObjectId.containsKey(label.item.id) ||
-          speech.notesByLabel.containsKey(label.item.label.lowercase()) ||
           !label.item.note.isNullOrBlank()
       val strokeColor = when {
         selected -> Color.rgb(100, 165, 255)
+        hasNote && label.item.noteUncertain -> Color.rgb(251, 191, 36)
         hasNote -> Color.rgb(72, 235, 160)
         else -> Color.rgb(0, 255, 0)
       }
@@ -412,6 +444,7 @@ object WorldGitHudRenderer {
       paint.style = Paint.Style.FILL
       paint.color = when {
         selected -> Color.rgb(30, 105, 245)
+        hasNote && label.item.noteUncertain -> Color.rgb(120, 80, 12)
         hasNote -> Color.rgb(18, 92, 64)
         else -> Color.argb(215, 0, 0, 0)
       }
@@ -431,7 +464,6 @@ object WorldGitHudRenderer {
     layouts
       .filter {
         val hasNote = speech.notesByObjectId.containsKey(it.item.id) ||
-          speech.notesByLabel.containsKey(it.item.label.lowercase()) ||
           !it.item.note.isNullOrBlank()
         hasNote && it.item.id != cursor.selectedId
       }
@@ -504,7 +536,11 @@ object WorldGitHudRenderer {
 
     paint.style = Paint.Style.STROKE
     paint.strokeWidth = 1.5f
-    paint.color = if (isSelected) Color.rgb(100, 165, 255) else Color.rgb(72, 235, 160)
+    paint.color = when {
+      isSelected -> Color.rgb(100, 165, 255)
+      label.item.noteUncertain -> Color.rgb(251, 191, 36)
+      else -> Color.rgb(72, 235, 160)
+    }
     canvas.drawRoundRect(bounds, 6f, 6f, paint)
 
     paint.style = Paint.Style.FILL
@@ -528,7 +564,7 @@ object WorldGitHudRenderer {
     paint.color = Color.rgb(56, 189, 248)
     paint.textSize = 22f
     paint.typeface = Typeface.create(Typeface.SANS_SERIF, Typeface.BOLD)
-    canvas.drawText("Spatial Timeline & Pins", 52f, 140f, paint)
+    canvas.drawText("Restore Instructions", 52f, 140f, paint)
 
     paint.typeface = Typeface.SANS_SERIF
     paint.textSize = 18f
@@ -544,7 +580,7 @@ object WorldGitHudRenderer {
     }
     paint.color = Color.argb(180, 148, 224, 255)
     paint.textSize = 16f
-    drawCenteredText(canvas, "Tap glasses / Undo button to revert last action", 300f, 466f, paint)
+    drawCenteredText(canvas, "Guide only — tap Undo to refresh restore instructions", 300f, 466f, paint)
   }
 
   private fun drawScanHud(canvas: Canvas, compass: CompassState, imu: ImuState) {
@@ -624,8 +660,8 @@ object WorldGitHudRenderer {
       textSize = 21f
     }
     val caption = when {
-      speech.finishing && speech.purpose == SpeechPurpose.ASK_GEMINI -> "Asking Gemini 3.8 Flash..."
-      speech.finishing -> "Transcribing with Gemini..."
+      speech.finishing && speech.purpose == SpeechPurpose.ASK_GEMINI -> "Checking memory & Studio..."
+      speech.finishing -> "Transcribing audio..."
       speech.text.isNotBlank() -> speech.text.takeLast(110)
       speech.purpose == SpeechPurpose.ASK_GEMINI -> "Ask about your space..."
       else -> "Speak note for ${speech.noteLabel ?: "object"}..."

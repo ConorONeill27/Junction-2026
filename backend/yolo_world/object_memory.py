@@ -63,10 +63,13 @@ def _human_age(seconds: float) -> str:
     if seconds < 10:
         return "just now"
     if seconds < 60:
-        return f"{int(seconds)}s ago"
+        sec = int(seconds)
+        return f"{sec} second{'s' if sec != 1 else ''} ago"
     if seconds < 3600:
-        return f"{int(seconds // 60)}m ago"
-    return f"{int(seconds // 3600)}h ago"
+        mins = int(seconds // 60)
+        return f"{mins} minute{'s' if mins != 1 else ''} ago"
+    hrs = int(seconds // 3600)
+    return f"{hrs} hour{'s' if hrs != 1 else ''} ago"
 
 
 def _spoken_label(label: str) -> str:
@@ -207,7 +210,7 @@ def _hist_corr(a, b) -> float:
 class ObjectMemoryStore:
     """Stores last-seen frame, crop, and surrounding context for everyday objects."""
 
-    def __init__(self, directory=DEFAULT_MEMORY_DIR, save_interval_s=3.0, studio_url=None, world_id="world_1", actor_user_id="usr_conor"):
+    def __init__(self, directory=DEFAULT_MEMORY_DIR, save_interval_s=3.0, studio_url=None, world_id="world_1", actor_user_id="usr_conor", api_token=""):
         self.directory = Path(directory)
         self.directory.mkdir(parents=True, exist_ok=True)
         self.index_path = self.directory / "memory.json"
@@ -215,6 +218,7 @@ class ObjectMemoryStore:
         self.studio_url = studio_url.rstrip("/") if studio_url else None
         self.world_id = world_id
         self.actor_user_id = actor_user_id
+        self.api_token = (api_token or "").strip()
         self.lock = threading.Lock()
         self.paused = False
         self._epoch = 0
@@ -271,6 +275,7 @@ class ObjectMemoryStore:
                 or not detections
             ):
                 return
+            obs_epoch = self._epoch
             now = time.time()
             h, w = frame.shape[:2]
             updated = False
@@ -358,6 +363,7 @@ class ObjectMemoryStore:
                 if self.studio_url:
                     cx = ((l + r) * 0.5 / max(1, w) - 0.5) * 2.0
                     cy = (0.5 - (t + b) * 0.5 / max(1, h)) * 1.2 + 0.8
+                    bridge_headers = {"X-WorldGit-Token": self.api_token} if self.api_token else None
                     post_json_async(
                         self.studio_url,
                         "/api/objects/sighting",
@@ -370,6 +376,8 @@ class ObjectMemoryStore:
                             "confidence": round(conf, 3),
                             "unlocalized_2d": True,
                         },
+                        headers=bridge_headers,
+                        cancel_check=lambda: self.paused or self._epoch != obs_epoch,
                     )
 
             if updated:
@@ -377,6 +385,7 @@ class ObjectMemoryStore:
 
     def list_memories(self):
         with self.lock:
+            obs_epoch = self._epoch
             now = time.time()
             out = []
             for item in self.items.values():
@@ -431,8 +440,14 @@ class ObjectMemoryStore:
             hits = self._lookup_all_locked(q)
             if not hits:
                 return None
+            obs_epoch = self._epoch
             now = time.time()
             rec = self._with_snapshot(hits[0], now, instance_count=len(hits))
+            rec["ambiguous"] = len(hits) > 1
+            rec["ambiguity"] = (
+                f"{len(hits)} {hits[0]['label']} observations in memory; showing latest."
+                if len(hits) > 1 else ""
+            )
             if len(hits) > 1:
                 rec["instances"] = [
                     {
@@ -445,7 +460,7 @@ class ObjectMemoryStore:
             return rec
 
     def ask(self, question: str):
-        """Answer natural-language memory queries such as 'Hey Meta, have I left anything behind?'."""
+        """Answer natural-language memory queries using only recorded observations."""
         raw = (question or "").strip()
         q = raw.lower()
         for wake in ("hey meta", "ok meta", "meta"):
@@ -453,12 +468,24 @@ class ObjectMemoryStore:
         q = " ".join(q.split())
 
         with self.lock:
+            obs_epoch = self._epoch
             now = time.time()
             match = None
-            for cand in PERSONAL_ITEM_LABELS + tuple(self.items.keys()):
-                if cand in q:
-                    match = self._lookup_locked(cand)
-                    if match is not None:
+            matched_hits = []
+            matched_explicitly = False
+            candidate_labels = list(dict.fromkeys([
+                *PERSONAL_ITEM_LABELS,
+                *(str(v.get("label") or "").lower() for v in self.items.values() if v.get("label")),
+                *self.items.keys(),
+            ]))
+            candidate_labels.sort(key=len, reverse=True)
+            for cand in candidate_labels:
+                if cand and cand in q:
+                    hits = self._lookup_all_locked(cand)
+                    if hits:
+                        match = hits[0]
+                        matched_hits = hits
+                        matched_explicitly = True
                         break
 
             left_behind_intent = any(w in q for w in ("left", "behind", "forget", "forgot", "anything", "miss"))
@@ -480,27 +507,39 @@ class ObjectMemoryStore:
                         )
                     )
                     match = personal[0]
+                    matched_hits = self._lookup_all_locked(match.get("label", "")) or [match]
 
             if match is None:
                 return {
                     "found": False,
                     "query": raw,
-                    "spoken_response": "Everything looks clear. I haven't spotted any personal items left behind.",
-                    "summary": "No left-behind items found in recent memory",
+                    "spoken_response": "I don't have a recent observation matching that.",
+                    "summary": "I don't have a recent observation matching that.",
                 }
 
-            rec = self._with_snapshot(match, now)
+            instance_count = max(1, len(matched_hits))
+            rec = self._with_snapshot(match, now, instance_count=instance_count)
             spoken_name = _spoken_label(rec["label"])
+            age = rec["age_label"]
             loc = rec.get("spatial_phrase") or rec.get("context") or "in the room"
-            if left_behind_intent:
-                spoken = f"You left your {spoken_name} {loc}."
+            if matched_explicitly:
+                spoken = f"Last seen {age} {loc}."
             else:
-                spoken = f"Your {spoken_name} is {loc}."
+                spoken = f"{spoken_name.capitalize()}, last seen {age} {loc}."
+            ambiguity = ""
+            if instance_count > 1:
+                ambiguity = f"{instance_count} {rec['label']} observations in memory; showing latest."
+                spoken = f"{spoken} ({ambiguity})"
             return {
                 "found": True,
                 "query": raw,
                 "spoken_response": spoken,
                 "summary": spoken,
                 "item": rec,
+                "age_label": age,
+                "context": loc,
+                "instance_count": instance_count,
+                "ambiguous": instance_count > 1,
+                "ambiguity": ambiguity,
                 "snapshot_b64": rec.get("snapshot_b64", ""),
             }

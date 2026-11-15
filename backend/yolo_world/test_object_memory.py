@@ -125,7 +125,7 @@ class ObjectMemoryTests(unittest.TestCase):
                 self.assertTrue(ans["found"])
                 self.assertEqual(
                     ans["spoken_response"],
-                    "You left your water bottle on the ground beside the left bed.",
+                    "Water bottle, last seen just now on the ground beside the left bed.",
                 )
                 self.assertTrue(len(ans.get("snapshot_b64", "")) > 100)
             finally:

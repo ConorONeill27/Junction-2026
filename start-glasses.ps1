@@ -27,7 +27,7 @@ if ($Rebuild -or -not (Test-Path (Join-Path $GlassesDir "dist\index.html"))) {
 if (-not (Test-PortListening 8000)) {
     Write-Host "[2/4] Starting FastAPI + VGGT + IMU backend (:8000)..." -ForegroundColor Yellow
     $py = Join-Path $BackendDir ".venv311\Scripts\uvicorn.exe"
-    Start-Process -FilePath $py -ArgumentList "main:app", "--host", "0.0.0.0", "--port", "8000" -WorkingDirectory $BackendDir -WindowStyle Minimized
+    Start-Process -FilePath $py -ArgumentList "main:app", "--host", "127.0.0.1", "--port", "8000" -WorkingDirectory $BackendDir -WindowStyle Minimized
     Start-Sleep -Seconds 2
 } else {
     Write-Host "[2/4] Backend (:8000) already running." -ForegroundColor Green

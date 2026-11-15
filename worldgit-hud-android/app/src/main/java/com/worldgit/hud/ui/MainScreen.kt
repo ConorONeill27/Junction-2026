@@ -251,6 +251,7 @@ fun MainScreen(viewModel: WorldGitViewModel) {
         },
         onUndo = viewModel::runCtrlZ,
         onToggleScan = viewModel::toggleImuRecording,
+        onRetryNoteSave = viewModel::retryPendingNoteSave,
         modifier = Modifier.weight(1f),
       )
     }
@@ -462,9 +463,13 @@ private fun AskCompassHeroCard(ui: AppUiState) {
           overflow = TextOverflow.Ellipsis,
         )
         Text(
-          text = c.turnInstruction.ifBlank { "Ask about an object" },
-          color = accent,
-          fontSize = 22.sp,
+          text = when {
+            c.hasNavigation -> c.turnInstruction.ifBlank { "Aligned" }
+            c.targetLabel.isNotBlank() -> c.localizationStatus.ifBlank { "No 3D direction" }
+            else -> "Ask about an object"
+          },
+          color = if (c.hasNavigation) accent else WorldGitPalette.Amber,
+          fontSize = 20.sp,
           fontWeight = FontWeight.Bold,
           maxLines = 2,
           overflow = TextOverflow.Ellipsis,
@@ -475,8 +480,9 @@ private fun AskCompassHeroCard(ui: AppUiState) {
             color = accent.copy(alpha = 0.14f),
           ) {
             Text(
-              text = "${c.headingDeg.toInt()}° ${c.cardinal} • ${c.sensorSource}",
-              color = accent,
+              text = if (c.hasNavigation) "${c.headingDeg.toInt()}° ${c.cardinal} • ${c.sensorSource}"
+              else c.localizationStatus.ifBlank { "${c.sensorSource} • unlocalized" },
+              color = if (c.hasNavigation) accent else WorldGitPalette.TextSecondary,
               fontSize = 11.sp,
               fontWeight = FontWeight.SemiBold,
               modifier = Modifier.padding(horizontal = 10.dp, vertical = 4.dp),
@@ -629,6 +635,7 @@ private fun ModeDetailPanel(
   onTapObjectChip: (YoloItem) -> Unit,
   onUndo: () -> Unit,
   onToggleScan: () -> Unit,
+  onRetryNoteSave: () -> Unit,
   modifier: Modifier = Modifier,
 ) {
   Surface(
@@ -649,6 +656,7 @@ private fun ModeDetailPanel(
         ui = ui,
         onPinsAction = onPinsAction,
         onTapObjectChip = onTapObjectChip,
+        onRetryNoteSave = onRetryNoteSave,
       )
       HudMode.UNDO -> UndoDetailContent(
         ui = ui,
@@ -684,21 +692,32 @@ private fun AskDetailContent(
       ) {
         Surface(
           shape = RoundedCornerShape(999.dp),
-          color = WorldGitPalette.Emerald.copy(alpha = 0.14f),
-          border = BorderStroke(1.dp, WorldGitPalette.Emerald.copy(alpha = 0.45f)),
+          color = if (ui.compass.targetLabel.isNotBlank()) WorldGitPalette.Emerald.copy(alpha = 0.14f) else WorldGitPalette.Surface,
+          border = BorderStroke(
+            1.dp,
+            if (ui.compass.targetLabel.isNotBlank()) WorldGitPalette.Emerald.copy(alpha = 0.45f) else WorldGitPalette.BorderBright,
+          ),
         ) {
           Text(
-            text = "TARGET: ${ui.compass.targetLabel.uppercase()}",
+            text = if (ui.compass.targetLabel.isNotBlank()) "TARGET: ${ui.compass.targetLabel.uppercase()}" else "MEMORY QUERY",
             modifier = Modifier.padding(horizontal = 10.dp, vertical = 4.dp),
             fontSize = 11.sp,
             fontWeight = FontWeight.Bold,
-            color = WorldGitPalette.Emerald,
+            color = if (ui.compass.targetLabel.isNotBlank()) WorldGitPalette.Emerald else WorldGitPalette.TextSecondary,
           )
         }
         Text(
-          text = "${ui.compass.cardinal} ${ui.compass.headingDeg.roundToInt()}° • ${ui.compass.turnInstruction}",
+          text = if (ui.compass.hasNavigation) {
+            "${ui.compass.cardinal} ${ui.compass.headingDeg.roundToInt()}° • ${ui.compass.turnInstruction}"
+          } else {
+            ui.compass.localizationStatus.ifBlank { "No directional guidance" }
+          },
           style = MaterialTheme.typography.labelSmall,
-          color = if (ui.compass.aligned) WorldGitPalette.Emerald else WorldGitPalette.Cyan,
+          color = when {
+            !ui.compass.hasNavigation -> WorldGitPalette.Amber
+            ui.compass.aligned -> WorldGitPalette.Emerald
+            else -> WorldGitPalette.Cyan
+          },
         )
       }
 
@@ -709,6 +728,26 @@ private fun AskDetailContent(
         maxLines = 4,
         overflow = TextOverflow.Ellipsis,
       )
+
+      if (!ui.compass.memoryContext.isNullOrBlank() || !ui.compass.ambiguityNote.isNullOrBlank()) {
+        val meta = listOfNotNull(ui.compass.memoryContext, ui.compass.ambiguityNote).joinToString(" • ")
+        Text(
+          text = meta,
+          fontSize = 11.sp,
+          color = WorldGitPalette.TextSecondary,
+          maxLines = 2,
+          overflow = TextOverflow.Ellipsis,
+        )
+      }
+      if (!ui.speech.providerDisclosure.isNullOrBlank()) {
+        Text(
+          text = ui.speech.providerDisclosure,
+          fontSize = 11.sp,
+          color = WorldGitPalette.Amber,
+          maxLines = 1,
+          overflow = TextOverflow.Ellipsis,
+        )
+      }
     }
 
     Row(
@@ -765,6 +804,7 @@ private fun PinsDetailContent(
   ui: AppUiState,
   onPinsAction: () -> Unit,
   onTapObjectChip: (YoloItem) -> Unit,
+  onRetryNoteSave: () -> Unit,
 ) {
   val hoveredItem = ui.cursor.selectedId?.let { id ->
     ui.projectedYoloState.items.firstOrNull { it.id == id }
@@ -843,6 +883,34 @@ private fun PinsDetailContent(
       }
     }
 
+    if (!ui.noteSaveStatus.isNullOrBlank() || ui.pendingRetryNote != null || !ui.notesSyncError.isNullOrBlank() || !ui.speech.providerDisclosure.isNullOrBlank()) {
+      Row(
+        modifier = Modifier.fillMaxWidth(),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.SpaceBetween,
+      ) {
+        val statusMsg = listOfNotNull(
+          ui.noteSaveStatus,
+          ui.notesSyncError,
+          ui.speech.providerDisclosure,
+        ).joinToString(" • ")
+        Text(
+          text = statusMsg,
+          fontSize = 11.sp,
+          color = if (ui.pendingRetryNote != null || ui.notesSyncError != null) WorldGitPalette.Amber else WorldGitPalette.Cyan,
+          maxLines = 2,
+          overflow = TextOverflow.Ellipsis,
+          modifier = Modifier.weight(1f),
+        )
+        if (ui.pendingRetryNote != null) {
+          Spacer(Modifier.width(8.dp))
+          TextButton(onClick = onRetryNoteSave) {
+            Text("Retry", color = WorldGitPalette.Amber, fontWeight = FontWeight.Bold, fontSize = 12.sp)
+          }
+        }
+      }
+    }
+
     AnimatedVisibility(
       visible = ui.projectedYoloState.items.isNotEmpty(),
       enter = fadeIn(),
@@ -857,7 +925,6 @@ private fun PinsDetailContent(
         ui.projectedYoloState.items.forEach { item ->
           val selected = item.id == ui.cursor.selectedId
           val note = ui.speech.notesByObjectId[item.id]
-            ?: ui.speech.notesByLabel[item.label.lowercase()]
             ?: item.note
           FilterChip(
             selected = selected,
@@ -867,6 +934,7 @@ private fun PinsDetailContent(
                 text = if (!note.isNullOrBlank()) "${item.label}: ${note.take(18)}" else item.label,
                 fontSize = 12.sp,
                 maxLines = 1,
+                color = if (item.noteUncertain) WorldGitPalette.Amber else Color.Unspecified,
               )
             },
             colors = FilterChipDefaults.filterChipColors(
@@ -943,7 +1011,7 @@ private fun UndoDetailContent(ui: AppUiState, onUndo: () -> Unit) {
     ) {
       Column {
         Text("WorldGit History (Ctrl+Z)", style = MaterialTheme.typography.titleMedium)
-        Text("Revert recent tracked changes in your room", fontSize = 12.sp, color = WorldGitPalette.TextSecondary)
+        Text("Restore instructions (guide only — does not move objects)", fontSize = 12.sp, color = WorldGitPalette.TextSecondary)
       }
       Button(
         onClick = onUndo,
@@ -952,7 +1020,7 @@ private fun UndoDetailContent(ui: AppUiState, onUndo: () -> Unit) {
       ) {
         Icon(Icons.AutoMirrored.Filled.Undo, contentDescription = null, modifier = Modifier.size(16.dp))
         Spacer(Modifier.width(6.dp))
-        Text("Undo Latest", fontWeight = FontWeight.Bold, fontSize = 13.sp)
+        Text("Restore Guide", fontWeight = FontWeight.Bold, fontSize = 13.sp)
       }
     }
 

@@ -3,9 +3,9 @@
 **Hands-free object memory, spoken spatial notes, and 3D room context for Meta Ray-Ban Display AI glasses.**
 
 > **Docs & Submission:**
-> - [`docs/META_SUBMISSION.md`](docs/META_SUBMISSION.md) — Meta challenge submission, privacy/accessibility controls, and honest scope
-> - [`EXPLAINER.md`](EXPLAINER.md) — Full system architecture, API contracts, and demo script
-> - [`worldgit-hud-android/`](worldgit-hud-android/) — **Native Android + Meta DAT SDK glasses app** (live glasses camera, 60 Hz IMU fusion, Bloks HUD, voice transcription, and TTS)
+> - [`docs/META_SUBMISSION.md`](docs/META_SUBMISSION.md) — **Authoritative spec**: submission scope, provenance legend (live vs pre-reconstructed vs seeded vs approximate), privacy boundaries, and verified checks
+> - [`EXPLAINER.md`](EXPLAINER.md) — Legacy architecture & simulator guide (see `META_SUBMISSION.md` where claims differ)
+> - [`worldgit-hud-android/`](worldgit-hud-android/) — **Native Android + Meta DAT SDK glasses app** (live glasses camera, ~60 Hz local IMU fusion with throttled per-session uploads, Bloks HUD, voice transcription, `Restore Guide` instructions, and TTS)
 
 ## Architecture & Components
 

@@ -212,6 +212,15 @@ class SpatialDatabase:
             )
             """
         )
+        self._exec(
+            """
+            CREATE TABLE IF NOT EXISTS session_records (
+                kind TEXT NOT NULL,
+                record_id TEXT NOT NULL,
+                PRIMARY KEY (kind, record_id)
+            )
+            """
+        )
 
         # Additive column migrations for pre-existing tables
         for col_sql in (
@@ -566,8 +575,34 @@ class SpatialDatabase:
     def clear_pins(self) -> None:
         self._exec("DELETE FROM spatial_pins")
 
+    def delete_pin(self, pin_id: str) -> None:
+        self._exec("DELETE FROM spatial_pins WHERE id = ?", (pin_id,))
+
     def clear_object_events(self) -> None:
         self._exec("DELETE FROM object_events")
+
+    def delete_object_event(self, event_id: str) -> None:
+        self._exec("DELETE FROM object_events WHERE event_id = ?", (event_id,))
+
+    def track_session_record(self, kind: str, record_id: str) -> None:
+        self._exec(
+            """
+            INSERT INTO session_records (kind, record_id)
+            VALUES (?, ?)
+            ON CONFLICT (kind, record_id) DO NOTHING
+            """,
+            (kind, record_id),
+        )
+
+    def list_session_records(self, kind: Optional[str] = None) -> List[str]:
+        if kind:
+            rows = self._fetchall("SELECT record_id FROM session_records WHERE kind = ?", (kind,))
+        else:
+            rows = self._fetchall("SELECT record_id FROM session_records")
+        return [r["record_id"] for r in rows]
+
+    def clear_session_records(self) -> None:
+        self._exec("DELETE FROM session_records")
 
     def append_object_event(self, event: Dict[str, Any]) -> None:
         self._exec(

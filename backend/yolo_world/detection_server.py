@@ -40,9 +40,9 @@ class DetectionServer:
         self.inference_lock = threading.Lock()
         self.audio_clips = AudioClips(audio_dir)
         self.transcribe = transcribe or ParakeetClient().transcribe
-        self.notes = SpatialNoteStore(notes_dir, studio_url=studio_url)
+        self.notes = SpatialNoteStore(notes_dir, studio_url=studio_url, api_token=self.api_token)
         self.places = PlaceAnchorStore(places_dir, studio_url=studio_url)
-        self.memory = ObjectMemoryStore(memory_dir, studio_url=studio_url)
+        self.memory = ObjectMemoryStore(memory_dir, studio_url=studio_url, api_token=self.api_token)
         self.latest_frame = None
         self.latest_detections = []
 
@@ -178,7 +178,11 @@ class DetectionServer:
                         "notes": [],
                         "places": [],
                         "cleared": True,
+                        "notes_cleared": True,
+                        "memories_cleared": True,
+                        "places_cleared": True,
                         "studio_cleared": studio_cleared,
+                        "session_epoch": owner.privacy_epoch,
                     })
                     return
                 self.send_error(404)
@@ -253,6 +257,20 @@ class DetectionServer:
                         rotation = np.array([float(v) for v in raw_rotation.split(",")]).reshape(3, 3)
                         if not np.isfinite(rotation).all() or not np.allclose(rotation.T @ rotation, np.eye(3), atol=0.02) or np.linalg.det(rotation) < 0.98:
                             raise ValueError("Invalid rotation")
+                    cam_pose = None
+                    raw_pos = self.headers.get("X-Camera-Position")
+                    if raw_pos and rotation is not None:
+                        pos_vec = np.array([float(v) for v in raw_pos.split(",")], dtype=np.float64)
+                        if pos_vec.shape == (3,) and np.isfinite(pos_vec).all():
+                            cam_pose = (pos_vec, rotation)
+                    else:
+                        raw_pose = self.headers.get("X-Camera-Pose")
+                        if raw_pose:
+                            pose_obj = json.loads(raw_pose)
+                            pos_vec = np.asarray(pose_obj.get("pos"), dtype=np.float64)
+                            rot_mat = np.asarray(pose_obj.get("rot"), dtype=np.float64)
+                            if pos_vec.shape == (3,) and rot_mat.shape == (3, 3) and np.isfinite(pos_vec).all() and np.isfinite(rot_mat).all():
+                                cam_pose = (pos_vec, rot_mat)
                     phone_tracking = self.headers.get("X-Tracking-Mode") == "phone" and predict is not None
                     detections = predict(frame) if phone_tracking else track(frame, rotation) if track else predict(frame)
                     with owner.lock:
@@ -267,7 +285,7 @@ class DetectionServer:
                         })
                         return
                     owner.memory.observe(detections, frame, expected_epoch=mem_epoch)
-                    detections = owner.notes.annotate_detections(detections, frame)
+                    detections = owner.notes.annotate_detections(detections, frame, cam_pose=cam_pose)
                     detections.extend(owner.places.match_frame(frame))
                     with owner.lock:
                         if owner.memory.paused or owner.privacy_epoch != req_epoch:
@@ -314,10 +332,43 @@ class DetectionServer:
                     if self.headers.get('Content-Type', '').split(';')[0] != 'audio/mp4':
                         self.send_error(415, 'Expected audio/mp4')
                         return
+                    client_epoch_hdr = self.headers.get('X-Session-Epoch')
+                    client_epoch = None
+                    if client_epoch_hdr is not None:
+                        try:
+                            client_epoch = int(client_epoch_hdr)
+                        except ValueError:
+                            client_epoch = -1
+                    with owner.lock:
+                        is_paused = owner.memory.paused
+                        req_epoch = owner.privacy_epoch
+                    if is_paused or (client_epoch is not None and client_epoch != req_epoch):
+                        if length > 0:
+                            self.rfile.read(length)
+                        self._send_json({'ok': False, 'paused': is_paused, 'discarded': True}, status=409)
+                        return
                     body = self.rfile.read(length)
                     if len(body) != length:
                         raise ValueError('Incomplete audio clip')
+                    with owner.lock:
+                        if owner.memory.paused or owner.privacy_epoch != req_epoch:
+                            self._send_json({'ok': False, 'paused': owner.memory.paused, 'discarded': True}, status=409)
+                            return
                     result = owner.audio_clips.save(body, self.headers.get('X-Clip-Id'))
+                    with owner.lock:
+                        if owner.memory.paused or owner.privacy_epoch != req_epoch:
+                            clip_id = result.get('clip_id')
+                            if clip_id:
+                                (owner.audio_clips.directory / f"{clip_id}.pcm").unlink(missing_ok=True)
+                            self._send_json({'ok': False, 'paused': owner.memory.paused, 'discarded': True}, status=409)
+                            return
+                    with owner.lock:
+                        if owner.memory.paused or owner.privacy_epoch != req_epoch:
+                            saved_path = getattr(owner.audio_clips, 'directory', None)
+                            if saved_path and result.get('file'):
+                                (Path(saved_path) / result['file']).unlink(missing_ok=True)
+                            self._send_json({'ok': False, 'paused': owner.memory.paused, 'discarded': True}, status=409)
+                            return
                     data = json.dumps(result).encode()
                     self.send_response(200)
                     self.send_header('Content-Type', 'application/json')
@@ -341,24 +392,33 @@ class DetectionServer:
                     body = self.rfile.read(length)
                     validate_pcm(body)
                     try:
-                        transcript = owner.transcribe(body)
+                        transcript = dict(owner.transcribe(body))
+                        transcript.setdefault('provider', transcript.get('model') or 'parakeet-local')
+                        transcript.setdefault('audio_left_local', False)
                     except TranscriptionUnavailable:
-                        studio = (owner.studio_url or "http://127.0.0.1:8000").rstrip("/")
+                        if not owner.studio_url:
+                            raise TranscriptionUnavailable('Local Parakeet ASR unavailable and Studio cloud relay is disabled')
+                        studio = owner.studio_url.rstrip("/")
+                        relay_headers = {
+                            "Content-Type": "application/octet-stream",
+                            "X-Sample-Rate": "16000",
+                            "X-Relay-From-8765": "1",
+                        }
+                        if owner.api_token:
+                            relay_headers["X-WorldGit-Token"] = owner.api_token
                         req = urllib.request.Request(
                             f"{studio}/api/transcribe",
                             data=body,
-                            headers={
-                                "Content-Type": "application/octet-stream",
-                                "X-Sample-Rate": "16000",
-                                "X-Relay-From-8765": "1",
-                            },
+                            headers=relay_headers,
                             method="POST",
                         )
                         try:
-                            with urllib.request.urlopen(req, timeout=12) as resp:
+                            with urllib.request.urlopen(req, timeout=15) as resp:
                                 transcript = json.loads(resp.read().decode("utf-8"))
+                            transcript.setdefault('audio_left_local', True)
+                            transcript.setdefault('disclosure', 'Audio sent to cloud ASR')
                         except Exception as exc:
-                            raise TranscriptionUnavailable(f"Parakeet and Gemini ASR unavailable: {exc}") from exc
+                            raise TranscriptionUnavailable(f"Parakeet and cloud ASR unavailable: {exc}") from exc
                     data = json.dumps(transcript).encode()
                     self.send_response(200)
                     self.send_header('Content-Type', 'application/json')
@@ -439,15 +499,22 @@ class DetectionServer:
                     if not 2 <= length <= 500_000:
                         self.send_error(400, "Invalid note payload")
                         return
+                    with owner.lock:
+                        is_paused = owner.memory.paused
+                        req_epoch = owner.privacy_epoch
+                        note_epoch = owner.notes.epoch()
+                        latest_frame = owner.latest_frame
+                        latest_dets = list(owner.latest_detections)
                     payload = json.loads(self.rfile.read(length).decode("utf-8"))
+                    client_epoch = payload.get("session_epoch")
+                    if is_paused or (client_epoch is not None and int(client_epoch) != req_epoch):
+                        self._send_json({"ok": False, "paused": is_paused, "discarded": True, "error": "Session paused or cleared"}, status=409)
+                        return
                     object_id = payload.get("object_id")
                     label = payload.get("label") or "object"
                     bbox = payload.get("bbox_xyxy")
                     frame_size = payload.get("frame_size_px")
                     crop_bgr = None
-                    with owner.lock:
-                        latest_frame = owner.latest_frame
-                        latest_dets = list(owner.latest_detections)
                     if object_id:
                         for d in latest_dets:
                             if d.get("object_id") == object_id:
@@ -480,8 +547,23 @@ class DetectionServer:
                         target_user_ids=payload.get("target_user_ids"),
                         lat=payload.get("lat"),
                         lon=payload.get("lon"),
+                        note_id=payload.get("note_id"),
+                        expected_epoch=note_epoch,
+                        api_token=owner.api_token,
                     )
-                    self._send_json({"ok": True, "note": record})
+                    with owner.lock:
+                        aborted = record.get("discarded") or owner.memory.paused or owner.privacy_epoch != req_epoch
+                    if aborted:
+                        if not record.get("discarded") and record.get("note_id"):
+                            owner.notes.remove_note(record["note_id"])
+                        self._send_json({"ok": False, "paused": owner.memory.paused, "discarded": True, "error": "Session changed during note save"}, status=409)
+                        return
+                    self._send_json({
+                        "ok": True,
+                        "note": record,
+                        "note_id": record["note_id"],
+                        "studio_synced": bool(record.get("studio_synced", False)),
+                    })
                 except (OSError, ValueError, TypeError):
                     self.send_error(400, "Invalid note request")
 

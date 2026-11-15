@@ -4,21 +4,32 @@ import org.json.JSONArray
 import org.json.JSONObject
 import java.net.HttpURLConnection
 import java.net.URI
+import java.net.URLEncoder
+
+class ApiHttpException(val statusCode: Int, message: String) : Exception(message)
 
 data class WorldStateResult(
   val objects: List<SpatialObject>,
   val wearerPos: Triple<Double, Double, Double>,
   val wearerYaw: Float?,
+  val wearerLocalized: Boolean,
   val pins: List<SavedNote>,
   val undoSteps: List<String>,
   val activeTargetId: String?,
 )
 
 data class AskResult(
+  val found: Boolean,
   val answer: String,
   val targetObject: String?,
   val targetObjectId: String?,
   val objects: List<SpatialObject>,
+  val localized: Boolean = false,
+  val stale: Boolean = false,
+  val ageLabel: String? = null,
+  val context: String? = null,
+  val ambiguity: String? = null,
+  val fromMemory: Boolean = false,
 )
 
 data class FrameResult(
@@ -28,8 +39,46 @@ data class FrameResult(
   val inferenceMs: Double,
 )
 
+enum class TranscriptionStatus {
+  OK,
+  SILENCE,
+  SERVICE_UNAVAILABLE,
+}
+
+data class TranscriptionResult(
+  val text: String,
+  val status: TranscriptionStatus,
+  val provider: String = "",
+  val audioLeftLocal: Boolean = false,
+  val disclosure: String? = null,
+  val error: String? = null,
+)
+
+data class NoteSaveResult(
+  val ok: Boolean,
+  val noteId: String?,
+  val studioSynced: Boolean,
+  val discarded: Boolean = false,
+  val error: String? = null,
+)
+
+data class PrivacyToggleResult(
+  val visionConfirmed: Boolean,
+  val studioConfirmed: Boolean,
+  val paused: Boolean,
+  val error: String? = null,
+)
+
+data class SessionClearResult(
+  val visionCleared: Boolean,
+  val studioCleared: Boolean,
+  val error: String? = null,
+)
+
 object WorldGitApi {
   @Volatile private var apiToken: String = ""
+  @Volatile var visionBaseOverride: String? = null
+  @Volatile var studioBaseOverride: String? = null
 
   fun setApiToken(token: String) {
     apiToken = token.trim()
@@ -47,6 +96,7 @@ object WorldGitApi {
   }
 
   fun visionBase(hostInput: String): String {
+    visionBaseOverride?.takeIf { it.isNotBlank() }?.let { return it.trimEnd('/') }
     val clean = hostInput.trim().trimEnd('/')
     if (clean.startsWith("http://") || clean.startsWith("https://")) {
       return runCatching {
@@ -59,6 +109,7 @@ object WorldGitApi {
   }
 
   fun studioBase(hostInput: String): String {
+    studioBaseOverride?.takeIf { it.isNotBlank() }?.let { return it.trimEnd('/') }
     val clean = hostInput.trim().trimEnd('/')
     if (clean.startsWith("http://") || clean.startsWith("https://")) {
       return runCatching {
@@ -74,8 +125,13 @@ object WorldGitApi {
   private fun getJson(url: String, timeoutMs: Int = 2500): JSONObject {
     val conn = openConn(url, timeoutMs, timeoutMs)
     try {
-      val stream = if (conn.responseCode in 200..299) conn.inputStream else conn.errorStream
-      return JSONObject(stream.bufferedReader().use { it.readText() })
+      val code = conn.responseCode
+      val stream = if (code in 200..299) conn.inputStream else conn.errorStream
+      val text = stream?.bufferedReader()?.use { it.readText() } ?: "{}"
+      if (code !in 200..299) {
+        throw ApiHttpException(code, "HTTP $code from $url: ${text.take(180)}")
+      }
+      return if (text.isBlank()) JSONObject() else JSONObject(text)
     } finally {
       conn.disconnect()
     }
@@ -90,8 +146,12 @@ object WorldGitApi {
     conn.setFixedLengthStreamingMode(bytes.size)
     try {
       conn.outputStream.use { it.write(bytes) }
-      val stream = if (conn.responseCode in 200..299) conn.inputStream else conn.errorStream
+      val code = conn.responseCode
+      val stream = if (code in 200..299) conn.inputStream else conn.errorStream
       val text = stream?.bufferedReader()?.use { it.readText() } ?: "{}"
+      if (code !in 200..299) {
+        throw ApiHttpException(code, "HTTP $code from $url: ${text.take(180)}")
+      }
       return if (text.isBlank()) JSONObject() else JSONObject(text)
     } finally {
       conn.disconnect()
@@ -120,7 +180,7 @@ object WorldGitApi {
     )
   }
 
-  fun fetchSavedNotes(host: String): List<SavedNote> = runCatching {
+  fun fetchSavedNotes(host: String): Result<List<SavedNote>> = runCatching {
     val j = getJson("${visionBase(host)}/api/notes", 2500)
     val arr = j.optJSONArray("notes") ?: JSONArray()
     (0 until arr.length()).mapNotNull { idx ->
@@ -135,7 +195,7 @@ object WorldGitApi {
         author = o.optString("author", "Person A"),
       )
     }
-  }.getOrDefault(emptyList())
+  }
 
   fun fetchWorldState(host: String): WorldStateResult? = runCatching {
     val j = getJson("${studioBase(host)}/api/state", 2500)
@@ -159,17 +219,30 @@ object WorldGitApi {
     var wy = 1.6
     var wz = 0.0
     var wYaw: Float? = null
+    var wLocalized = false
     val wearers = j.optJSONArray("wearers")
     if (wearers != null && wearers.length() > 0) {
-      val w0 = wearers.optJSONObject(0)
-      val wp = w0?.optJSONArray("position")
-      if (wp != null && wp.length() >= 3) {
-        wx = wp.optDouble(0, 0.0)
-        wy = wp.optDouble(1, 1.6)
-        wz = wp.optDouble(2, 0.0)
+      var selectedWearer: JSONObject? = null
+      for (i in 0 until wearers.length()) {
+        val cand = wearers.optJSONObject(i) ?: continue
+        val wid = cand.optString("wearer_id", "").ifBlank { cand.optString("id", "") }
+        val uid = cand.optString("user_id", "")
+        if (wid == "wearer-b" || uid == "usr-conor") {
+          selectedWearer = cand
+          break
+        }
       }
-      if (w0 != null && w0.has("yaw")) {
-        wYaw = w0.optDouble("yaw", 0.0).toFloat()
+      if (selectedWearer != null) {
+        wLocalized = true
+        val wp = selectedWearer.optJSONArray("position")
+        if (wp != null && wp.length() >= 3) {
+          wx = wp.optDouble(0, 0.0)
+          wy = wp.optDouble(1, 1.6)
+          wz = wp.optDouble(2, 0.0)
+        }
+        if (selectedWearer.has("yaw")) {
+          wYaw = selectedWearer.optDouble("yaw", 0.0).toFloat()
+        }
       }
     }
     val pins = mutableListOf<SavedNote>()
@@ -193,7 +266,7 @@ object WorldGitApi {
       uArr.optString(i)?.takeIf { it.isNotBlank() }?.let(undo::add)
     }
     val activeId = j.optJSONObject("active_target")?.optString("id")?.takeIf { it.isNotBlank() }
-    WorldStateResult(objs, Triple(wx, wy, wz), wYaw, pins, undo, activeId)
+    WorldStateResult(objs, Triple(wx, wy, wz), wYaw, wLocalized, pins, undo, activeId)
   }.getOrNull()
 
   fun postFrame(host: String, jpegBytes: ByteArray, rotation: FloatArray?): FrameResult {
@@ -207,7 +280,13 @@ object WorldGitApi {
     conn.setFixedLengthStreamingMode(jpegBytes.size)
     try {
       conn.outputStream.use { it.write(jpegBytes) }
-      val json = JSONObject(conn.inputStream.bufferedReader().use { it.readText() })
+      val code = conn.responseCode
+      val stream = if (code in 200..299) conn.inputStream else conn.errorStream
+      val raw = stream?.bufferedReader()?.use { it.readText() } ?: "{}"
+      if (code !in 200..299) {
+        throw ApiHttpException(code, "Vision HTTP $code: ${raw.take(160)}")
+      }
+      val json = JSONObject(raw)
       val arr = json.optJSONArray("detections") ?: JSONArray()
       val items = (0 until arr.length()).mapNotNull { i ->
         val d = arr.optJSONObject(i) ?: return@mapNotNull null
@@ -220,6 +299,7 @@ object WorldGitApi {
           confidence = d.optDouble("confidence", 0.7),
           box = listOf(b.getDouble(0), b.getDouble(1), b.getDouble(2), b.getDouble(3)),
           note = note,
+          noteUncertain = d.optBoolean("note_uncertain", false),
         )
       }
       val fs = json.optJSONArray("frame_size_px")
@@ -231,29 +311,82 @@ object WorldGitApi {
     }
   }
 
-  fun transcribePcm(host: String, pcm16: ByteArray): String {
+  fun transcribePcm(host: String, pcm16: ByteArray): String =
+    transcribePcmWithResult(host, pcm16).text
+
+  fun transcribePcmWithResult(host: String, pcm16: ByteArray): TranscriptionResult {
     val segmentBytes = 16000 * 2 * 20
     val chunks = mutableListOf<String>()
     var offset = 0
+    var lastProvider = ""
+    var anyCloud = false
+    var lastDisclosure: String? = null
+    var sawSilence = false
+    var lastError: String? = null
+
     while (offset < pcm16.size) {
       val end = minOf(offset + segmentBytes, pcm16.size)
       var slice = pcm16.copyOfRange(offset, end)
       if (slice.size < 3200) slice = slice.copyOf(3200)
-      val text = transcribeChunk(host, slice)
-      if (text.isNotBlank()) chunks += text
+      val chunkRes = transcribeChunk(host, slice)
+      when (chunkRes.status) {
+        TranscriptionStatus.OK -> {
+          if (chunkRes.text.isNotBlank()) chunks += chunkRes.text
+          if (chunkRes.provider.isNotBlank()) lastProvider = chunkRes.provider
+          if (chunkRes.audioLeftLocal) anyCloud = true
+          if (!chunkRes.disclosure.isNullOrBlank()) lastDisclosure = chunkRes.disclosure
+        }
+        TranscriptionStatus.SILENCE -> {
+          sawSilence = true
+          if (chunkRes.provider.isNotBlank()) lastProvider = chunkRes.provider
+          if (chunkRes.audioLeftLocal) anyCloud = true
+        }
+        TranscriptionStatus.SERVICE_UNAVAILABLE -> {
+          lastError = chunkRes.error ?: "Transcription service unavailable"
+        }
+      }
       offset = end
     }
-    return chunks.joinToString(" ").trim()
+
+    val combined = chunks.joinToString(" ").trim()
+    return when {
+      combined.isNotBlank() -> TranscriptionResult(
+        text = combined,
+        status = TranscriptionStatus.OK,
+        provider = lastProvider,
+        audioLeftLocal = anyCloud,
+        disclosure = lastDisclosure ?: if (anyCloud) "Audio sent to cloud ASR" else null,
+      )
+      sawSilence && lastError == null -> TranscriptionResult(
+        text = "",
+        status = TranscriptionStatus.SILENCE,
+        provider = lastProvider,
+        audioLeftLocal = anyCloud,
+        disclosure = lastDisclosure,
+      )
+      else -> TranscriptionResult(
+        text = "",
+        status = TranscriptionStatus.SERVICE_UNAVAILABLE,
+        provider = lastProvider,
+        audioLeftLocal = anyCloud,
+        error = lastError ?: "Transcription service unavailable",
+      )
+    }
   }
 
-  private fun transcribeChunk(host: String, slice: ByteArray): String {
-    // Call Studio server (:8000) directly for Gemini 3.8 Flash audio ASR, with Vision (:8765) as fallback.
-    val urls = listOf(
-      "${studioBase(host)}/api/transcribe",
-      "${visionBase(host)}/api/transcribe",
+  private fun transcribeChunk(host: String, slice: ByteArray): TranscriptionResult {
+    // Prefer local Vision (:8765 Parakeet) first, then Studio (:8000 Gemini cloud ASR).
+    val endpoints = listOf(
+      "${visionBase(host)}/api/transcribe" to false,
+      "${studioBase(host)}/api/transcribe" to true,
     )
-    for (url in urls) {
-      val res = runCatching {
+    var sawSilence = false
+    var silenceProvider = ""
+    var silenceCloud = false
+    val errors = mutableListOf<String>()
+
+    for ((url, isCloudEndpoint) in endpoints) {
+      val attempt = runCatching {
         val conn = openConn(url, 4000, 25000)
         conn.requestMethod = "POST"
         conn.doOutput = true
@@ -262,33 +395,115 @@ object WorldGitApi {
         conn.setFixedLengthStreamingMode(slice.size)
         try {
           conn.outputStream.use { it.write(slice) }
-          if (conn.responseCode == 200) {
-            val j = JSONObject(conn.inputStream.bufferedReader().use { it.readText() })
-            j.optString("text", "").trim()
-          } else null
+          val code = conn.responseCode
+          val stream = if (code in 200..299) conn.inputStream else conn.errorStream
+          val raw = stream?.bufferedReader()?.use { it.readText() } ?: "{}"
+          if (code !in 200..299) {
+            throw ApiHttpException(code, "HTTP $code")
+          }
+          JSONObject(raw)
         } finally {
           conn.disconnect()
         }
-      }.getOrNull()
-      if (res != null) return res
+      }
+      attempt.onSuccess { j ->
+        val txt = j.optString("text", "").trim()
+        val provider = j.optString("provider", j.optString("model", if (isCloudEndpoint) "gemini-3.8-flash" else "parakeet-local"))
+        val leftLocal = j.optBoolean("audio_left_local", isCloudEndpoint)
+        val disclosure = j.optString("disclosure", "").takeIf { it.isNotBlank() }
+          ?: if (leftLocal) "Audio sent to cloud ASR" else null
+        if (txt.isNotBlank()) {
+          return TranscriptionResult(
+            text = txt,
+            status = TranscriptionStatus.OK,
+            provider = provider,
+            audioLeftLocal = leftLocal,
+            disclosure = disclosure,
+          )
+        }
+        // Empty 200 response: record silence but keep trying remaining endpoint in case local/cloud disagrees.
+        sawSilence = true
+        silenceProvider = provider
+        silenceCloud = leftLocal
+      }.onFailure { err ->
+        errors += "${if (isCloudEndpoint) "Studio" else "Vision"}: ${err.message}"
+      }
     }
-    return ""
+
+    return if (sawSilence && errors.size < endpoints.size) {
+      TranscriptionResult(
+        text = "",
+        status = TranscriptionStatus.SILENCE,
+        provider = silenceProvider,
+        audioLeftLocal = silenceCloud,
+      )
+    } else {
+      TranscriptionResult(
+        text = "",
+        status = TranscriptionStatus.SERVICE_UNAVAILABLE,
+        error = errors.joinToString("; ").ifBlank { "No transcription endpoint responded" },
+      )
+    }
+  }
+
+  fun findMemory(host: String, query: String): JSONObject? = runCatching {
+    val enc = URLEncoder.encode(query, "UTF-8")
+    getJson("${visionBase(host)}/api/memory/find?q=$enc", timeoutMs = 4000)
+  }.getOrNull()
+
+  fun askMemory(host: String, question: String): JSONObject = postJson(
+    "${visionBase(host)}/api/memory/ask",
+    JSONObject().put("question", question),
+    timeoutMs = 5000,
+  )
+
+  private fun labelsCompatible(a: String, b: String): Boolean {
+    val na = a.trim().lowercase()
+    val nb = b.trim().lowercase()
+    if (na.isBlank() || nb.isBlank()) return false
+    if (na == nb) return true
+    val ta = na.split(Regex("\\s+")).filter { it.isNotBlank() }
+    val tb = nb.split(Regex("\\s+")).filter { it.isNotBlank() }
+    return ta.any { it in tb } || tb.any { it in ta }
   }
 
   fun askGemini(host: String, question: String, yawDeg: Float): AskResult {
-    val j = postJson(
-      "${studioBase(host)}/api/ask",
-      JSONObject()
-        .put("wearer_id", "wearer-b")
-        .put("query", question)
-        .put("yaw", yawDeg.toDouble()),
-      timeoutMs = 25000,
-    )
-    val objs = mutableListOf<SpatialObject>()
-    val singleObj = j.optJSONObject("object")
+    // 1. Query recent glasses object memory (:8765) first for retrieval questions.
+    val memAttempt = runCatching { askMemory(host, question) }
+    val studioAttempt = runCatching {
+      postJson(
+        "${studioBase(host)}/api/ask",
+        JSONObject()
+          .put("wearer_id", "wearer-b")
+          .put("viewer_id", "usr-conor")
+          .put("query", question)
+          .put("yaw", yawDeg.toDouble()),
+        timeoutMs = 25000,
+      )
+    }
+
+    if (memAttempt.isFailure && studioAttempt.isFailure) {
+      throw (studioAttempt.exceptionOrNull() ?: memAttempt.exceptionOrNull() ?: Exception("Servers unreachable"))
+    }
+
+    val memJson = memAttempt.getOrNull()
+    val memFound = memJson?.optBoolean("found", false) == true
+    val memItem = memJson?.optJSONObject("item")
+    val memLabel = memItem?.optString("label")?.takeIf { it.isNotBlank() && it != "null" }
+    val memAge = memJson?.optString("age_label", memItem?.optString("age_label", "") ?: "")?.takeIf { it.isNotBlank() }
+    val memCtx = memJson?.optString("context", memItem?.optString("spatial_phrase", "") ?: "")?.takeIf { it.isNotBlank() }
+    val memAmb = memJson?.optString("ambiguity", "")?.takeIf { it.isNotBlank() }
+    val memSpoken = memJson?.optString("spoken_response", memJson.optString("summary", ""))?.trim().orEmpty()
+
+    val studioJson = studioAttempt.getOrNull()
+    val studioFound = studioJson?.optBoolean("found", false) == true
+    val studioLocalized = studioJson?.optBoolean("localized", false) == true
+    val studioStale = studioJson?.optBoolean("stale", false) == true
+    val studioObjs = mutableListOf<SpatialObject>()
+    val singleObj = studioJson?.optJSONObject("object")
     if (singleObj != null) {
       val pos = singleObj.optJSONArray("position")
-      objs += SpatialObject(
+      studioObjs += SpatialObject(
         id = singleObj.optString("id", "target-0"),
         label = singleObj.optString("label", "object"),
         x = pos?.optDouble(0, 0.0) ?: singleObj.optDouble("x", 0.0),
@@ -296,11 +511,11 @@ object WorldGitApi {
         z = pos?.optDouble(2, 0.0) ?: singleObj.optDouble("z", 0.0),
       )
     }
-    val oArr = j.optJSONArray("objects") ?: JSONArray()
+    val oArr = studioJson?.optJSONArray("objects") ?: JSONArray()
     for (i in 0 until oArr.length()) {
       val o = oArr.optJSONObject(i) ?: continue
       val pos = o.optJSONArray("position")
-      objs += SpatialObject(
+      studioObjs += SpatialObject(
         id = o.optString("id", "obj-$i"),
         label = o.optString("label", "object"),
         x = pos?.optDouble(0, 0.0) ?: o.optDouble("x", 0.0),
@@ -308,19 +523,66 @@ object WorldGitApi {
         z = pos?.optDouble(2, 0.0) ?: o.optDouble("z", 0.0),
       )
     }
-    val spoken = j.optString(
+    val studioSpoken = studioJson?.optString(
       "spoken_answer",
-      j.optString("spoken_response", j.optString("answer", j.optString("message", ""))),
-    ).trim()
-    val targetLabel = singleObj?.optString("label")?.takeIf { it.isNotBlank() && it != "null" }
-      ?: j.optString("target_label", j.optString("object", "")).takeIf { it.isNotBlank() && it != "null" && !it.startsWith("{") }
-    val targetId = singleObj?.optString("id")?.takeIf { it.isNotBlank() && it != "null" }
-      ?: j.optString("target_id", "").takeIf { it.isNotBlank() && it != "null" }
+      studioJson.optString("spoken_response", studioJson.optString("answer", studioJson.optString("message", ""))),
+    )?.trim().orEmpty()
+    val studioTargetLabel = singleObj?.optString("label")?.takeIf { it.isNotBlank() && it != "null" }
+      ?: studioJson?.optString("target_label", studioJson.optString("object", ""))?.takeIf { it.isNotBlank() && it != "null" && !it.startsWith("{") }
+    val studioTargetId = singleObj?.optString("id")?.takeIf { it.isNotBlank() && it != "null" }
+      ?: studioJson?.optString("target_id", "")?.takeIf { it.isNotBlank() && it != "null" }
+
+    if (memFound) {
+      val sameMappedTarget = studioFound &&
+        !memLabel.isNullOrBlank() &&
+        !studioTargetLabel.isNullOrBlank() &&
+        labelsCompatible(memLabel, studioTargetLabel)
+      val useMappedNav = sameMappedTarget && studioLocalized && !studioStale && studioObjs.isNotEmpty()
+      val answerText = when {
+        memSpoken.isNotBlank() && useMappedNav && studioSpoken.isNotBlank() && !studioSpoken.contains("haven't seen", ignoreCase = true) ->
+          "$memSpoken ($studioSpoken)"
+        memSpoken.isNotBlank() -> memSpoken
+        else -> studioSpoken.ifBlank { "Last seen ${memAge ?: "recently"} ${memCtx ?: "in view"}." }
+      }
+      return AskResult(
+        found = true,
+        answer = answerText,
+        targetObject = if (useMappedNav) (studioTargetLabel ?: memLabel) else memLabel,
+        targetObjectId = if (useMappedNav) studioTargetId else memItem?.optString("instance_id")?.takeIf { it.isNotBlank() },
+        objects = if (useMappedNav) studioObjs else emptyList(),
+        localized = useMappedNav,
+        stale = if (useMappedNav) studioStale else false,
+        ageLabel = memAge,
+        context = memCtx,
+        ambiguity = memAmb,
+        fromMemory = true,
+      )
+    }
+
+    if (studioFound) {
+      return AskResult(
+        found = true,
+        answer = studioSpoken.ifBlank { "Mapped ${studioTargetLabel ?: "object"} found." },
+        targetObject = studioTargetLabel,
+        targetObjectId = studioTargetId,
+        objects = studioObjs,
+        localized = studioLocalized && studioObjs.isNotEmpty(),
+        stale = studioStale,
+        fromMemory = false,
+      )
+    }
+
+    val noMatchMsg = memSpoken.takeIf { it.isNotBlank() }
+      ?: studioSpoken.takeIf { it.isNotBlank() }
+      ?: "I don't have a recent observation matching that."
     return AskResult(
-      answer = spoken.ifBlank { "Turn toward your target." },
-      targetObject = targetLabel,
-      targetObjectId = targetId,
-      objects = objs,
+      found = false,
+      answer = noMatchMsg,
+      targetObject = null,
+      targetObjectId = null,
+      objects = emptyList(),
+      localized = false,
+      fromMemory = memJson != null,
     )
   }
 
@@ -332,34 +594,39 @@ object WorldGitApi {
     box: List<Double>?,
     frameWidth: Int,
     frameHeight: Int,
-  ) {
-    // 1. Save to SpatialNoteStore on :8765 (notes.json + crop HSV re-ID + auto-relay to :8000/api/pin-from-hud)
-    runCatching {
+    noteId: String? = null,
+  ): NoteSaveResult {
+    // Single authoritative forwarding path: Vision :8765/api/notes persists locally and relays to Studio :8000/api/pin-from-hud with one stable note_id.
+    return runCatching {
       val payload = JSONObject()
         .put("object_id", objectId)
         .put("label", label)
         .put("text", text)
         .put("author", "You")
+      if (!noteId.isNullOrBlank()) {
+        payload.put("note_id", noteId)
+      }
       if (box != null && box.size >= 4) {
         payload.put("bbox_xyxy", JSONArray(box))
         payload.put("frame_size_px", JSONArray(listOf(frameWidth, frameHeight)))
       }
-      postJson("${visionBase(host)}/api/notes", payload, timeoutMs = 4000)
-    }
-    // 2. Also ensure HUD pin sync in Studio :8000/api/pin-from-hud
-    runCatching {
-      val cx = if (box != null && box.size >= 4) (box[0] + box[2]) / 2.0 else frameWidth / 2.0
-      val cy = if (box != null && box.size >= 4) (box[1] + box[3]) / 2.0 else frameHeight / 2.0
-      postJson(
-        "${studioBase(host)}/api/pin-from-hud",
-        JSONObject()
-          .put("id", objectId)
-          .put("label", label)
-          .put("text", text)
-          .put("author", "You")
-          .put("center_px", JSONArray(listOf(cx, cy)))
-          .put("frame_size_px", JSONArray(listOf(frameWidth.toDouble(), frameHeight.toDouble()))),
-        timeoutMs = 4000,
+      val j = postJson("${visionBase(host)}/api/notes", payload, timeoutMs = 4500)
+      val noteObj = j.optJSONObject("note")
+      val savedId = j.optString("note_id", noteObj?.optString("note_id", noteId ?: "") ?: "").takeIf { it.isNotBlank() }
+      val studioSynced = j.optBoolean("studio_synced", noteObj?.optBoolean("studio_synced", false) ?: false)
+      val discarded = j.optBoolean("discarded", false)
+      NoteSaveResult(
+        ok = j.optBoolean("ok", true) && !discarded,
+        noteId = savedId,
+        studioSynced = studioSynced,
+        discarded = discarded,
+      )
+    }.getOrElse { err ->
+      NoteSaveResult(
+        ok = false,
+        noteId = noteId,
+        studioSynced = false,
+        error = err.message ?: "Save failed",
       )
     }
   }
@@ -370,12 +637,18 @@ object WorldGitApi {
     (0 until arr.length()).mapNotNull { arr.optString(it)?.takeIf { s -> s.isNotBlank() } }
   }.getOrNull()
 
-  fun sendImuSample(host: String, yaw: Float, pitch: Float, roll: Float) = runCatching {
+  fun sendImuSample(
+    host: String,
+    yaw: Float,
+    pitch: Float,
+    roll: Float,
+    sessionId: String = "glasses-live",
+  ) = runCatching {
     val nowMs = System.currentTimeMillis().toDouble()
     postJson(
       "${studioBase(host)}/api/imu-sessions",
       JSONObject()
-        .put("session_id", "glasses-live")
+        .put("session_id", sessionId)
         .put("device", "meta-ray-ban-display")
         .put("started_at_ms", nowMs)
         .put("ended_at_ms", nowMs)
@@ -394,29 +667,63 @@ object WorldGitApi {
     )
   }
 
-  fun togglePrivacy(host: String, paused: Boolean) = runCatching {
-    postJson("${visionBase(host)}/api/privacy", JSONObject().put("paused", paused), timeoutMs = 2000)
+  fun togglePrivacy(host: String, paused: Boolean): PrivacyToggleResult {
+    val visionRes = runCatching {
+      postJson("${visionBase(host)}/api/privacy", JSONObject().put("paused", paused), timeoutMs = 2500)
+    }
+    val studioRes = runCatching {
+      postJson("${studioBase(host)}/api/privacy", JSONObject().put("paused", paused), timeoutMs = 2500)
+    }
+    val vOk = visionRes.isSuccess && visionRes.getOrNull()?.optBoolean("ok", true) != false
+    val sOk = studioRes.isSuccess && studioRes.getOrNull()?.optBoolean("ok", true) != false
+    val err = listOfNotNull(
+      visionRes.exceptionOrNull()?.message?.let { "Vision: $it" },
+      studioRes.exceptionOrNull()?.message?.let { "Studio: $it" },
+    ).joinToString("; ").takeIf { it.isNotBlank() }
+    return PrivacyToggleResult(
+      visionConfirmed = vOk,
+      studioConfirmed = sOk,
+      paused = paused,
+      error = err,
+    )
   }
 
-  fun clearNotes(host: String) = runCatching {
-    val deleteUrl: (String) -> Int = { fullUrl ->
-      val conn = openConn(fullUrl, 2000, 2000)
+  fun clearNotes(host: String): SessionClearResult {
+    val deleteJson: (String) -> JSONObject = { fullUrl ->
+      val conn = openConn(fullUrl, 2500, 3000)
       conn.requestMethod = "DELETE"
       try {
         val code = conn.responseCode
         val stream = if (code in 200..299) conn.inputStream else conn.errorStream
-        stream?.use { it.readBytes() }
-        code
+        val text = stream?.bufferedReader()?.use { it.readText() } ?: "{}"
+        if (code !in 200..299) {
+          throw ApiHttpException(code, "HTTP $code")
+        }
+        if (text.isBlank()) JSONObject() else JSONObject(text)
       } finally {
         conn.disconnect()
       }
     }
     val vBase = visionBase(host)
-    val code = runCatching { deleteUrl("$vBase/api/session") }.getOrDefault(0)
-    if (code !in 200..299) {
-      runCatching { deleteUrl("$vBase/api/notes") }
-      runCatching { deleteUrl("$vBase/api/memory") }
+    val vSession = runCatching { deleteJson("$vBase/api/session") }
+    var visionCleared = vSession.isSuccess && vSession.getOrNull()?.optBoolean("cleared", true) != false
+    var studioCleared = vSession.getOrNull()?.optBoolean("studio_cleared", false) == true
+
+    if (!visionCleared) {
+      val nOk = runCatching { deleteJson("$vBase/api/notes") }.isSuccess
+      val mOk = runCatching { deleteJson("$vBase/api/memory") }.isSuccess
+      visionCleared = nOk && mOk
     }
-    runCatching { deleteUrl("${studioBase(host)}/api/session") }
+
+    if (!studioCleared) {
+      val sRes = runCatching { deleteJson("${studioBase(host)}/api/session") }
+      studioCleared = sRes.isSuccess && sRes.getOrNull()?.optBoolean("cleared", true) != false
+    }
+
+    return SessionClearResult(
+      visionCleared = visionCleared,
+      studioCleared = studioCleared,
+      error = vSession.exceptionOrNull()?.message,
+    )
   }
 }

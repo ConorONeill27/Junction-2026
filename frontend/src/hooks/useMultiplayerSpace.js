@@ -77,33 +77,66 @@ export function useMultiplayerSpace(initialViewerId = "usr-conor", initialWorldI
   }, [viewerId, worldId, refreshAll]);
 
   useEffect(() => {
-    const proto = window.location.protocol === "https:" ? "wss:" : "ws:";
-    const wsUrl = `${proto}//${window.location.host}/ws/stream?viewer_id=${encodeURIComponent(viewerId)}&world_id=${encodeURIComponent(worldId)}`;
-    const ws = new WebSocket(wsUrl);
-    wsRef.current = ws;
+    let disposed = false;
+    let reconnectTimer = null;
+    let attempt = 0;
 
-    ws.onopen = () => setWsConnected(true);
-    ws.onclose = () => setWsConnected(false);
-    ws.onmessage = (evt) => {
-      try {
-        const msg = JSON.parse(evt.data);
-        if (msg.type === "world_state" || msg.type === "state") {
-          setLiveState(msg);
-          if (Array.isArray(msg.zones)) setZones(msg.zones);
-        } else if (msg.type === "wearers_update" || msg.type === "wearers") {
-          setLiveState((prev) => (prev ? { ...prev, wearers: msg.wearers || [] } : prev));
+    const connect = () => {
+      if (disposed) return;
+      const proto = window.location.protocol === "https:" ? "wss:" : "ws:";
+      const wsUrl = `${proto}//${window.location.host}/ws/stream?viewer_id=${encodeURIComponent(viewerId)}&world_id=${encodeURIComponent(worldId)}`;
+      const ws = new WebSocket(wsUrl);
+      wsRef.current = ws;
+
+      ws.onopen = () => {
+        if (disposed) {
+          try { ws.close(); } catch {}
+          return;
         }
-      } catch {
-        // ignore malformed WS frames
-      }
+        attempt = 0;
+        setWsConnected(true);
+      };
+      ws.onclose = () => {
+        if (wsRef.current === ws) {
+          wsRef.current = null;
+        }
+        setWsConnected(false);
+        if (disposed) return;
+        const delayMs = Math.min(10000, 1000 * Math.pow(2, attempt));
+        attempt = Math.min(attempt + 1, 4);
+        reconnectTimer = window.setTimeout(connect, delayMs);
+      };
+      ws.onerror = () => {
+        try { ws.close(); } catch {}
+      };
+      ws.onmessage = (evt) => {
+        try {
+          const msg = JSON.parse(evt.data);
+          if (msg.type === "world_state" || msg.type === "state") {
+            setLiveState(msg);
+            if (Array.isArray(msg.zones)) setZones(msg.zones);
+          } else if (msg.type === "wearers_update" || msg.type === "wearers") {
+            setLiveState((prev) => (prev ? { ...prev, wearers: msg.wearers || [] } : prev));
+          }
+        } catch {
+          // ignore malformed WS frames
+        }
+      };
     };
 
+    connect();
+
     return () => {
+      disposed = true;
+      if (reconnectTimer !== null) {
+        window.clearTimeout(reconnectTimer);
+      }
       try {
-        ws.close();
+        wsRef.current?.close();
       } catch {
         // ignore
       }
+      wsRef.current = null;
     };
   }, [viewerId, worldId]);
 

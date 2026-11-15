@@ -67,4 +67,6 @@ dependencies {
   implementation("com.meta.wearable:mwdat-inputs:1.0.1")
   implementation(libs.mwdat.core)
   implementation(libs.mwdat.display)
+  testImplementation("junit:junit:4.13.2")
+  testImplementation("org.json:json:20240303")
 }

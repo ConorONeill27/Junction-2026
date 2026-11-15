@@ -86,12 +86,19 @@ class WorldGitViewModel(application: Application) : AndroidViewModel(application
   private val networkBusy = AtomicBoolean(false)
   private var nextUploadAtNs = 0L
   @Volatile private var lastVisionOkMs = 0L
+  @Volatile private var visionAttemptStartMs = 0L
+  @Volatile private var visionConsecutiveFailures = 0
   @Volatile private var manualSelectionHoldUntilMs = 0L
+  @Volatile private var sessionEpoch = 0
 
   private var spatialObjects: List<SpatialObject> = emptyList()
   private var wearerPos = Triple(0.0, 1.6, 0.0)
-  private var activeTargetLabel = "bottle"
+  @Volatile private var wearerLocalized = false
+  private var activeTargetLabel = ""
   private var activeTargetId: String? = null
+  @Volatile private var activeTargetLocalized = false
+  @Volatile private var activeTargetStale = false
+  private var imuSessionId = "glasses-live"
   private var currentYawDeg = 0f
   private var currentPitchDeg = 0f
   private var currentRollDeg = 0f
@@ -196,32 +203,46 @@ class WorldGitViewModel(application: Application) : AndroidViewModel(application
 
       while (isActive) {
         val host = _ui.value.host
+        val reqEpoch = sessionEpoch
         val st = WorldGitApi.fetchWorldState(host)
-        val notes = WorldGitApi.fetchSavedNotes(host)
+        val notesRes = WorldGitApi.fetchSavedNotes(host)
+
+        if (reqEpoch != sessionEpoch || host != _ui.value.host) {
+          delay(250L)
+          continue
+        }
 
         if (st != null) {
           spatialObjects = st.objects
           wearerPos = st.wearerPos
-          if (st.activeTargetId != null) {
+          wearerLocalized = st.wearerLocalized
+          if (activeTargetId == null && st.activeTargetId != null) {
             st.objects.firstOrNull { it.id == st.activeTargetId }?.let { t ->
               activeTargetLabel = t.label
               activeTargetId = t.id
+              activeTargetLocalized = st.wearerLocalized
+              activeTargetStale = false
             }
           }
           _ui.value = _ui.value.copy(undoSteps = st.undoSteps)
           refreshCompassState()
         }
 
-        if (notes.isNotEmpty()) {
-          val byId = notes.filter { it.objectId.isNotBlank() }.associate { it.objectId to it.text }
-          val byLabel = notes.filter { it.label.isNotBlank() }.associate { it.label.lowercase() to it.text }
+        notesRes.onSuccess { notes ->
+          val byId = notes
+            .filter { it.objectId.isNotBlank() }
+            .associate { it.objectId to it.text }
           val curSpeech = _ui.value.speech
           _ui.value = _ui.value.copy(
             savedNotes = notes,
+            notesSyncError = null,
             speech = curSpeech.copy(
-              notesByObjectId = curSpeech.notesByObjectId + byId,
-              notesByLabel = curSpeech.notesByLabel + byLabel,
+              notesByObjectId = byId,
             ),
+          )
+        }.onFailure { err ->
+          _ui.value = _ui.value.copy(
+            notesSyncError = "Notes sync error: ${err.message ?: "offline"}",
           )
         }
         delay(1500L)
@@ -243,11 +264,33 @@ class WorldGitViewModel(application: Application) : AndroidViewModel(application
 
   fun updateHost(newHost: String) {
     val clean = newHost.trim().ifBlank { "127.0.0.1" }
+    sessionEpoch += 1
     prefs.edit().putString("host", clean).apply()
-    _ui.value = _ui.value.copy(host = clean)
+    spatialObjects = emptyList()
+    wearerLocalized = false
+    activeTargetId = null
+    activeTargetLabel = ""
+    activeTargetLocalized = false
+    activeTargetStale = false
+    lastVisionOkMs = 0L
+    visionAttemptStartMs = 0L
+    visionConsecutiveFailures = 0
+    _ui.value = _ui.value.copy(
+      host = clean,
+      savedNotes = emptyList(),
+      undoSteps = emptyList(),
+      noteSaveStatus = null,
+      pendingRetryNote = null,
+      notesSyncError = null,
+      speech = _ui.value.speech.copy(notesByObjectId = emptyMap()),
+    )
+    refreshCompassState()
+    val reqEpoch = sessionEpoch
     viewModelScope.launch(Dispatchers.IO) {
       WorldGitApi.fetchCalibration(clean)?.let { c ->
-        _ui.value = _ui.value.copy(calibration = c)
+        if (reqEpoch == sessionEpoch && _ui.value.host == clean) {
+          _ui.value = _ui.value.copy(calibration = c)
+        }
       }
     }
   }
@@ -265,6 +308,7 @@ class WorldGitViewModel(application: Application) : AndroidViewModel(application
   fun connectOrDisconnectGlasses(activity: Activity, hasAudioPermission: Boolean) {
     val snap = wearablesManager.snapshot.value
     if (snap.displayStarted || snap.cameraStreaming) {
+      sessionEpoch += 1
       wearablesManager.stopSession()
       return
     }
@@ -272,6 +316,7 @@ class WorldGitViewModel(application: Application) : AndroidViewModel(application
       wearablesManager.startRegistration(activity)
       return
     }
+    sessionEpoch += 1
     wearablesManager.connectGlasses(withMicrophone = hasAudioPermission)
   }
 
@@ -399,10 +444,38 @@ class WorldGitViewModel(application: Application) : AndroidViewModel(application
   }
 
   private fun queryGeminiAndUpdateCompass(question: String) {
+    val reqEpoch = sessionEpoch
+    val reqHost = _ui.value.host
     viewModelScope.launch(Dispatchers.IO) {
       runCatching {
-        WorldGitApi.askGemini(_ui.value.host, question, currentYawDeg)
+        WorldGitApi.askGemini(reqHost, question, currentYawDeg)
       }.onSuccess { res ->
+        if (reqEpoch != sessionEpoch || reqHost != _ui.value.host) return@onSuccess
+        if (!res.found) {
+          activeTargetId = null
+          activeTargetLabel = ""
+          activeTargetLocalized = false
+          activeTargetStale = false
+          _ui.value = _ui.value.copy(
+            mode = HudMode.ASK,
+            compass = _ui.value.compass.copy(
+              targetLabel = "",
+              hasNavigation = false,
+              localizationStatus = "NO_TARGET",
+              arrowGlyph = "",
+              turnInstruction = "No recent observation",
+              aligned = false,
+              answerText = res.answer,
+              memoryContext = null,
+              ambiguityNote = null,
+            ),
+          )
+          refreshCompassState()
+          wearablesManager.requestImmediateHudRefresh()
+          speakAloud("ask-${System.currentTimeMillis()}", res.answer)
+          return@onSuccess
+        }
+
         if (res.objects.isNotEmpty()) {
           spatialObjects = res.objects
         }
@@ -413,22 +486,43 @@ class WorldGitViewModel(application: Application) : AndroidViewModel(application
         if (matched != null) {
           activeTargetId = matched.id
           activeTargetLabel = matched.label
-        } else if (!res.targetObject.isNullOrBlank()) {
-          activeTargetLabel = res.targetObject
+        } else {
+          activeTargetId = res.targetObjectId
+          activeTargetLabel = res.targetObject.orEmpty()
         }
+        activeTargetLocalized = res.localized && matched != null && (wearerLocalized || !res.fromMemory)
+        activeTargetStale = res.stale
+        val memCtx = listOfNotNull(res.ageLabel, res.context).joinToString(" • ").takeIf { it.isNotBlank() }
         _ui.value = _ui.value.copy(
           mode = HudMode.ASK,
           compass = _ui.value.compass.copy(
             targetLabel = activeTargetLabel,
             answerText = res.answer,
+            memoryContext = memCtx,
+            ambiguityNote = res.ambiguity,
           ),
         )
         refreshCompassState()
         wearablesManager.requestImmediateHudRefresh()
         speakAloud("ask-${System.currentTimeMillis()}", res.answer)
       }.onFailure { err ->
+        if (reqEpoch != sessionEpoch || reqHost != _ui.value.host) return@onFailure
+        activeTargetId = null
+        activeTargetLabel = ""
+        activeTargetLocalized = false
+        activeTargetStale = false
         _ui.value = _ui.value.copy(
-          compass = _ui.value.compass.copy(answerText = "Cannot reach WorldGit server (${err.message})"),
+          compass = _ui.value.compass.copy(
+            targetLabel = "",
+            hasNavigation = false,
+            localizationStatus = "NO_TARGET",
+            arrowGlyph = "",
+            turnInstruction = "Server unreachable",
+            aligned = false,
+            answerText = "Cannot reach WorldGit server (${err.message})",
+            memoryContext = null,
+            ambiguityNote = null,
+          ),
         )
         wearablesManager.requestImmediateHudRefresh()
       }
@@ -458,21 +552,29 @@ class WorldGitViewModel(application: Application) : AndroidViewModel(application
       ),
     )
 
+    val reqEpoch = sessionEpoch
+    val reqHost = _ui.value.host
+
     speechJob = viewModelScope.launch(Dispatchers.IO) {
       val pcmBuffer = ByteArrayOutputStream()
       val endpoint = SpeechEndpoint(sampleRate = 16000, manualStop = false)
       val useGlassesMic = wearablesManager.snapshot.value.cameraStreaming
       var recorder: AudioRecord? = null
+      var streamStalled = false
+      val captureStartMs = SystemClock.elapsedRealtime()
 
       try {
         var fallbackToPhoneMic = !useGlassesMic
         if (useGlassesMic) {
           var gotAnyGlassesAudio = false
           val glassesStartMs = SystemClock.elapsedRealtime()
+          var lastChunkMs = glassesStartMs
           while (isActive && !manualStopSpeech) {
             val chunk = withTimeoutOrNull(80L) { glassesAudioQueue.receive() }
+            val nowMs = SystemClock.elapsedRealtime()
             if (chunk != null && chunk.size >= 2) {
               gotAnyGlassesAudio = true
+              lastChunkMs = nowMs
               pcmBuffer.write(chunk)
               val shorts = ShortArray(chunk.size / 2) { idx ->
                 val lo = chunk[idx * 2].toInt() and 0xFF
@@ -480,9 +582,21 @@ class WorldGitViewModel(application: Application) : AndroidViewModel(application
                 ((hi shl 8) or lo).toShort()
               }
               if (endpoint.add(shorts, shorts.size)) break
-            } else if (!gotAnyGlassesAudio && SystemClock.elapsedRealtime() - glassesStartMs >= 1000L) {
+            } else if (!gotAnyGlassesAudio && nowMs - glassesStartMs >= 1000L) {
               Log.w(TAG, "No glasses PCM audio after 1s, falling back to phone microphone")
               fallbackToPhoneMic = true
+              break
+            }
+            val deadlineReason = endpoint.wallClockDeadlineReason(
+              elapsedMs = nowMs - glassesStartMs,
+              sinceLastChunkMs = nowMs - lastChunkMs,
+              gotAnyAudio = gotAnyGlassesAudio,
+            )
+            if (deadlineReason != null) {
+              if (deadlineReason == "STREAM_STALLED") {
+                streamStalled = true
+              }
+              Log.w(TAG, "Glasses audio stopped due to deadline: $deadlineReason")
               break
             }
           }
@@ -492,11 +606,24 @@ class WorldGitViewModel(application: Application) : AndroidViewModel(application
           if (recorder == null) {
             throw IllegalStateException("Microphone permission required")
           }
+          if (recorder.state != AudioRecord.STATE_INITIALIZED) {
+            throw IllegalStateException("Microphone initialization failed")
+          }
           recorder.startRecording()
+          if (recorder.recordingState != AudioRecord.RECORDSTATE_RECORDING) {
+            throw IllegalStateException("Microphone failed to start recording")
+          }
           val buf = ShortArray(1024)
+          val phoneStartMs = SystemClock.elapsedRealtime()
+          var lastPhoneChunkMs = phoneStartMs
           while (isActive && !manualStopSpeech) {
             val count = recorder.read(buf, 0, buf.size)
+            val nowMs = SystemClock.elapsedRealtime()
+            if (count < 0) {
+              throw IllegalStateException("Microphone stream error ($count)")
+            }
             if (count > 0) {
+              lastPhoneChunkMs = nowMs
               val bytes = ByteArray(count * 2)
               for (i in 0 until count) {
                 bytes[i * 2] = (buf[i].toInt() and 0xFF).toByte()
@@ -505,6 +632,10 @@ class WorldGitViewModel(application: Application) : AndroidViewModel(application
               pcmBuffer.write(bytes)
               if (endpoint.add(buf, count)) break
             }
+            if (nowMs - phoneStartMs >= 25_000L || nowMs - lastPhoneChunkMs >= 2_500L) {
+              Log.w(TAG, "Phone microphone capture hit wall-clock deadline")
+              break
+            }
           }
         }
       } catch (e: CancellationException) {
@@ -512,7 +643,7 @@ class WorldGitViewModel(application: Application) : AndroidViewModel(application
       } catch (e: Exception) {
         _ui.value = _ui.value.copy(
           speech = _ui.value.speech.copy(active = false, finishing = false, error = e.message),
-          snackbar = e.message,
+          snackbar = "Microphone error: ${e.message}",
         )
         return@launch
       } finally {
@@ -520,11 +651,21 @@ class WorldGitViewModel(application: Application) : AndroidViewModel(application
         runCatching { recorder?.release() }
       }
 
+      if (reqEpoch != sessionEpoch || reqHost != _ui.value.host) {
+        cancelSpeech()
+        return@launch
+      }
+
       val audio = pcmBuffer.toByteArray()
       if (audio.size < 3200) {
+        val msg = if (streamStalled) {
+          "Glasses mic disconnected mid-recording — reconnect or use phone mic"
+        } else {
+          "No speech detected (silence)"
+        }
         _ui.value = _ui.value.copy(
-          speech = _ui.value.speech.copy(active = false, finishing = false, text = ""),
-          snackbar = "No speech detected",
+          speech = _ui.value.speech.copy(active = false, finishing = false, text = "", error = if (streamStalled) msg else null),
+          snackbar = msg,
         )
         return@launch
       }
@@ -533,29 +674,74 @@ class WorldGitViewModel(application: Application) : AndroidViewModel(application
         speech = _ui.value.speech.copy(finishing = true),
       )
 
-      val transcript = runCatching {
-        WorldGitApi.transcribePcm(_ui.value.host, audio)
-      }.getOrDefault("")
-      Log.d(TAG, "Speech transcript ($purpose, ${audio.size} bytes): '$transcript'")
+      val trRes = runCatching {
+        WorldGitApi.transcribePcmWithResult(reqHost, audio)
+      }.getOrElse { err ->
+        TranscriptionResult(
+          text = "",
+          status = TranscriptionStatus.SERVICE_UNAVAILABLE,
+          error = err.message ?: "Transcription failed",
+        )
+      }
+
+      if (reqEpoch != sessionEpoch || reqHost != _ui.value.host) {
+        cancelSpeech()
+        return@launch
+      }
+
+      val transcript = trRes.text
+      Log.d(TAG, "Speech transcript ($purpose, ${audio.size} bytes, ${trRes.status}, provider=${trRes.provider}): '$transcript'")
+
+      if (trRes.status == TranscriptionStatus.SERVICE_UNAVAILABLE) {
+        val msg = "Transcription service unavailable (${trRes.error ?: "check local/cloud ASR"})"
+        _ui.value = _ui.value.copy(
+          speech = _ui.value.speech.copy(
+            active = false,
+            finishing = false,
+            text = "",
+            error = msg,
+            providerDisclosure = trRes.disclosure,
+          ),
+          snackbar = msg,
+        )
+        return@launch
+      }
 
       if (transcript.isBlank()) {
+        val msg = if (streamStalled) {
+          "Glasses mic stalled — silence/partial audio only"
+        } else {
+          "Silence detected — try speaking closer"
+        }
         _ui.value = _ui.value.copy(
-          speech = _ui.value.speech.copy(active = false, finishing = false, text = ""),
-          snackbar = "Didn't catch that — try speaking closer",
+          speech = _ui.value.speech.copy(
+            active = false,
+            finishing = false,
+            text = "",
+            providerDisclosure = trRes.disclosure,
+          ),
+          snackbar = msg,
         )
         return@launch
       }
 
       if (purpose == SpeechPurpose.ASK_GEMINI) {
         _ui.value = _ui.value.copy(
-          speech = _ui.value.speech.copy(active = false, finishing = false, text = transcript),
+          speech = _ui.value.speech.copy(
+            active = false,
+            finishing = false,
+            text = transcript,
+            providerDisclosure = trRes.disclosure,
+          ),
+          snackbar = trRes.disclosure,
         )
         queryGeminiAndUpdateCompass(transcript)
       } else if (purpose == SpeechPurpose.PIN_NOTE && noteId != null) {
         val rawItem = _ui.value.yoloState.items.firstOrNull { it.id == noteId }
         val rawBox = rawItem?.box ?: noteBox
-        WorldGitApi.savePermanentNote(
-          host = _ui.value.host,
+        val stableId = java.util.UUID.randomUUID().toString().replace("-", "").take(12)
+        val pending = PendingNoteSave(
+          noteId = stableId,
           objectId = noteId,
           label = noteLabel ?: "object",
           text = transcript,
@@ -563,28 +749,77 @@ class WorldGitViewModel(application: Application) : AndroidViewModel(application
           frameWidth = _ui.value.yoloState.width,
           frameHeight = _ui.value.yoloState.height,
         )
-        val curSpeech = _ui.value.speech
-        val updatedById = curSpeech.notesByObjectId + (noteId to transcript)
-        val updatedByLabel = if (!noteLabel.isNullOrBlank()) {
-          curSpeech.notesByLabel + (noteLabel.lowercase() to transcript)
-        } else curSpeech.notesByLabel
-        val newEntry = SavedNote("local-${System.currentTimeMillis()}", noteId, noteLabel ?: "object", transcript, "You")
         _ui.value = _ui.value.copy(
-          savedNotes = (listOf(newEntry) + _ui.value.savedNotes).distinctBy { "${it.objectId}:${it.text}" },
-          speech = curSpeech.copy(
+          noteSaveStatus = "Saving…",
+          pendingRetryNote = pending,
+          speech = _ui.value.speech.copy(
             active = false,
             finishing = false,
             noteId = null,
             noteLabel = null,
             noteBox = null,
             text = transcript,
-            notesByObjectId = updatedById,
-            notesByLabel = updatedByLabel,
+            providerDisclosure = trRes.disclosure,
           ),
-          snackbar = "Pinned to ${noteLabel ?: "object"}: $transcript",
+          snackbar = "Saving note…",
         )
-        speakAloud("saved-$noteId", "Pinned $transcript")
+        executeNoteSave(pending, reqHost, reqEpoch)
       }
+    }
+  }
+
+  private suspend fun executeNoteSave(pending: PendingNoteSave, reqHost: String, reqEpoch: Int) {
+    val saveRes = WorldGitApi.savePermanentNote(
+      host = reqHost,
+      objectId = pending.objectId,
+      label = pending.label,
+      text = pending.text,
+      box = pending.box,
+      frameWidth = pending.frameWidth,
+      frameHeight = pending.frameHeight,
+      noteId = pending.noteId,
+    )
+    if (reqEpoch != sessionEpoch || reqHost != _ui.value.host) {
+      return
+    }
+    if (saveRes.discarded) {
+      _ui.value = _ui.value.copy(
+        noteSaveStatus = "Discarded (session changed)",
+        pendingRetryNote = null,
+        snackbar = "Note discarded because session was paused or cleared",
+      )
+      return
+    }
+    if (!saveRes.ok) {
+      _ui.value = _ui.value.copy(
+        noteSaveStatus = "Failed—Retry",
+        pendingRetryNote = pending,
+        snackbar = "Failed to save note (${saveRes.error ?: "server error"}) — Retry",
+      )
+      return
+    }
+    val curSpeech = _ui.value.speech
+    val updatedById = curSpeech.notesByObjectId + (pending.objectId to pending.text)
+    val confirmedId = saveRes.noteId ?: pending.noteId
+    val newEntry = SavedNote(confirmedId, pending.objectId, pending.label, pending.text, "You")
+    val statusText = if (saveRes.studioSynced) "Saved" else "Saved locally; Studio sync pending"
+    _ui.value = _ui.value.copy(
+      savedNotes = (listOf(newEntry) + _ui.value.savedNotes).distinctBy { it.noteId },
+      noteSaveStatus = statusText,
+      pendingRetryNote = null,
+      speech = curSpeech.copy(notesByObjectId = updatedById),
+      snackbar = "$statusText: ${pending.label}",
+    )
+    speakAloud("saved-${pending.objectId}", "$statusText: ${pending.text}")
+  }
+
+  fun retryPendingNoteSave() {
+    val pending = _ui.value.pendingRetryNote ?: return
+    val reqEpoch = sessionEpoch
+    val reqHost = _ui.value.host
+    _ui.value = _ui.value.copy(noteSaveStatus = "Saving…", snackbar = "Retrying note save…")
+    viewModelScope.launch(Dispatchers.IO) {
+      executeNoteSave(pending, reqHost, reqEpoch)
     }
   }
 
@@ -619,22 +854,42 @@ class WorldGitViewModel(application: Application) : AndroidViewModel(application
   }
 
   fun runCtrlZ() {
+    val reqEpoch = sessionEpoch
+    val reqHost = _ui.value.host
     viewModelScope.launch(Dispatchers.IO) {
-      val steps = WorldGitApi.runCtrlZ(_ui.value.host)
+      val steps = WorldGitApi.runCtrlZ(reqHost)
+      if (reqEpoch != sessionEpoch || reqHost != _ui.value.host) return@launch
       if (steps != null) {
-        _ui.value = _ui.value.copy(undoSteps = steps, snackbar = "Reverted latest step")
+        _ui.value = _ui.value.copy(
+          undoSteps = steps,
+          snackbar = "Restore instructions loaded (guide only)",
+        )
       } else {
-        _ui.value = _ui.value.copy(snackbar = "Ctrl+Z server unreachable")
+        _ui.value = _ui.value.copy(snackbar = "Restore server unreachable")
       }
     }
   }
 
   fun toggleImuRecording() {
+    if (_ui.value.memoryPaused && !_ui.value.imu.recording) {
+      _ui.value = _ui.value.copy(snackbar = "Resume privacy pause before recording IMU")
+      return
+    }
     val next = !_ui.value.imu.recording
+    if (next) {
+      imuSessionId = "imu-${System.currentTimeMillis()}"
+    } else {
+      imuSessionId = "glasses-live"
+    }
     _ui.value = _ui.value.copy(
       imu = _ui.value.imu.copy(
         recording = next,
-        statusNote = if (next) "Streaming 60Hz glasses IMU to Studio" else "Live 60Hz glasses telemetry",
+        sampleCount = if (next) 0 else _ui.value.imu.sampleCount,
+        statusNote = if (next) {
+          "Sensor 60Hz local; throttled upload (~4-10Hz) to $imuSessionId"
+        } else {
+          "Sensor 60Hz local; throttled upload (~4Hz) to session"
+        },
       ),
     )
   }
@@ -669,6 +924,9 @@ class WorldGitViewModel(application: Application) : AndroidViewModel(application
 
   fun togglePrivacy() {
     val next = !_ui.value.memoryPaused
+    sessionEpoch += 1
+    val reqEpoch = sessionEpoch
+    val reqHost = _ui.value.host
     if (next) {
       if (_ui.value.speech.active) cancelSpeech()
       _ui.value = _ui.value.copy(
@@ -676,14 +934,35 @@ class WorldGitViewModel(application: Application) : AndroidViewModel(application
         cameraPreview = null,
         yoloState = YoloState(status = "Privacy paused"),
         projectedYoloState = YoloState(status = "Privacy paused"),
+        imu = _ui.value.imu.copy(
+          recording = false,
+          statusNote = "IMU uploads paused during privacy pause",
+        ),
+        snackbar = "Paused locally… confirming with server",
       )
     } else {
       _ui.value = _ui.value.copy(
         memoryPaused = false,
         yoloState = YoloState(status = "Point glasses at objects to scan"),
+        imu = _ui.value.imu.copy(
+          statusNote = "Sensor 60Hz local; throttled upload (~4Hz) to session",
+        ),
+        snackbar = "Resumed locally… confirming with server",
       )
     }
-    viewModelScope.launch(Dispatchers.IO) { WorldGitApi.togglePrivacy(_ui.value.host, next) }
+    viewModelScope.launch(Dispatchers.IO) {
+      val res = WorldGitApi.togglePrivacy(reqHost, next)
+      if (reqEpoch != sessionEpoch || reqHost != _ui.value.host) return@launch
+      val msg = when {
+        !res.visionConfirmed && next -> "Paused locally; server confirmation unavailable"
+        !res.visionConfirmed && !next -> "Resumed locally; server confirmation unavailable"
+        !res.studioConfirmed && next -> "Paused on Vision; Studio confirmation unavailable"
+        !res.studioConfirmed && !next -> "Resumed on Vision; Studio confirmation unavailable"
+        next -> "Privacy paused (confirmed)"
+        else -> "Privacy resumed (confirmed)"
+      }
+      _ui.value = _ui.value.copy(snackbar = msg)
+    }
   }
 
   fun selectNextDetectedObject() {
@@ -698,11 +977,51 @@ class WorldGitViewModel(application: Application) : AndroidViewModel(application
   }
 
   fun clearSavedNotes() {
+    val reqEpoch = sessionEpoch
+    val reqHost = _ui.value.host
     _ui.value = _ui.value.copy(
-      savedNotes = emptyList(),
-      speech = _ui.value.speech.copy(notesByObjectId = emptyMap(), notesByLabel = emptyMap()),
+      snackbar = "Clearing session memory & pins…",
     )
-    viewModelScope.launch(Dispatchers.IO) { WorldGitApi.clearNotes(_ui.value.host) }
+    viewModelScope.launch(Dispatchers.IO) {
+      val res = WorldGitApi.clearNotes(reqHost)
+      if (reqEpoch != sessionEpoch || reqHost != _ui.value.host) return@launch
+      if (res.visionCleared) {
+        sessionEpoch += 1
+        activeTargetId = null
+        activeTargetLabel = ""
+        activeTargetLocalized = false
+        activeTargetStale = false
+        val msg = if (res.studioCleared) {
+          "Memory & Studio session cleared"
+        } else {
+          "Memory cleared; Studio deletion pending"
+        }
+        _ui.value = _ui.value.copy(
+          savedNotes = emptyList(),
+          noteSaveStatus = null,
+          pendingRetryNote = null,
+          speech = _ui.value.speech.copy(notesByObjectId = emptyMap()),
+          compass = _ui.value.compass.copy(
+            targetLabel = "",
+            hasNavigation = false,
+            localizationStatus = "NO_TARGET",
+            arrowGlyph = "",
+            turnInstruction = "Ask about an item",
+            aligned = false,
+            memoryContext = null,
+            ambiguityNote = null,
+          ),
+          snackbar = msg,
+        )
+      } else {
+        val msg = if (res.studioCleared) {
+          "Studio cleared; Vision clear failed — retry"
+        } else {
+          "Clear failed; server confirmation unavailable"
+        }
+        _ui.value = _ui.value.copy(snackbar = msg)
+      }
+    }
   }
 
   fun clearSnackbar() {
@@ -722,13 +1041,18 @@ class WorldGitViewModel(application: Application) : AndroidViewModel(application
       }
       refreshCompassState()
       val nowMs = System.currentTimeMillis()
-      if ((_ui.value.imu.recording || nowMs - lastImuPushMs > 250L) && nowMs - lastImuPushMs >= 100L) {
+      val reqHost = _ui.value.host
+      if (!_ui.value.memoryPaused &&
+        (_ui.value.imu.recording || nowMs - lastImuPushMs > 250L) &&
+        nowMs - lastImuPushMs >= 100L
+      ) {
         lastImuPushMs = nowMs
         if (_ui.value.imu.recording) {
           _ui.value = _ui.value.copy(imu = _ui.value.imu.copy(sampleCount = _ui.value.imu.sampleCount + 1))
         }
+        val sid = imuSessionId
         viewModelScope.launch(Dispatchers.IO) {
-          WorldGitApi.sendImuSample(_ui.value.host, yaw, pitch, roll)
+          WorldGitApi.sendImuSample(reqHost, yaw, pitch, roll, sessionId = sid)
         }
       }
     }
@@ -736,12 +1060,31 @@ class WorldGitViewModel(application: Application) : AndroidViewModel(application
   }
 
   private fun refreshCompassState() {
-    val targetObj = spatialObjects.firstOrNull {
-      (activeTargetId != null && it.id == activeTargetId) ||
-        it.label.equals(activeTargetLabel, ignoreCase = true)
-    } ?: spatialObjects.firstOrNull()
+    val targetObj = if (activeTargetId != null || activeTargetLabel.isNotBlank()) {
+      spatialObjects.firstOrNull {
+        (activeTargetId != null && it.id == activeTargetId) ||
+          (activeTargetLabel.isNotBlank() && it.label.equals(activeTargetLabel, ignoreCase = true))
+      }
+    } else null
 
-    val (angle, glyph, turn, aligned) = CompassMath.relativeTargetNav(currentYawDeg, wearerPos, targetObj)
+    val hasLocalizedNav = targetObj != null && activeTargetLocalized && !activeTargetStale && wearerLocalized
+    val (angle, glyph, turn, aligned) = if (hasLocalizedNav) {
+      CompassMath.relativeTargetNav(currentYawDeg, wearerPos, targetObj)
+    } else {
+      val fallbackTurn = when {
+        activeTargetLabel.isBlank() -> "Ask about an item"
+        activeTargetStale -> "Last seen (stale location)"
+        else -> "Last seen (no 3D direction)"
+      }
+      CompassMath.Tuple4(0f, "", fallbackTurn, false)
+    }
+    val locStatus = when {
+      hasLocalizedNav -> "LOCALIZED"
+      activeTargetLabel.isBlank() -> "NO_TARGET"
+      activeTargetStale -> "STALE"
+      else -> "UNLOCALIZED_2D"
+    }
+
     val prev = _ui.value.compass
     val next = prev.copy(
       headingDeg = currentYawDeg.roundToInt().toFloat(),
@@ -749,6 +1092,8 @@ class WorldGitViewModel(application: Application) : AndroidViewModel(application
       pitchDeg = currentPitchDeg.roundToInt().toFloat(),
       rollDeg = currentRollDeg.roundToInt().toFloat(),
       targetLabel = targetObj?.label ?: activeTargetLabel,
+      hasNavigation = hasLocalizedNav,
+      localizationStatus = locStatus,
       arrowAngleDeg = angle.roundToInt().toFloat(),
       arrowGlyph = glyph,
       turnInstruction = turn,
@@ -807,24 +1152,34 @@ class WorldGitViewModel(application: Application) : AndroidViewModel(application
           bitmap.compress(Bitmap.CompressFormat.JPEG, 72, baos)
           val jpeg = baos.toByteArray()
           val host = _ui.value.host
+          val reqEpoch = sessionEpoch
+          if (visionAttemptStartMs == 0L) {
+            visionAttemptStartMs = System.currentTimeMillis()
+          }
           viewModelScope.launch(Dispatchers.IO) {
             try {
               val res = WorldGitApi.postFrame(host, jpeg, pose)
+              if (reqEpoch != sessionEpoch || host != _ui.value.host || _ui.value.memoryPaused) return@launch
               lastVisionOkMs = System.currentTimeMillis()
-              if (_ui.value.memoryPaused) return@launch
+              visionConsecutiveFailures = 0
               visionHandler.post {
                 localTracker.correct(res.items, receivedAtNs / 1e9, SystemClock.elapsedRealtimeNanos() / 1e9, res.width, res.height)
               }
-              val noteItems = res.items.filter { !it.note.isNullOrBlank() }
-              if (noteItems.isNotEmpty()) {
+              val confidentNoteItems = res.items.filter { !it.note.isNullOrBlank() && !it.noteUncertain }
+              if (confidentNoteItems.isNotEmpty()) {
                 val cur = _ui.value.speech
-                val nextIds = cur.notesByObjectId + noteItems.associate { it.id to it.note!! }
-                val nextLabels = cur.notesByLabel + noteItems.associate { it.label.lowercase() to it.note!! }
-                _ui.value = _ui.value.copy(speech = cur.copy(notesByObjectId = nextIds, notesByLabel = nextLabels))
+                val nextIds = cur.notesByObjectId + confidentNoteItems.associate { it.id to it.note!! }
+                _ui.value = _ui.value.copy(speech = cur.copy(notesByObjectId = nextIds))
               }
             } catch (e: Exception) {
+              if (reqEpoch != sessionEpoch || host != _ui.value.host) return@launch
+              visionConsecutiveFailures += 1
               Log.w(TAG, "Frame upload skipped: ${e.message}")
-              if (lastVisionOkMs > 0L && System.currentTimeMillis() - lastVisionOkMs > 2500L) {
+              val nowMs = System.currentTimeMillis()
+              val offlineLongEnough = (lastVisionOkMs > 0L && nowMs - lastVisionOkMs > 2500L) ||
+                (lastVisionOkMs == 0L && visionAttemptStartMs > 0L && nowMs - visionAttemptStartMs > 2500L) ||
+                visionConsecutiveFailures >= 3
+              if (offlineLongEnough) {
                 val msg = "Vision server offline — reconnecting"
                 _ui.value = _ui.value.copy(
                   yoloState = YoloState(status = msg),
@@ -887,11 +1242,11 @@ class WorldGitViewModel(application: Application) : AndroidViewModel(application
         val s = cur.speech
         val dialStep = (c.arrowAngleDeg / 15f).roundToInt()
         val bodyText = when {
-          s.active && s.finishing -> "Asking Gemini 3.8 Flash..."
+          s.active && s.finishing -> "Checking memory & Studio..."
           s.active -> s.text.ifBlank { "Listening... tap Stop to ask" }.take(95)
-          else -> c.answerText.ifBlank { "Tap Ask to find an object with Gemini." }.take(110)
+          else -> c.answerText.ifBlank { "Tap Ask to find an item." }.take(110)
         }
-        val sig = "ASK:${c.targetLabel}:${c.turnInstruction}:$dialStep:$bodyText:${s.active}:${s.finishing}:${cur.memoryPaused}"
+        val sig = "ASK:${c.targetLabel}:${c.hasNavigation}:${c.turnInstruction}:$dialStep:$bodyText:${s.active}:${s.finishing}:${cur.memoryPaused}"
         GlassesHudPacket(signature = sig, minIntervalMs = if (s.active) 250L else 650L) {
           flexBox(direction = Direction.COLUMN, gap = 10, padding = 16) {
             flexBox(direction = Direction.ROW, gap = 8, crossAlignment = Alignment.CENTER) {
@@ -916,19 +1271,24 @@ class WorldGitViewModel(application: Application) : AndroidViewModel(application
               crossAlignment = Alignment.CENTER,
               flexGrow = 1f,
             ) {
-              flexBox(direction = Direction.COLUMN, flexGrow = 1f) {
-                image(
-                  bitmap = WorldGitHudRenderer.renderCompassDialBitmap(c, sizePx = 220),
-                  sizePreset = ImageSize.FILL,
-                )
+              if (c.hasNavigation) {
+                flexBox(direction = Direction.COLUMN, flexGrow = 1f) {
+                  image(
+                    bitmap = WorldGitHudRenderer.renderCompassDialBitmap(c, sizePx = 220),
+                    sizePreset = ImageSize.FILL,
+                  )
+                }
               }
               flexBox(direction = Direction.COLUMN, gap = 6, flexGrow = 2f) {
                 text(
-                  "${c.targetLabel.uppercase().take(18)} • ${c.cardinal} ${c.headingDeg.roundToInt()}°",
+                  "${(c.targetLabel.ifBlank { "MEMORY" }).uppercase().take(18)} • ${c.cardinal} ${c.headingDeg.roundToInt()}°",
                   style = TextStyle.META,
                   color = TextColor.SECONDARY,
                 )
-                text("${c.arrowGlyph}  ${c.turnInstruction}", style = TextStyle.HEADING)
+                text(
+                  if (c.hasNavigation) "${c.arrowGlyph}  ${c.turnInstruction}" else c.turnInstruction,
+                  style = TextStyle.HEADING,
+                )
                 text(bodyText, style = TextStyle.BODY)
               }
             }
@@ -1094,12 +1454,12 @@ class WorldGitViewModel(application: Application) : AndroidViewModel(application
               text("WorldGit • Ctrl+Z", style = TextStyle.HEADING)
             }
             flexBox(direction = Direction.COLUMN, gap = 8, padding = 18, background = FlexBoxBackground.CARD, flexGrow = 1f) {
-              text("Recent Spatial History", style = TextStyle.META, color = TextColor.SECONDARY)
+              text("Restore Instructions", style = TextStyle.META, color = TextColor.SECONDARY)
               text(stepText, style = TextStyle.BODY)
             }
             buttonGroup(alignment = ButtonGroupAlignment.CENTER) {
               button(
-                label = "Revert",
+                label = "Restore Guide",
                 style = ButtonStyle.PRIMARY,
                 iconName = IconName.ARROW_U_LEFT,
                 actionRole = ActionRole.PRIMARY,

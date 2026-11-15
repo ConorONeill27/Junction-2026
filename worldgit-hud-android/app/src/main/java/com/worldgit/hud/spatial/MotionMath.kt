@@ -445,7 +445,12 @@ object GlassesFramePixels {
   }
 }
 
-class SpeechEndpoint(private val sampleRate: Int = 16000, private val manualStop: Boolean = false) {
+class SpeechEndpoint(
+  private val sampleRate: Int = 16000,
+  private val manualStop: Boolean = false,
+  private val maxWallClockMs: Long = 25_000L,
+  private val stalledStreamMs: Long = 1_500L,
+) {
   var heardSpeech = false
     private set
   private var samples = 0L
@@ -473,6 +478,14 @@ class SpeechEndpoint(private val sampleRate: Int = 16000, private val manualStop
     return !manualStop && (samples >= sampleRate * 25L ||
       (heardSpeech && samples - lastVoice >= sampleRate * 11L / 10) ||
       (!heardSpeech && samples >= sampleRate * 7L))
+  }
+
+  fun wallClockDeadlineReason(elapsedMs: Long, sinceLastChunkMs: Long, gotAnyAudio: Boolean): String? {
+    if (manualStop) return null
+    if (elapsedMs >= maxWallClockMs) return "MAX_WALL_CLOCK"
+    if (gotAnyAudio && sinceLastChunkMs >= stalledStreamMs) return "STREAM_STALLED"
+    if (!heardSpeech && elapsedMs >= 7_000L) return "INITIAL_SILENCE_TIMEOUT"
+    return null
   }
 }
 
@@ -502,7 +515,7 @@ object CompassMath {
     wearerPos: Triple<Double, Double, Double>,
     target: SpatialObject?,
   ): Tuple4<Float, String, String, Boolean> {
-    if (target == null) return Tuple4(0f, "↑", "AHEAD", true)
+    if (target == null) return Tuple4(0f, "", "NO TARGET", false)
     val dx = target.x - wearerPos.first
     val dz = target.z - wearerPos.third
     val rawBearing = Math.toDegrees(atan2(dx, -dz))

@@ -34,6 +34,7 @@ data class YoloItem(
   val confidence: Double,
   val box: List<Double>,
   val note: String? = null,
+  val noteUncertain: Boolean = false,
 )
 
 data class YoloState(
@@ -64,6 +65,16 @@ enum class SpeechPurpose {
   PIN_NOTE,
 }
 
+data class PendingNoteSave(
+  val noteId: String,
+  val objectId: String,
+  val label: String,
+  val text: String,
+  val box: List<Double>?,
+  val frameWidth: Int,
+  val frameHeight: Int,
+)
+
 data class LiveSpeechState(
   val active: Boolean = false,
   val finishing: Boolean = false,
@@ -73,8 +84,8 @@ data class LiveSpeechState(
   val noteBox: List<Double>? = null,
   val text: String = "",
   val error: String? = null,
+  val providerDisclosure: String? = null,
   val notesByObjectId: Map<String, String> = emptyMap(),
-  val notesByLabel: Map<String, String> = emptyMap(),
 )
 
 data class CompassState(
@@ -82,19 +93,23 @@ data class CompassState(
   val cardinal: String = "N",
   val pitchDeg: Float = 0f,
   val rollDeg: Float = 0f,
-  val targetLabel: String = "bottle",
+  val targetLabel: String = "",
+  val hasNavigation: Boolean = false,
+  val localizationStatus: String = "NO_TARGET",
   val arrowAngleDeg: Float = 0f,
-  val arrowGlyph: String = "↑",
-  val turnInstruction: String = "AHEAD",
-  val aligned: Boolean = true,
-  val answerText: String = "Tap Ask to query Gemini about your room.",
+  val arrowGlyph: String = "",
+  val turnInstruction: String = "Ask about an item",
+  val aligned: Boolean = false,
+  val answerText: String = "Tap Ask to query recent glasses memory or mapped room objects.",
+  val memoryContext: String? = null,
+  val ambiguityNote: String? = null,
   val sensorSource: String = "READY",
 )
 
 data class ImuState(
   val recording: Boolean = false,
   val sampleCount: Int = 0,
-  val statusNote: String = "Live 60Hz glasses telemetry",
+  val statusNote: String = "Sensor 60Hz local; throttled upload (~4Hz) to session",
 )
 
 data class AppUiState(
@@ -116,6 +131,9 @@ data class AppUiState(
   val imu: ImuState = ImuState(),
   val undoSteps: List<String> = emptyList(),
   val savedNotes: List<SavedNote> = emptyList(),
+  val noteSaveStatus: String? = null,
+  val pendingRetryNote: PendingNoteSave? = null,
+  val notesSyncError: String? = null,
   val cameraPreview: Bitmap? = null,
   val hudMirror: Bitmap? = null,
   val ttsEnabled: Boolean = true,

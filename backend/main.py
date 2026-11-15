@@ -13,20 +13,22 @@ from typing import Any, Dict, List, Optional
 import httpx
 from dotenv import load_dotenv
 import numpy as np
-from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
+from fastapi import Depends, FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, Response
+from fastapi.responses import FileResponse, JSONResponse, Response
 from pathlib import Path
 from pydantic import BaseModel
 import tempfile
 
 from ai_services import (
+    GEMINI_MODEL,
     ai_status,
     analyze_frame_with_gemini,
     answer_space_question_with_gemini,
     generate_ctrl_z_instructions,
     synthesize_elevenlabs_tts,
     transcribe_pcm_with_gemini,
+    transcribe_pcm_with_gemini_result,
 )
 from db import SpatialDatabase
 from imu_fusion import ImuSessionStore
@@ -54,11 +56,26 @@ app = FastAPI(title="WorldGit Spatial Hub", version="0.3.0")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=[
+        "http://127.0.0.1:4173",
+        "http://127.0.0.1:5173",
+        "http://localhost:4173",
+        "http://localhost:5173",
+    ],
+    allow_origin_regex=r"^https?://(localhost|127\.0\.0\.1)(:\d+)?$",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+def _require_api_token(request: Request) -> None:
+    expected = (os.getenv("WORLDGIT_API_TOKEN") or "").strip()
+    if not expected:
+        return
+    supplied = (request.headers.get("X-WorldGit-Token") or "").strip()
+    if supplied != expected:
+        raise HTTPException(status_code=401, detail="Unauthorized")
 
 
 class SpatialObject(BaseModel):
@@ -162,6 +179,10 @@ class WorldState:
         self.objects: Dict[str, SpatialObject] = {}
         self.pins: Dict[str, SpatialPin] = {}
         self.session_object_ids: set[str] = set()
+        self.session_pin_ids: set[str] = set()
+        self.session_event_ids: set[str] = set()
+        self.privacy_paused: bool = False
+        self.privacy_epoch: int = 0
         self.snapshots: List[WorldSnapshot] = []
         self.points: List[List[float]] = _generate_room_point_cloud()
         self.wall_segments: List[List[float]] = []
@@ -175,6 +196,9 @@ class WorldState:
         self.scan_jobs: Dict[str, Dict[str, Any]] = {}
         self.clients: Dict[WebSocket, Dict[str, Optional[str]]] = {}
         self._seed_demo_world()
+        self.session_object_ids.update(self.db.list_session_records("object"))
+        self.session_pin_ids.update(self.db.list_session_records("pin"))
+        self.session_event_ids.update(self.db.list_session_records("event"))
 
     def _seed_demo_world(self) -> None:
         now = time.time()
@@ -549,7 +573,7 @@ class ResetCloudRequest(BaseModel):
     empty: bool = True
 
 
-@app.post("/api/reset-cloud")
+@app.post("/api/reset-cloud", dependencies=[Depends(_require_api_token)])
 async def reset_cloud(req: ResetCloudRequest) -> Dict[str, Any]:
     reconstructor.reset()
     if req.empty:
@@ -697,10 +721,38 @@ class ImuSessionUpload(BaseModel):
     samples: List[Dict[str, Any]] = []
 
 
-@app.post("/api/imu-sessions")
-async def upload_imu_session(payload: ImuSessionUpload) -> Dict[str, Any]:
+class PrivacyReq(BaseModel):
+    paused: bool
+
+
+@app.get("/api/privacy")
+async def get_privacy() -> Dict[str, Any]:
+    return {"paused": world.privacy_paused, "privacy_epoch": world.privacy_epoch}
+
+
+@app.post("/api/privacy", dependencies=[Depends(_require_api_token)])
+async def set_privacy(req: PrivacyReq) -> Dict[str, Any]:
+    world.privacy_paused = bool(req.paused)
+    world.privacy_epoch += 1
+    await broadcast_state()
+    return {"ok": True, "paused": world.privacy_paused, "privacy_epoch": world.privacy_epoch}
+
+
+@app.post("/api/imu-sessions", dependencies=[Depends(_require_api_token)])
+async def upload_imu_session(payload: ImuSessionUpload):
     """Stores a timestamped 9-axis IMU session captured on the Meta Ray-Ban Display glasses."""
+    if world.privacy_paused:
+        return JSONResponse(
+            {"ok": False, "paused": True, "discarded": True, "error": "Privacy pause is active"},
+            status_code=409,
+        )
+    req_epoch = world.privacy_epoch
     summary = imu_store.save_session(payload.model_dump())
+    if world.privacy_paused or world.privacy_epoch != req_epoch:
+        return JSONResponse(
+            {"ok": False, "paused": world.privacy_paused, "discarded": True, "error": "Privacy state changed during IMU upload"},
+            status_code=409,
+        )
     return {"ok": True, "session": summary}
 
 
@@ -754,7 +806,7 @@ async def _background_ingest_dat_scan(saved_vid: Path, imu_session_id: str) -> N
             world.active_world_id = wid
             idx["active_world_id"] = wid
             mgr.save_index(idx)
-            db.upsert_space_meta({
+            world.db.upsert_space_meta({
                 "world_id": wid,
                 "display_name": containing.get("label") or saved_vid.stem,
                 "owner_id": "usr-conor",
@@ -1001,7 +1053,7 @@ async def get_model_ply() -> FileResponse:
 
 @app.get("/api/aiven-status")
 async def get_aiven_status() -> Dict[str, Any]:
-    return db.status()
+    return world.db.status()
 
 
 @app.post("/api/localize-video")
@@ -1065,8 +1117,8 @@ async def localize_video_endpoint(request: Request) -> Dict[str, Any]:
         world.objects[obj.id] = obj
         world.pins[pin.id] = pin
         world.video_trail = list(result.get("video_trail", []))
-        db.upsert_object(obj.model_dump())
-        db.upsert_pin(pin.model_dump())
+        world.db.upsert_object(obj.model_dump())
+        world.db.upsert_pin(pin.model_dump())
         await broadcast_state()
         return {
             **result,
@@ -1104,14 +1156,14 @@ def _match_objects_for_query(q_raw: str, candidates: List[SpatialObject]) -> Lis
 @app.post("/api/ctrl-f")
 async def ctrl_f_search(req: CtrlFQuery) -> Dict[str, Any]:
     vid = resolve_viewer_id(req.viewer_id or WEARER_TO_USER.get(req.wearer_id))
-    visible = [o for o in world.objects.values() if can_user_view(o.model_dump(), vid, db)]
+    visible = [o for o in world.objects.values() if can_user_view(o.model_dump(), vid, world.db)]
     matches = _match_objects_for_query(req.query, visible)
     if not matches:
         return {"found": False, "message": f"No teammate has seen '{req.query}' yet."}
 
     target = matches[0]
     wearer = world.wearers.get(req.wearer_id)
-    events = db.list_object_events(world_id=target.world_id, object_id=target.id, limit=25)
+    events = world.db.list_object_events(world_id=target.world_id, object_id=target.id, limit=25)
     zone_label = target.zone_name or "Room"
     if not wearer:
         spoken = build_ask_answer(target.label, zone_label, 0.0, "nearby", events)
@@ -1142,12 +1194,12 @@ async def ctrl_f_search(req: CtrlFQuery) -> Dict[str, Any]:
 @app.get("/api/social/bootstrap")
 async def social_bootstrap(viewer_id: Optional[str] = None) -> Dict[str, Any]:
     vid = resolve_viewer_id(viewer_id)
-    users = db.list_users()
+    users = world.db.list_users()
     viewer = next((u for u in users if u["user_id"] == vid), {"user_id": "guest", "name": "Guest", "handle": "@guest", "avatar_color": "#64748b", "friend_code": "GUEST"})
-    friend_ids = set(db.list_friend_ids(vid)) if vid != "guest" else set()
+    friend_ids = set(world.db.list_friend_ids(vid)) if vid != "guest" else set()
     friends = [u for u in users if u["user_id"] in friend_ids]
-    groups = db.list_groups(user_id=vid) if vid != "guest" else []
-    spaces = [s for s in db.list_spaces_meta() if can_user_view(s, vid, db)]
+    groups = world.db.list_groups(user_id=vid) if vid != "guest" else []
+    spaces = [s for s in world.db.list_spaces_meta() if can_user_view(s, vid, world.db)]
     return {
         "viewer": viewer,
         "users": users,
@@ -1178,7 +1230,7 @@ async def create_profile(req: CreateProfileReq) -> Dict[str, Any]:
         "avatar_color": "#38bdf8",
         "friend_code": uuid.uuid4().hex[:6].upper(),
     }
-    db.upsert_user(user)
+    world.db.upsert_user(user)
     wid = f"wearer-{slug}"
     world.wearers[wid] = WearerState(
         wearer_id=wid,
@@ -1201,10 +1253,10 @@ class AddFriendReq(BaseModel):
 
 @app.post("/api/social/friends/add")
 async def add_friend_endpoint(req: AddFriendReq) -> Dict[str, Any]:
-    target = db.find_user_by_handle_or_code(req.target_handle_or_code)
+    target = world.db.find_user_by_handle_or_code(req.target_handle_or_code)
     if target is None:
         return {"ok": False, "error": f"No user found matching '{req.target_handle_or_code}'"}
-    db.add_friendship(req.user_id, target["user_id"])
+    world.db.add_friendship(req.user_id, target["user_id"])
     await broadcast_state()
     return {"ok": True, "friend": target}
 
@@ -1228,7 +1280,7 @@ async def create_group_endpoint(req: CreateGroupReq) -> Dict[str, Any]:
         "invite_code": uuid.uuid4().hex[:6].upper(),
         "member_ids": members,
     }
-    db.create_group(grp)
+    world.db.create_group(grp)
     await broadcast_state()
     return {"ok": True, "group": grp}
 
@@ -1240,10 +1292,10 @@ class JoinGroupReq(BaseModel):
 
 @app.post("/api/social/groups/join")
 async def join_group_endpoint(req: JoinGroupReq) -> Dict[str, Any]:
-    grp = db.find_group_by_invite(req.invite_code)
+    grp = world.db.find_group_by_invite(req.invite_code)
     if grp is None:
         return {"ok": False, "error": "Invalid group invite code"}
-    db.join_group(grp["group_id"], req.user_id)
+    world.db.join_group(grp["group_id"], req.user_id)
     await broadcast_state()
     return {"ok": True, "group": grp}
 
@@ -1329,7 +1381,7 @@ async def auto_index_space_endpoint(world_id: str, req: AutoIndexSpaceReq = Auto
 
 @app.post("/api/spaces/share")
 async def share_space_endpoint(req: ShareSpaceReq) -> Dict[str, Any]:
-    existing = next((s for s in db.list_spaces_meta() if s["world_id"] == req.world_id), None)
+    existing = next((s for s in world.db.list_spaces_meta() if s["world_id"] == req.world_id), None)
     meta = {
         "world_id": req.world_id,
         "display_name": req.display_name or (existing["display_name"] if existing else req.world_id),
@@ -1337,7 +1389,7 @@ async def share_space_endpoint(req: ShareSpaceReq) -> Dict[str, Any]:
         "audience_type": req.audience_type,
         "group_ids": req.group_ids,
     }
-    db.upsert_space_meta(meta)
+    world.db.upsert_space_meta(meta)
     await broadcast_state()
     return {"ok": True, "space": meta}
 
@@ -1384,10 +1436,13 @@ class ObjectSightingReq(BaseModel):
     unlocalized_2d: bool = False
 
 
-@app.post("/api/objects/sighting")
-async def record_object_sighting(req: ObjectSightingReq) -> Dict[str, Any]:
+@app.post("/api/objects/sighting", dependencies=[Depends(_require_api_token)])
+async def record_object_sighting(req: ObjectSightingReq):
+    if world.privacy_paused:
+        return JSONResponse({"ok": False, "paused": True, "skipped": "privacy_paused"}, status_code=409)
     if req.unlocalized_2d:
         return {"ok": True, "skipped": "unlocalized_2d"}
+    req_epoch = world.privacy_epoch
     now = time.time()
     slug = "".join(c if c.isalnum() else "-" for c in req.label.lower().strip()).strip("-")[:24] or "item"
     obj_id = f"obj-{slug}"
@@ -1410,6 +1465,8 @@ async def record_object_sighting(req: ObjectSightingReq) -> Dict[str, Any]:
         world_id=req.world_id,
         ts=now,
     )
+    if world.privacy_paused or world.privacy_epoch != req_epoch:
+        return JSONResponse({"ok": False, "paused": world.privacy_paused, "skipped": "privacy_epoch_changed"}, status_code=409)
 
     obj = SpatialObject(
         id=obj_id,
@@ -1425,10 +1482,14 @@ async def record_object_sighting(req: ObjectSightingReq) -> Dict[str, Any]:
         group_ids=prev.group_ids if prev else req.group_ids,
     )
     world.objects[obj.id] = obj
-    world.session_object_ids.add(obj.id)
+    if prev is None:
+        world.session_object_ids.add(obj.id)
+        world.db.track_session_record("object", obj.id)
     world.db.upsert_object(obj.model_dump())
     if event is not None:
         world.db.append_object_event(event)
+        world.session_event_ids.add(event["event_id"])
+        world.db.track_session_record("event", event["event_id"])
     await broadcast_state()
     return {"ok": True, "object": obj.model_dump(), "event_type": ev_type, "event": event}
 
@@ -1441,9 +1502,9 @@ async def get_object_history(
 ) -> Dict[str, Any]:
     vid = resolve_viewer_id(viewer_id)
     visible_obj_ids = {
-        o.id for o in world.objects.values() if can_user_view(o.model_dump(), vid, db)
+        o.id for o in world.objects.values() if can_user_view(o.model_dump(), vid, world.db)
     }
-    events = db.list_object_events(world_id=world_id, limit=120)
+    events = world.db.list_object_events(world_id=world_id, limit=120)
     filtered = [e for e in events if e["object_id"] in visible_obj_ids]
     if query:
         q = query.strip().lower()
@@ -1461,7 +1522,7 @@ class AskSpaceReq(BaseModel):
 @app.post("/api/ask")
 async def ask_space_qa(req: AskSpaceReq) -> Dict[str, Any]:
     vid = resolve_viewer_id(req.viewer_id or WEARER_TO_USER.get(req.wearer_id))
-    visible_objs = [o for o in world.objects.values() if can_user_view(o.model_dump(), vid, db)]
+    visible_objs = [o for o in world.objects.values() if can_user_view(o.model_dump(), vid, world.db)]
     if req.world_id:
         scoped = [o for o in visible_objs if o.world_id == req.world_id]
         if scoped:
@@ -1482,34 +1543,53 @@ async def ask_space_qa(req: AskSpaceReq) -> Dict[str, Any]:
     if target is None:
         return {
             "found": False,
-            "provider": "gemini-3.8-flash" if gemini_res else "local-matcher",
-            "spoken_answer": (
-                gemini_res["spoken_answer"]
-                if gemini_res
-                else f"I haven't seen '{req.query}' in your shared spaces yet."
-            ),
+            "localized": False,
+            "provider": "local-matcher",
+            "spoken_answer": "I don't have a recent observation or mapped location for that item.",
         }
 
     wearer_id = USER_TO_WEARER.get(vid, req.wearer_id)
     wearer = world.wearers.get(wearer_id) or world.wearers.get(req.wearer_id)
-    nav = _compute_directions(wearer, target) if wearer else {"distance_m": 0.0, "bearing_deg": 0, "arrow": "↑", "turn": "nearby", "directions": ""}
-    events = db.list_object_events(world_id=target.world_id, object_id=target.id, limit=25)
+    now = time.time()
+    age_s = max(0.0, now - float(target.timestamp))
+    wearer_age_s = max(0.0, now - float(wearer.last_seen)) if wearer else 9999.0
+    stale = age_s > 1800.0
+    localized = bool(wearer is not None and target.world_id == wearer.world_id and wearer_age_s <= 1800.0 and not stale)
+    if localized:
+        nav = _compute_directions(wearer, target)
+    else:
+        nav = {
+            "distance_m": 0.0,
+            "bearing_deg": 0,
+            "arrow": "",
+            "turn": "stale" if stale else "unlocalized",
+            "directions": "",
+        }
+    events = world.db.list_object_events(world_id=target.world_id, object_id=target.id, limit=25)
+    latest_move = next((e for e in reversed(events) if e.get("event_type") == "moved"), None)
     zone_label = target.zone_name or "Room"
-    spoken = (
-        gemini_res["spoken_answer"]
-        if gemini_res
-        else build_ask_answer(target.label, zone_label, nav["distance_m"], nav["turn"], events)
-    )
-    spaces_by_id = {s["world_id"]: s["display_name"] for s in db.list_spaces_meta()}
+    if latest_move is not None:
+        spoken = build_ask_answer(target.label, zone_label, nav["distance_m"], nav["turn"], events, localized=localized)
+        provider_used = "local-matcher"
+    elif gemini_res and localized:
+        spoken = gemini_res["spoken_answer"]
+        provider_used = GEMINI_MODEL
+    else:
+        spoken = build_ask_answer(target.label, zone_label, nav["distance_m"], nav["turn"], events, localized=localized)
+        provider_used = "local-matcher"
+    spaces_by_id = {s["world_id"]: s["display_name"] for s in world.db.list_spaces_meta()}
     return {
         "found": True,
-        "provider": "gemini-3.8-flash" if gemini_res else "local-matcher",
+        "localized": localized,
+        "stale": stale,
+        "age_seconds": round(age_s, 1),
+        "provider": provider_used,
         "world_id": target.world_id,
         "space_name": spaces_by_id.get(target.world_id, target.world_id),
         "object": target.model_dump(),
         "history": events,
-        "latest_move": next((e for e in reversed(events) if e.get("event_type") == "moved"), None),
-        "path": [wearer.position, target.position] if wearer else [target.position],
+        "latest_move": latest_move,
+        "path": [wearer.position, target.position] if (localized and wearer) else [],
         **nav,
         "spoken_answer": spoken,
     }
@@ -1523,27 +1603,59 @@ async def create_snapshot(label: str = "checkpoint") -> Dict[str, Any]:
 
 
 @app.post("/api/transcribe")
-async def transcribe_pcm_endpoint(request: Request) -> Dict[str, Any]:
+async def transcribe_pcm_endpoint(request: Request):
     body = await request.body()
     if len(body) < 3200:
-        return {"text": "", "model": "nvidia/parakeet-unified-en-0.6b", "device": "cuda:0"}
+        return {
+            "text": "",
+            "status": "silence",
+            "model": "local-vad",
+            "provider": "local-vad",
+            "device": "local",
+            "audio_left_local": False,
+        }
     # Try local Parakeet server on :8765 first; fall back to Gemini 3.8 Flash audio ASR
     if request.headers.get("X-Relay-From-8765") != "1":
+        relay_headers = {"Content-Type": "application/octet-stream", "X-Sample-Rate": "16000"}
+        token = (os.getenv("WORLDGIT_API_TOKEN") or "").strip()
+        if token:
+            relay_headers["X-WorldGit-Token"] = token
         try:
             async with httpx.AsyncClient(timeout=3.5) as client:
                 r = await client.post(
                     "http://127.0.0.1:8765/api/transcribe",
                     content=body,
-                    headers={"Content-Type": "application/octet-stream", "X-Sample-Rate": "16000"},
+                    headers=relay_headers,
                 )
                 if r.status_code == 200:
                     data = r.json()
                     if data.get("text"):
+                        data.setdefault("provider", data.get("model") or "parakeet-local")
+                        data.setdefault("audio_left_local", False)
                         return data
         except Exception:
             pass
-    text = await transcribe_pcm_with_gemini(body, 16000)
-    return {"text": text, "model": "nvidia/parakeet-unified-en-0.6b", "device": "cuda:0"}
+    res = await transcribe_pcm_with_gemini_result(body, 16000)
+    if res["status"] == "unavailable":
+        return JSONResponse(
+            {
+                "error": res.get("error", "Transcription service unavailable"),
+                "status": "unavailable",
+                "provider": res["provider"],
+                "device": res["device"],
+                "audio_left_local": res["audio_left_local"],
+            },
+            status_code=503,
+        )
+    return {
+        "text": res["text"],
+        "status": res["status"],
+        "model": res["provider"],
+        "provider": res["provider"],
+        "device": res["device"],
+        "audio_left_local": res["audio_left_local"],
+        "disclosure": res.get("disclosure", ""),
+    }
 
 
 @app.get("/api/diff")
@@ -1562,19 +1674,19 @@ async def ctrl_z_undo() -> Dict[str, Any]:
     }
 
 
-@app.post("/api/pin")
+@app.post("/api/pin", dependencies=[Depends(_require_api_token)])
 async def add_pin(pin: SpatialPin) -> Dict[str, Any]:
     if not pin.id:
         pin.id = f"pin-{uuid.uuid4().hex[:8]}"
     if not pin.created_at:
         pin.created_at = time.time()
     if not pin.author_id:
-        matched_user = next((u for u in db.list_users() if u["name"].lower() == pin.author.lower()), None)
+        matched_user = next((u for u in world.db.list_users() if u["name"].lower() == pin.author.lower()), None)
         if matched_user:
             pin.author_id = matched_user["user_id"]
     world.pins[pin.id] = pin
     pin_dict = pin.model_dump()
-    db.upsert_pin(pin_dict)
+    world.db.upsert_pin(pin_dict)
     await broadcast_state()
     return {"ok": True, "pin": pin_dict, **pin_dict}
 
@@ -1623,8 +1735,11 @@ def _raycast_world_point(
     return [round(float(v), 3) for v in pt]
 
 
-@app.post("/api/pin-from-hud")
-async def add_pin_from_hud(req: HudPinRequest) -> Dict[str, Any]:
+@app.post("/api/pin-from-hud", dependencies=[Depends(_require_api_token)])
+async def add_pin_from_hud(req: HudPinRequest):
+    if world.privacy_paused:
+        return JSONResponse({"ok": False, "paused": True, "discarded": True, "error": "Memory and capture are paused"}, status_code=409)
+    req_epoch = world.privacy_epoch
     if req.position_hint and len(req.position_hint) == 3:
         pos = [round(float(v), 3) for v in req.position_hint]
     else:
@@ -1647,6 +1762,9 @@ async def add_pin_from_hud(req: HudPinRequest) -> Dict[str, Any]:
         direction /= max(1e-6, float(np.linalg.norm(direction)))
         pos = _raycast_world_point(origin, direction, world.points)
 
+    if world.privacy_paused or world.privacy_epoch != req_epoch:
+        return JSONResponse({"ok": False, "paused": world.privacy_paused, "discarded": True, "error": "Session cleared or paused during pin save"}, status_code=409)
+
     pin_id = req.id or f"pin-{uuid.uuid4().hex[:8]}"
     pin = SpatialPin(
         id=pin_id,
@@ -1659,38 +1777,59 @@ async def add_pin_from_hud(req: HudPinRequest) -> Dict[str, Any]:
         age_label="just now",
     )
     world.pins[pin.id] = pin
-    db.upsert_pin(pin.model_dump())
+    world.session_pin_ids.add(pin.id)
+    world.db.upsert_pin(pin.model_dump())
+    world.db.track_session_record("pin", pin.id)
     await broadcast_state()
     return {"ok": True, "position": pos, "pin": pin.model_dump()}
 
 
-@app.delete("/api/session")
+@app.delete("/api/session", dependencies=[Depends(_require_api_token)])
 async def clear_session_records() -> Dict[str, Any]:
-    """Wipe forwarded HUD pins, object sighting events, and session-added sightings."""
-    pins_cleared = len(world.pins)
-    world.pins.clear()
-    db.clear_pins()
-    db.clear_object_events()
+    """Wipe session-scoped forwarded HUD pins, session object events, and session-added sightings."""
+    world.privacy_epoch += 1
+    session_pins = set(world.session_pin_ids) | set(world.db.list_session_records("pin"))
+    session_events = set(world.session_event_ids) | set(world.db.list_session_records("event"))
+    session_objects = set(world.session_object_ids) | set(world.db.list_session_records("object"))
+
+    pins_cleared = 0
+    for pid in list(session_pins):
+        if pid in world.pins:
+            del world.pins[pid]
+            pins_cleared += 1
+        world.db.delete_pin(pid)
+
+    events_cleared = 0
+    for eid in list(session_events):
+        world.db.delete_object_event(eid)
+        events_cleared += 1
+
     removed_objects = 0
-    for oid in list(world.session_object_ids):
+    for oid in list(session_objects):
         if oid in world.objects:
             del world.objects[oid]
             removed_objects += 1
-        db.delete_object(oid)
+        world.db.delete_object(oid)
+
+    world.session_pin_ids.clear()
+    world.session_event_ids.clear()
     world.session_object_ids.clear()
+    world.db.clear_session_records()
     await broadcast_state()
     return {
         "ok": True,
         "pins_cleared": pins_cleared,
+        "events_cleared": events_cleared,
         "objects_cleared": removed_objects,
         "cleared": True,
+        "scoped": True,
     }
 
 
-@app.post("/api/object")
+@app.post("/api/object", dependencies=[Depends(_require_api_token)])
 async def upsert_object(obj: SpatialObject) -> Dict[str, Any]:
     world.objects[obj.id] = obj
-    db.upsert_object(obj.model_dump())
+    world.db.upsert_object(obj.model_dump())
     await broadcast_state()
     return obj.model_dump()
 
@@ -1840,7 +1979,7 @@ async def analyze_frame(req: FrameAnalysisRequest) -> Dict[str, Any]:
             confidence=float(det.get("confidence", 0.9)),
         )
         world.objects[obj.id] = obj
-        db.upsert_object(obj.model_dump())
+        world.db.upsert_object(obj.model_dump())
         created_objects.append(obj.model_dump())
 
     await broadcast_state()
@@ -1889,7 +2028,7 @@ async def ws_stream(websocket: WebSocket) -> None:
 
             elif msg_type == "pose":
                 uid = msg.get("user_id") or WEARER_TO_USER.get(msg["wearer_id"])
-                u = db.get_user(uid) if uid else None
+                u = world.db.get_user(uid) if uid else None
                 w = WearerState(
                     wearer_id=msg["wearer_id"],
                     name=msg.get("name") or (u["name"] if u else msg["wearer_id"]),

@@ -1,7 +1,9 @@
 # WorldGit — Explainer & Architecture Guide
 
-> **Version Control for the Physical World.**  
-> Multiplayer Spatial Memory (`Ctrl+F`, `Ctrl+Z`, `git diff`, Spatial Pins & *Friend's World*) for **Meta Ray-Ban Display** glasses.
+> **Canonical Reference:** See [`docs/META_SUBMISSION.md`](docs/META_SUBMISSION.md) for the authoritative specification of live hardware behavior, privacy boundaries, provenance labels, and current limitations. The sections below summarize the broader Studio & Web simulator architecture (including pre-reconstructed rooms and seeded examples):
+> - **Live observations vs. pre-reconstructed rooms:** Unlocalized 2D glasses detections live in `:8765` `ObjectMemoryStore` with last-seen age and neighbor context; `[x, y, z]` spatial paths and raycasted HUD pins apply only when the target exists in an active pre-reconstructed or explicitly scanned 3D room.
+> - **Restore instructions (`Ctrl+Z`):** `Ctrl+Z` computes and displays step-by-step **restore instructions** between snapshots; it does not physically move or revert objects.
+> - **Demo identity & seeded data:** Studio demo wearers/worksite fixtures (`Alex`, `Conor`, `Red DeWalt Drill`, etc.) are seeded examples, and `viewer_id` is a local demo selector rather than authenticated multi-user security.
 
 ---
 
@@ -11,15 +13,15 @@ Software engineers take `Ctrl+F`, `Ctrl+Z`, and `git diff` for granted. In the p
 
 **WorldGit** turns every pair of **Meta Ray-Ban Display** glasses into a node in a **shared spatial memory network**:
 
-1. **Passive Multiplayer 3D Mapping (Clearing the Fog of War)**  
-   As teammates wear their glasses and walk through a room or worksite, keyframes + pose estimates stream to the Spatial Hub (`backend/`) and Modal GPU worker (`gpu_worker/`), continuously building a shared colored 3D point cloud.
-2. **`Ctrl+F` Physical Search + 3D Guidance**  
-   Ask your glasses: *"Where is the 10mm socket wrench?"* or *"Find the Red DeWalt Drill."* Even if **you** never looked at it, if a teammate walked past it 14 minutes ago, WorldGit locates its exact `[x, y, z]` world coordinate, projects a 3D walking path on the Command Center, displays distance/direction on your 600×600 Meta HUD, and speaks turn-by-turn guidance via ElevenLabs.
+1. **Explicit Room Mapping (`POST /api/dat-scans` / Pre-Reconstructed Rooms)**  
+   Pre-reconstructed room point clouds (`world_1`) or explicit uploaded video + IMU scans build the Studio 3D map (`backend/` + optional GPU reconstruction). Live glasses frame detections that are not localized into a 3D map stay in live 2D object memory (`:8765`).
+2. **`Ctrl+F` & Live Memory Search**  
+   Ask your glasses: *"Where did I leave my bottle?"* or *"Where is the Red DeWalt Drill?"* Live object memory returns last-seen context and age (`"Last seen 4 minutes ago beside the laptop"`); when an object is localized in an active 3D map, Studio also provides approximate `[x, y, z]` guidance and turn cues.
 3. **Spatial Voice Triggers & *Friend's World***  
-   - **Worksite / Team Triggers:** Anchor live safety hazards (*"Live 240V conduit behind drywall"*) or procedural notes to 3D coordinates. When any teammate walks within `trigger_radius_m`, the note whispers into their glasses automatically.
-   - **Friend's World (Persistent Social Layer):** Multi-year memories anchored to real-world places across a city (e.g., *"Sam • 2 years ago: My favourite flat white in Helsinki — ask for the oat cortado"*).
-4. **Reality `git diff` & `Ctrl+Z` Undo**  
-   Compare two spatial snapshots (`pass-1-initial` vs `pass-2-current`) to see what `MOVED`, went `MISSING`, or was `ADDED`. Trigger **`Ctrl+Z`** to receive step-by-step physical restore instructions (e.g., *"Move Red DeWalt Drill 2.4m back to Workbench A"*).
+   - **Room / Team Notes:** Anchor live notes onto detected objects (`SpatialNoteStore` + approximate Studio raycast pins when a 3D map is active) or view seeded demo reviews.
+   - **Friend's World (Seeded & Local Demo Layer):** Seeded demo memories and place anchors (e.g., demo cafe/restaurant pins via `seed_demo_places.py`).
+4. **Reality `git diff` & `Ctrl+Z` Restore Instructions**  
+   Compare two spatial snapshots (`pass-1-initial` vs `pass-2-current`) to inspect `MOVED`, `MISSING`, or `ADDED` entries. Trigger **`Ctrl+Z`** to generate step-by-step **restore instructions** (guide only — e.g., *"Move Red DeWalt Drill 2.4m back to Workbench A"*).
 5. **Live Co-Op Crew Minimap**  
    Track every wearer's live `[x, y, z]` position, yaw, and gaze cone in real time across the 3D Command Center and HUD.
 

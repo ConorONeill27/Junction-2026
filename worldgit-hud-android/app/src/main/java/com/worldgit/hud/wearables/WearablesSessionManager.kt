@@ -145,7 +145,7 @@ class WearablesSessionManager(
                   it.linkState == LinkState.CONNECTED && it.isDisplayCapable()
                 }
                 _snapshot.value = _snapshot.value.copy(
-                  connectedDeviceName = readyDev?.name ?: _snapshot.value.connectedDeviceName,
+                  connectedDeviceName = readyDev?.name,
                   firmwareUpdateRequired = needsFw,
                 )
               }

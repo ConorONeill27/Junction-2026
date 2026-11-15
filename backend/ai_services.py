@@ -4,6 +4,7 @@ AI services for WorldGit:
 - OpenAI API: reasoning fallback
 - ElevenLabs API: whispered spatial TTS with browser SpeechSynthesis fallback
 """
+import asyncio
 import base64
 import json
 import os
@@ -17,6 +18,7 @@ import httpx
 _ENV_PATH = Path(__file__).resolve().parent / ".env"
 load_dotenv(_ENV_PATH, override=True)
 GEMINI_MODEL = "gemini-3.8-flash"
+CLOUD_CALL_TIMEOUT_S = float(os.getenv("WORLDGIT_CLOUD_TIMEOUT_S", "12.0"))
 
 
 def _get_gemini_key() -> str:
@@ -57,21 +59,26 @@ async def analyze_frame_with_gemini(
 
     if gemini_key and clean_b64:
         try:
-            from google import genai
-            from google.genai import types
+            def _call_gemini_frame():
+                from google import genai
+                from google.genai import types
 
-            client = genai.Client(api_key=gemini_key)
-            img_bytes = base64.b64decode(clean_b64)
-            response = client.models.generate_content(
-                model=GEMINI_MODEL,
-                contents=[
-                    types.Part.from_bytes(data=img_bytes, mime_type="image/jpeg"),
-                    prompt,
-                ],
-            )
+                client = genai.Client(api_key=gemini_key)
+                img_bytes = base64.b64decode(clean_b64)
+                return client.models.generate_content(
+                    model=GEMINI_MODEL,
+                    contents=[
+                        types.Part.from_bytes(data=img_bytes, mime_type="image/jpeg"),
+                        prompt,
+                    ],
+                )
+
+            response = await asyncio.wait_for(asyncio.to_thread(_call_gemini_frame), timeout=CLOUD_CALL_TIMEOUT_S)
             detections = _extract_json_array(response.text or "")
             if detections:
-                return {"provider": "gemini-2.5-flash", "detections": detections}
+                return {"provider": GEMINI_MODEL, "detections": detections}
+        except asyncio.TimeoutError:
+            gemini_err = f"timeout>{CLOUD_CALL_TIMEOUT_S}s"
         except Exception as exc:
             gemini_err = str(exc)
         else:
@@ -81,25 +88,28 @@ async def analyze_frame_with_gemini(
 
     if openai_key and clean_b64:
         try:
-            from openai import OpenAI
+            def _call_oai_frame():
+                from openai import OpenAI
 
-            oai = OpenAI(api_key=openai_key)
-            resp = oai.chat.completions.create(
-                model="gpt-4o-mini",
-                messages=[
-                    {
-                        "role": "user",
-                        "content": [
-                            {"type": "text", "text": prompt},
-                            {
-                                "type": "image_url",
-                                "image_url": {"url": f"data:image/jpeg;base64,{clean_b64}"},
-                            },
-                        ],
-                    }
-                ],
-                max_tokens=300,
-            )
+                oai = OpenAI(api_key=openai_key, timeout=CLOUD_CALL_TIMEOUT_S)
+                return oai.chat.completions.create(
+                    model="gpt-4o-mini",
+                    messages=[
+                        {
+                            "role": "user",
+                            "content": [
+                                {"type": "text", "text": prompt},
+                                {
+                                    "type": "image_url",
+                                    "image_url": {"url": f"data:image/jpeg;base64,{clean_b64}"},
+                                },
+                            ],
+                        }
+                    ],
+                    max_tokens=300,
+                )
+
+            resp = await asyncio.wait_for(asyncio.to_thread(_call_oai_frame), timeout=CLOUD_CALL_TIMEOUT_S)
             text = resp.choices[0].message.content or ""
             detections = _extract_json_array(text)
             if detections:
@@ -159,31 +169,37 @@ async def generate_ctrl_z_instructions(diff: Dict[str, Any]) -> Dict[str, Any]:
 
     if gemini_key:
         try:
-            from google import genai
+            def _call_gemini_ctrlz():
+                from google import genai
 
-            client = genai.Client(api_key=gemini_key)
-            resp = client.models.generate_content(
-                model=GEMINI_MODEL,
-                contents=instruction_prompt,
-            )
+                client = genai.Client(api_key=gemini_key)
+                return client.models.generate_content(
+                    model=GEMINI_MODEL,
+                    contents=instruction_prompt,
+                )
+
+            resp = await asyncio.wait_for(asyncio.to_thread(_call_gemini_ctrlz), timeout=CLOUD_CALL_TIMEOUT_S)
             match = re.search(r"\[[\s\S]*\]", resp.text or "")
             if match:
                 steps = json.loads(match.group(0))
                 if isinstance(steps, list) and steps:
-                    return {"provider": "gemini-2.5-flash", "undo_steps": [str(s) for s in steps]}
+                    return {"provider": GEMINI_MODEL, "undo_steps": [str(s) for s in steps]}
         except Exception:
             pass
 
     if openai_key:
         try:
-            from openai import OpenAI
+            def _call_oai_ctrlz():
+                from openai import OpenAI
 
-            oai = OpenAI(api_key=openai_key)
-            resp = oai.chat.completions.create(
-                model="gpt-4o-mini",
-                messages=[{"role": "user", "content": instruction_prompt}],
-                max_tokens=220,
-            )
+                oai = OpenAI(api_key=openai_key, timeout=CLOUD_CALL_TIMEOUT_S)
+                return oai.chat.completions.create(
+                    model="gpt-4o-mini",
+                    messages=[{"role": "user", "content": instruction_prompt}],
+                    max_tokens=220,
+                )
+
+            resp = await asyncio.wait_for(asyncio.to_thread(_call_oai_ctrlz), timeout=CLOUD_CALL_TIMEOUT_S)
             match = re.search(r"\[[\s\S]*\]", resp.choices[0].message.content or "")
             if match:
                 steps = json.loads(match.group(0))
@@ -268,10 +284,13 @@ async def answer_space_question_with_gemini(
         f"Objects: {json.dumps(compact)}"
     )
     try:
-        from google import genai
+        def _call_gemini_ask():
+            from google import genai
 
-        client = genai.Client(api_key=gemini_key)
-        resp = client.models.generate_content(model=GEMINI_MODEL, contents=prompt)
+            client = genai.Client(api_key=gemini_key)
+            return client.models.generate_content(model=GEMINI_MODEL, contents=prompt)
+
+        resp = await asyncio.wait_for(asyncio.to_thread(_call_gemini_ask), timeout=CLOUD_CALL_TIMEOUT_S)
         match = re.search(r"\{[\s\S]*\}", resp.text or "")
         if match:
             parsed = json.loads(match.group(0))
@@ -285,21 +304,52 @@ async def answer_space_question_with_gemini(
     return None
 
 
-async def transcribe_pcm_with_gemini(pcm_bytes: bytes, sample_rate: int = 16000) -> str:
-    """Transcribe 16-bit mono PCM audio using Gemini 3.8 Flash."""
-    gemini_key = _get_gemini_key()
-    if not gemini_key or len(pcm_bytes) < 3200:
-        return ""
+async def transcribe_pcm_with_gemini_result(pcm_bytes: bytes, sample_rate: int = 16000) -> Dict[str, Any]:
+    """Transcribe 16-bit mono PCM audio using Gemini cloud ASR with bounded timeout & explicit status."""
+    if len(pcm_bytes) < 3200:
+        return {
+            "status": "silence",
+            "text": "",
+            "provider": "local-vad",
+            "device": "local",
+            "audio_left_local": False,
+            "error": "",
+        }
     import io
     import wave
     import numpy as np
 
     samples = np.frombuffer(pcm_bytes[: len(pcm_bytes) - (len(pcm_bytes) % 2)], dtype="<i2")
     if samples.size == 0:
-        return ""
+        return {
+            "status": "silence",
+            "text": "",
+            "provider": "local-vad",
+            "device": "local",
+            "audio_left_local": False,
+            "error": "",
+        }
     rms = float(np.sqrt(np.mean(samples.astype(np.float64) ** 2)))
     if rms < 110.0:
-        return ""
+        return {
+            "status": "silence",
+            "text": "",
+            "provider": "local-vad",
+            "device": "local",
+            "audio_left_local": False,
+            "error": "",
+        }
+
+    gemini_key = _get_gemini_key()
+    if not gemini_key:
+        return {
+            "status": "unavailable",
+            "text": "",
+            "provider": "none",
+            "device": "none",
+            "audio_left_local": False,
+            "error": "No local Parakeet ASR or GEMINI_API_KEY configured",
+        }
 
     buf = io.BytesIO()
     with wave.open(buf, "wb") as wf:
@@ -309,21 +359,62 @@ async def transcribe_pcm_with_gemini(pcm_bytes: bytes, sample_rate: int = 16000)
         wf.writeframes(samples.tobytes())
 
     try:
-        from google import genai
-        from google.genai import types
+        def _call_gemini_asr():
+            from google import genai
+            from google.genai import types
 
-        client = genai.Client(api_key=gemini_key)
-        resp = client.models.generate_content(
-            model=GEMINI_MODEL,
-            contents=[
-                types.Part.from_bytes(data=buf.getvalue(), mime_type="audio/wav"),
-                "Transcribe ONLY the exact words spoken in this short voice note. "
-                "Do not add quotes, prefixes, or commentary. If no clear speech is audible, return NOTHING.",
-            ],
-        )
+            client = genai.Client(api_key=gemini_key)
+            return client.models.generate_content(
+                model=GEMINI_MODEL,
+                contents=[
+                    types.Part.from_bytes(data=buf.getvalue(), mime_type="audio/wav"),
+                    "Transcribe ONLY the exact words spoken in this short voice note. "
+                    "Do not add quotes, prefixes, or commentary. If no clear speech is audible, return NOTHING.",
+                ],
+            )
+
+        resp = await asyncio.wait_for(asyncio.to_thread(_call_gemini_asr), timeout=CLOUD_CALL_TIMEOUT_S)
         text = (resp.text or "").strip().strip('"').strip("'")
-        if text.upper() == "NOTHING":
-            return ""
-        return text[:240]
-    except Exception:
-        return ""
+        if text.upper() == "NOTHING" or not text:
+            return {
+                "status": "silence",
+                "text": "",
+                "provider": GEMINI_MODEL,
+                "device": "cloud",
+                "audio_left_local": True,
+                "disclosure": "Audio sent to cloud Gemini ASR",
+                "error": "",
+            }
+        return {
+            "status": "ok",
+            "text": text[:240],
+            "provider": GEMINI_MODEL,
+            "device": "cloud",
+            "audio_left_local": True,
+            "disclosure": "Audio sent to cloud Gemini ASR",
+            "error": "",
+        }
+    except asyncio.TimeoutError:
+        return {
+            "status": "unavailable",
+            "text": "",
+            "provider": GEMINI_MODEL,
+            "device": "cloud",
+            "audio_left_local": True,
+            "error": f"Gemini cloud ASR timed out after {CLOUD_CALL_TIMEOUT_S:.0f}s",
+        }
+    except Exception as exc:
+        return {
+            "status": "unavailable",
+            "text": "",
+            "provider": GEMINI_MODEL,
+            "device": "cloud",
+            "audio_left_local": True,
+            "error": f"Gemini cloud ASR failed: {type(exc).__name__}",
+        }
+
+
+async def transcribe_pcm_with_gemini(pcm_bytes: bytes, sample_rate: int = 16000) -> str:
+    """Transcribe 16-bit mono PCM audio using Gemini 3.8 Flash."""
+    res = await transcribe_pcm_with_gemini_result(pcm_bytes, sample_rate=sample_rate)
+    return str(res.get("text") or "")

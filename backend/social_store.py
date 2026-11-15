@@ -168,8 +168,10 @@ def build_ask_answer(
     distance_m: float,
     turn: str,
     events: List[Dict[str, Any]],
+    localized: bool = True,
 ) -> str:
-    """Format a natural spoken answer explaining who placed/moved the item and where it is now."""
+    """Format a natural spoken answer explaining who placed/moved the item and where it was last seen."""
+    loc_suffix = f" ({distance_m}m {turn})" if localized else ""
     moved_events = [e for e in events if e.get("event_type") == "moved"]
     if moved_events:
         latest = moved_events[-1]
@@ -179,19 +181,19 @@ def build_ask_answer(
         placed = next((e for e in events if e.get("event_type") == "placed"), None)
         if placed and placed.get("actor_name") and placed["actor_name"] != mover:
             return (
-                f"{placed['actor_name']} left your {item_label} at {from_z}, "
-                f"and {mover} moved it to {to_z} ({distance_m}m {turn})."
+                f"Last seen with {placed['actor_name']} at {from_z}, "
+                f"and {mover} moved the {item_label} to {to_z}{loc_suffix}."
             )
         return (
-            f"{mover} moved your {item_label} from {from_z} to {to_z} "
-            f"({distance_m}m {turn})."
+            f"{mover} moved the {item_label} from {from_z} to {to_z}"
+            f"{loc_suffix}."
         )
     if events:
         latest = events[-1]
-        actor = latest.get("actor_name") or "You"
+        actor = latest.get("actor_name") or "Someone"
         zone = latest.get("to_zone") or current_zone
-        return f"{actor} left your {item_label} at {zone} ({distance_m}m {turn})."
-    return f"Your {item_label} is at {current_zone} ({distance_m}m {turn})."
+        return f"{actor} placed the {item_label} at {zone}{loc_suffix}."
+    return f"{item_label} was last seen at {current_zone}{loc_suffix}."
 
 
 def seed_everyday_social_data(db: Any) -> None:
