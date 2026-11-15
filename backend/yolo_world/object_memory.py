@@ -217,6 +217,7 @@ class ObjectMemoryStore:
         self.actor_user_id = actor_user_id
         self.lock = threading.Lock()
         self.paused = False
+        self._epoch = 0
         self.items = {}  # normalized label -> dict
         self._last_saved_at = {}  # label -> monotonic/wall timestamp to throttle disk writes
         self._load()
@@ -239,24 +240,36 @@ class ObjectMemoryStore:
         )
         tmp.replace(self.index_path)
 
+    def epoch(self) -> int:
+        with self.lock:
+            return self._epoch
+
     def set_paused(self, paused: bool) -> bool:
         with self.lock:
+            self._epoch += 1
             self.paused = bool(paused)
             self._save()
             return self.paused
 
     def clear(self):
         with self.lock:
+            self._epoch += 1
             self.items.clear()
             self._last_saved_at.clear()
             for p in self.directory.glob("*.jpg"):
                 p.unlink(missing_ok=True)
             self._save()
 
-    def observe(self, detections, frame, min_conf=0.40):
+    def observe(self, detections, frame, min_conf=0.40, expected_epoch=None):
         """Passively update last-seen snapshot & nearby object context."""
         with self.lock:
-            if self.paused or frame is None or frame.size == 0 or not detections:
+            if (
+                self.paused
+                or (expected_epoch is not None and self._epoch != expected_epoch)
+                or frame is None
+                or frame.size == 0
+                or not detections
+            ):
                 return
             now = time.time()
             h, w = frame.shape[:2]
@@ -418,7 +431,18 @@ class ObjectMemoryStore:
             hits = self._lookup_all_locked(q)
             if not hits:
                 return None
-            return self._with_snapshot(hits[0], time.time(), instance_count=len(hits))
+            now = time.time()
+            rec = self._with_snapshot(hits[0], now, instance_count=len(hits))
+            if len(hits) > 1:
+                rec["instances"] = [
+                    {
+                        "instance_id": h.get("instance_id", h.get("label")),
+                        "age_label": _human_age(max(0.0, now - float(h.get("last_seen", now)))),
+                        "spatial_phrase": h.get("spatial_phrase") or h.get("context") or "in room view",
+                    }
+                    for h in hits
+                ]
+            return rec
 
     def ask(self, question: str):
         """Answer natural-language memory queries such as 'Hey Meta, have I left anything behind?'."""

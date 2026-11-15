@@ -12,7 +12,7 @@
 | Component | Purpose | Location |
 |---|---|---|
 | **Native Meta Display App** | Real Meta DAT SDK integration: glasses camera stream, Bloks HUD (`Ask` compass, `Pins` overlay, `Next` object cycling, `Undo`), Whisper/Gemini voice notes, TTS, and Privacy Pause | [`worldgit-hud-android/`](worldgit-hud-android/) |
-| **Real-Time Vision Server (`:8765`)** | YOLO-World object detection, HSV multi-instance object memory (`ObjectMemoryStore`), spatial notes (`SpatialNoteStore`), ORB place anchors, strict Privacy Pause, and `DELETE /api/session` wipe | [`backend/yolo_world/`](backend/yolo_world/) |
+| **Real-Time Vision Server (`:8765`)** | YOLO-World object detection, heuristic HSV multi-instance object memory (`ObjectMemoryStore`), spatial notes (`SpatialNoteStore`), ORB place anchors, Privacy Pause (with in-flight inference discard), and cross-service `DELETE /api/session` wipe | [`backend/yolo_world/`](backend/yolo_world/) |
 | **3D Studio & Spatial Hub (`:8000`)** | Room reconstruction (`VGGT-1B` / `Depth-Anything-V2`), spatial diffing, Gemini Q&A, and ElevenLabs/browser TTS | [`backend/`](backend/) |
 | **3D Studio Web UI (`:5173`)** | Desktop Three.js spatial viewer, object-pin inspector, and live glasses telemetry | [`frontend/`](frontend/) |
 | **Web HUD Simulator (`:4173`)** | Browser/MRBD-simulator companion HUD for desktop testing without hardware | [`glasses-app/`](glasses-app/) |

@@ -32,6 +32,7 @@ class CameraHTTPServer(ThreadingHTTPServer):
 class DetectionServer:
     def __init__(self, host="127.0.0.1", port=8765, predict=None, track=None, audio_dir=DEFAULT_AUDIO_DIR, transcribe=None, notes_dir=DEFAULT_NOTES_DIR, places_dir=DEFAULT_PLACES_DIR, memory_dir=DEFAULT_MEMORY_DIR, studio_url=DEFAULT_STUDIO_URL, api_token=None):
         self.lock = threading.Lock()
+        self.privacy_epoch = 0
         self.snapshot = {"timestamp": None, "source": "laptop_camera", "detections": []}
         owner = self
         self.studio_url = studio_url
@@ -138,19 +139,47 @@ class DetectionServer:
                     self._send_json({"ok": True, "memories": []})
                     return
                 if self.path == "/api/session":
+                    with owner.lock:
+                        owner.privacy_epoch += 1
+                        owner.latest_frame = None
+                        owner.latest_detections = []
+                        owner.snapshot = {
+                            "timestamp": time.time(),
+                            "source": "cleared",
+                            "detections": [],
+                            "paused": owner.memory.paused,
+                        }
                     owner.memory.clear()
                     owner.notes.clear()
                     owner.places.clear()
-                    with owner.lock:
-                        owner.latest_frame = None
-                        owner.latest_detections = []
-                        owner.snapshot = {"timestamp": time.time(), "source": "cleared", "detections": [], "paused": owner.memory.paused}
                     audio_dir_path = getattr(owner.audio_clips, "directory", None)
                     if audio_dir_path and Path(audio_dir_path).exists():
                         for f in Path(audio_dir_path).glob("*"):
                             if f.is_file():
                                 f.unlink(missing_ok=True)
-                    self._send_json({"ok": True, "memories": [], "notes": [], "places": [], "cleared": True})
+                    studio_cleared = False
+                    if owner.studio_url:
+                        headers = {}
+                        if owner.api_token:
+                            headers["X-WorldGit-Token"] = owner.api_token
+                        req = urllib.request.Request(
+                            f"{owner.studio_url.rstrip('/')}/api/session",
+                            headers=headers,
+                            method="DELETE",
+                        )
+                        try:
+                            with urllib.request.urlopen(req, timeout=2.5) as resp:
+                                studio_cleared = 200 <= getattr(resp, "status", 200) < 300
+                        except Exception:
+                            studio_cleared = False
+                    self._send_json({
+                        "ok": True,
+                        "memories": [],
+                        "notes": [],
+                        "places": [],
+                        "cleared": True,
+                        "studio_cleared": studio_cleared,
+                    })
                     return
                 self.send_error(404)
 
@@ -185,7 +214,11 @@ class DetectionServer:
                 if not 0 < length <= 2_000_000:
                     self.send_error(413)
                     return
-                if owner.memory.paused:
+                with owner.lock:
+                    is_paused = owner.memory.paused
+                    req_epoch = owner.privacy_epoch
+                    mem_epoch = owner.memory.epoch()
+                if is_paused:
                     # Drain request body without decoding or retaining frames while Privacy Pause is active
                     if length > 0:
                         self.rfile.read(length)
@@ -222,15 +255,40 @@ class DetectionServer:
                             raise ValueError("Invalid rotation")
                     phone_tracking = self.headers.get("X-Tracking-Mode") == "phone" and predict is not None
                     detections = predict(frame) if phone_tracking else track(frame, rotation) if track else predict(frame)
-                    owner.memory.observe(detections, frame)
+                    with owner.lock:
+                        aborted_by_privacy = owner.memory.paused or owner.privacy_epoch != req_epoch
+                    if aborted_by_privacy:
+                        self._send_json({
+                            "timestamp": time.time(),
+                            "source": "privacy_paused",
+                            "detections": [],
+                            "paused": True,
+                            "tracking_mode": "paused",
+                        })
+                        return
+                    owner.memory.observe(detections, frame, expected_epoch=mem_epoch)
                     detections = owner.notes.annotate_detections(detections, frame)
                     detections.extend(owner.places.match_frame(frame))
                     with owner.lock:
+                        if owner.memory.paused or owner.privacy_epoch != req_epoch:
+                            self._send_json({
+                                "timestamp": time.time(),
+                                "source": "privacy_paused",
+                                "detections": [],
+                                "paused": True,
+                                "tracking_mode": "paused",
+                            })
+                            return
                         owner.latest_frame = frame.copy()
                         owner.latest_detections = list(detections)
-                    owner.publish(detections, [frame.shape[1], frame.shape[0]], "phone_camera")
-                    with owner.lock:
-                        owner.snapshot["processing_seconds"] = time.monotonic() - started
+                        owner.snapshot = {
+                            "timestamp": time.time(),
+                            "source": "phone_camera",
+                            "frame_size_px": [frame.shape[1], frame.shape[0]],
+                            "detections": copy.deepcopy(detections),
+                            "supports_image_rotation": True,
+                            "processing_seconds": time.monotonic() - started,
+                        }
                         result = copy.deepcopy(owner.snapshot)
                     result["tracking_mode"] = "phone" if phone_tracking else "server"
                     result["inference_seconds"] = time.monotonic() - started
@@ -322,9 +380,10 @@ class DetectionServer:
                 try:
                     length = int(self.headers.get("Content-Length", "0"))
                     payload = json.loads(self.rfile.read(length).decode("utf-8")) if length > 0 else {}
-                    paused = owner.memory.set_paused(bool(payload.get("paused", not owner.memory.paused)))
-                    if paused:
-                        with owner.lock:
+                    with owner.lock:
+                        paused = owner.memory.set_paused(bool(payload.get("paused", not owner.memory.paused)))
+                        owner.privacy_epoch += 1
+                        if paused:
                             owner.latest_frame = None
                             owner.latest_detections = []
                             owner.snapshot = {

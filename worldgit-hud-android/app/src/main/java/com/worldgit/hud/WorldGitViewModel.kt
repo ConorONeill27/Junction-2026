@@ -52,6 +52,10 @@ class WorldGitViewModel(application: Application) : AndroidViewModel(application
 
   private val prefs = application.getSharedPreferences("worldgit_hud", 0)
   private val initialHost = prefs.getString("host", "127.0.0.1") ?: "127.0.0.1"
+  private val initialToken =
+    (prefs.getString("api_token", null) ?: BuildConfig.WORLDGIT_API_TOKEN).trim().also {
+      WorldGitApi.setApiToken(it)
+    }
   private val initialCal = HudCalibration(
     size = prefs.getFloat("hud_size", 0.8522121f),
     horizontal = prefs.getFloat("hud_x", -512.44965f),
@@ -62,6 +66,7 @@ class WorldGitViewModel(application: Application) : AndroidViewModel(application
   private val _ui = MutableStateFlow(
     AppUiState(
       host = initialHost,
+      apiToken = initialToken,
       calibration = initialCal,
     ),
   )
@@ -245,6 +250,16 @@ class WorldGitViewModel(application: Application) : AndroidViewModel(application
         _ui.value = _ui.value.copy(calibration = c)
       }
     }
+  }
+
+  fun updateApiToken(newToken: String) {
+    val clean = newToken.trim()
+    prefs.edit().putString("api_token", clean).apply()
+    WorldGitApi.setApiToken(clean)
+    _ui.value = _ui.value.copy(
+      apiToken = clean,
+      snackbar = if (clean.isEmpty()) "API token cleared" else "API token updated",
+    )
   }
 
   fun connectOrDisconnectGlasses(activity: Activity, hasAudioPermission: Boolean) {

@@ -29,6 +29,23 @@ data class FrameResult(
 )
 
 object WorldGitApi {
+  @Volatile private var apiToken: String = ""
+
+  fun setApiToken(token: String) {
+    apiToken = token.trim()
+  }
+
+  private fun openConn(url: String, connectMs: Int, readMs: Int): HttpURLConnection {
+    val conn = URI(url).toURL().openConnection() as HttpURLConnection
+    conn.connectTimeout = connectMs
+    conn.readTimeout = readMs
+    val tok = apiToken
+    if (tok.isNotBlank()) {
+      conn.setRequestProperty("X-WorldGit-Token", tok)
+    }
+    return conn
+  }
+
   fun visionBase(hostInput: String): String {
     val clean = hostInput.trim().trimEnd('/')
     if (clean.startsWith("http://") || clean.startsWith("https://")) {
@@ -55,9 +72,7 @@ object WorldGitApi {
   }
 
   private fun getJson(url: String, timeoutMs: Int = 2500): JSONObject {
-    val conn = URI(url).toURL().openConnection() as HttpURLConnection
-    conn.connectTimeout = timeoutMs
-    conn.readTimeout = timeoutMs
+    val conn = openConn(url, timeoutMs, timeoutMs)
     try {
       val stream = if (conn.responseCode in 200..299) conn.inputStream else conn.errorStream
       return JSONObject(stream.bufferedReader().use { it.readText() })
@@ -68,9 +83,7 @@ object WorldGitApi {
 
   private fun postJson(url: String, body: JSONObject, timeoutMs: Int = 6000): JSONObject {
     val bytes = body.toString().toByteArray(Charsets.UTF_8)
-    val conn = URI(url).toURL().openConnection() as HttpURLConnection
-    conn.connectTimeout = timeoutMs
-    conn.readTimeout = timeoutMs
+    val conn = openConn(url, timeoutMs, timeoutMs)
     conn.requestMethod = "POST"
     conn.doOutput = true
     conn.setRequestProperty("Content-Type", "application/json")
@@ -184,9 +197,7 @@ object WorldGitApi {
   }.getOrNull()
 
   fun postFrame(host: String, jpegBytes: ByteArray, rotation: FloatArray?): FrameResult {
-    val conn = URI("${visionBase(host)}/api/frame").toURL().openConnection() as HttpURLConnection
-    conn.connectTimeout = 2500
-    conn.readTimeout = 3000
+    val conn = openConn("${visionBase(host)}/api/frame", 2500, 3000)
     conn.requestMethod = "POST"
     conn.doOutput = true
     conn.setRequestProperty("Content-Type", "image/jpeg")
@@ -243,9 +254,7 @@ object WorldGitApi {
     )
     for (url in urls) {
       val res = runCatching {
-        val conn = URI(url).toURL().openConnection() as HttpURLConnection
-        conn.connectTimeout = 4000
-        conn.readTimeout = 25000
+        val conn = openConn(url, 4000, 25000)
         conn.requestMethod = "POST"
         conn.doOutput = true
         conn.setRequestProperty("Content-Type", "application/octet-stream")
@@ -390,10 +399,8 @@ object WorldGitApi {
   }
 
   fun clearNotes(host: String) = runCatching {
-    val deletePath: (String) -> Int = { path ->
-      val conn = URI("${visionBase(host)}$path").toURL().openConnection() as HttpURLConnection
-      conn.connectTimeout = 2000
-      conn.readTimeout = 2000
+    val deleteUrl: (String) -> Int = { fullUrl ->
+      val conn = openConn(fullUrl, 2000, 2000)
       conn.requestMethod = "DELETE"
       try {
         val code = conn.responseCode
@@ -404,10 +411,12 @@ object WorldGitApi {
         conn.disconnect()
       }
     }
-    val code = deletePath("/api/session")
+    val vBase = visionBase(host)
+    val code = runCatching { deleteUrl("$vBase/api/session") }.getOrDefault(0)
     if (code !in 200..299) {
-      deletePath("/api/notes")
-      deletePath("/api/memory")
+      runCatching { deleteUrl("$vBase/api/notes") }
+      runCatching { deleteUrl("$vBase/api/memory") }
     }
+    runCatching { deleteUrl("${studioBase(host)}/api/session") }
   }
 }

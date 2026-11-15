@@ -50,12 +50,12 @@ A phone screen requires stopping, unlocking, aiming, and holding the device. Met
   - High-contrast HUD cards and calibrated display bounds (`hud_calibration.json` + phone `SharedPreferences`).
   - Toggleable **Voice: ON/OFF** (`TextToSpeech` readout for pinned notes, place reviews, and bottle-finder results).
 - **Privacy & Consent:**
-  - **Strict Privacy Pause (`POST /api/privacy`):** Stops frame uploads on the Android app (`receiveGlassesVideoFrame` returns immediately), clears live HUD previews/boxes, drops `latest_frame` and `latest_detections` on `:8765`, rejects/short-circuits `/api/frame` processing while paused, and displays `WorldGit • Privacy Paused` with a one-tap **Resume** button on the glasses HUD.
-  - **Full Session Wipe (`DELETE /api/session`):** One-tap **Clear** wipes object memory snapshots (`memory/`), saved spatial notes (`notes/`), place anchors (`places/`), recorded audio clips (`audio_clips/`), and in-memory frames/detections.
-  - **Localhost-by-Default & Optional Auth:** The `:8765` Vision server binds to `127.0.0.1` by default (routed over USB `adb reverse tcp:8765 tcp:8765`) and supports `WORLDGIT_API_TOKEN` / `X-WorldGit-Token` header verification.
+  - **Privacy Pause (`POST /api/privacy`):** Stops frame uploads on the Android app (`receiveGlassesVideoFrame` returns immediately), clears live HUD previews/boxes, drops `latest_frame` and `latest_detections` on `:8765`, discards any in-flight inference that finishes after pause via a privacy epoch check (`detection_server.py`), and displays `WorldGit • Privacy Paused` with a one-tap **Resume** button on the glasses HUD.
+  - **Session Wipe (`DELETE /api/session`):** One-tap **Clear** wipes `:8765` object memory snapshots (`memory/`), saved spatial notes (`notes/`), place anchors (`places/`), recorded audio clips (`audio_clips/`), and in-memory frames/detections, and forwards `DELETE /api/session` to Studio (`:8000`) to clear forwarded pins and session sightings.
+  - **Localhost-by-Default & Shared Token Auth:** `:8765` binds to `127.0.0.1` by default (routed over USB `adb reverse tcp:8765 tcp:8765`) and supports `WORLDGIT_API_TOKEN` / `X-WorldGit-Token` across both the Python Vision server and `WorldGitApi.kt` in the Android client (configurable at build time or in Android Settings).
 - **Accessible & Inclusive Input:**
   - **Head-Aim-Free `Next` Cycling:** In glasses `Pins` mode, wearers can either aim with head motion or tap **Next** in the Bloks `buttonGroup` to cycle through detected objects without fine neck/head aiming.
-  - **Multi-Instance Object Disambiguation:** `ObjectMemoryStore` compares 8×8 Hue-Saturation crop histograms to distinguish multiple items of the same class (e.g. `bottle` vs `bottle #2`) and reports age/staleness (`just now`, `5m ago`).
+  - **Heuristic Multi-Instance Appearance Tracking:** `ObjectMemoryStore` compares 8×8 Hue-Saturation crop histograms as a lightweight appearance heuristic (distinguishing differently colored items such as red vs. blue bottles; similar-looking items, lighting shifts, and viewpoint changes remain challenging) and reports `instance_count`, all tracked instances, and staleness (`just now`, `5m ago`).
 - **Device & Network Resilience:**
   - Graceful handling of camera/microphone permissions, glasses connect/disconnect state changes, automatic clearing of stale HUD boxes if `:8765` drops for >2.5s, and `adb reverse` USB tunneling.
 
@@ -63,7 +63,7 @@ A phone screen requires stopping, unlocking, aiming, and holding the device. Met
 
 ## 5. Proposed Next Steps: Path to Adoption / Pilot (Not Yet Field-Tested)
 
-> *Note: Within the hackathon scope, no external user study or clinical trial has been conducted yet. The following is the proposed pilot roadmap:*
+> *Note: Within the hackathon scope, no external user study, retrieval accuracy benchmark, battery endurance test, or clinical trial has been conducted yet. The following is the proposed pilot roadmap:*
 
 1. **Proposed Phase 1 — Household Opt-In Trial:** Evaluate everyday object-memory recall (`bottle`, `keys`, `medication`) and room-note handoffs across 3–5 shared households, measuring retrieval latency and false-positive rate.
 2. **Proposed Phase 2 — Accessibility Co-Design:** Partner with occupational therapists and low-vision / ADHD user groups to refine spoken TTS cadence, `Next` button navigation, and HUD contrast.

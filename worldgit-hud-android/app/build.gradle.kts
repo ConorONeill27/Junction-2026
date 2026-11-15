@@ -32,6 +32,10 @@ android {
         localProperties.getProperty("mwdat_application_id", "0")
     manifestPlaceholders["mwdat_client_token"] =
         localProperties.getProperty("mwdat_client_token", "0")
+    val apiToken =
+        (localProperties.getProperty("worldgit_api_token") ?: System.getenv("WORLDGIT_API_TOKEN") ?: "")
+            .replace("\"", "\\\"")
+    buildConfigField("String", "WORLDGIT_API_TOKEN", "\"$apiToken\"")
   }
 
   buildTypes {

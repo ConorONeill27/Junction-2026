@@ -15,7 +15,7 @@ class TranscriptionTests(unittest.TestCase):
         def recognize(body):
             self.received.append(body)
             return {'text': 'test partial', 'model': MODEL_ID, 'device': 'cuda:0'}
-        self.server = DetectionServer('127.0.0.1', 0, transcribe=recognize).start()
+        self.server = DetectionServer('127.0.0.1', 0, transcribe=recognize, studio_url='').start()
         self.url = f'http://127.0.0.1:{self.server.http.server_port}/api/transcribe'
 
     def tearDown(self):

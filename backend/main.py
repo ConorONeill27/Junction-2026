@@ -161,6 +161,7 @@ class WorldState:
         self.wearers: Dict[str, WearerState] = {}
         self.objects: Dict[str, SpatialObject] = {}
         self.pins: Dict[str, SpatialPin] = {}
+        self.session_object_ids: set[str] = set()
         self.snapshots: List[WorldSnapshot] = []
         self.points: List[List[float]] = _generate_room_point_cloud()
         self.wall_segments: List[List[float]] = []
@@ -1424,6 +1425,7 @@ async def record_object_sighting(req: ObjectSightingReq) -> Dict[str, Any]:
         group_ids=prev.group_ids if prev else req.group_ids,
     )
     world.objects[obj.id] = obj
+    world.session_object_ids.add(obj.id)
     world.db.upsert_object(obj.model_dump())
     if event is not None:
         world.db.append_object_event(event)
@@ -1660,6 +1662,29 @@ async def add_pin_from_hud(req: HudPinRequest) -> Dict[str, Any]:
     db.upsert_pin(pin.model_dump())
     await broadcast_state()
     return {"ok": True, "position": pos, "pin": pin.model_dump()}
+
+
+@app.delete("/api/session")
+async def clear_session_records() -> Dict[str, Any]:
+    """Wipe forwarded HUD pins, object sighting events, and session-added sightings."""
+    pins_cleared = len(world.pins)
+    world.pins.clear()
+    db.clear_pins()
+    db.clear_object_events()
+    removed_objects = 0
+    for oid in list(world.session_object_ids):
+        if oid in world.objects:
+            del world.objects[oid]
+            removed_objects += 1
+        db.delete_object(oid)
+    world.session_object_ids.clear()
+    await broadcast_state()
+    return {
+        "ok": True,
+        "pins_cleared": pins_cleared,
+        "objects_cleared": removed_objects,
+        "cleared": True,
+    }
 
 
 @app.post("/api/object")

@@ -261,6 +261,7 @@ fun MainScreen(viewModel: WorldGitViewModel) {
       ui = ui,
       onDismiss = { showSettings = false },
       onApplyHost = viewModel::updateHost,
+      onApplyToken = viewModel::updateApiToken,
       onCalibrationChange = viewModel::updateCalibration,
       onSaveCalibration = viewModel::saveCalibrationNow,
       onToggleTts = viewModel::toggleTts,
@@ -1118,6 +1119,7 @@ private fun SettingsModalSheet(
   ui: AppUiState,
   onDismiss: () -> Unit,
   onApplyHost: (String) -> Unit,
+  onApplyToken: (String) -> Unit,
   onCalibrationChange: (HudCalibration) -> Unit,
   onSaveCalibration: () -> Unit,
   onToggleTts: () -> Unit,
@@ -1125,6 +1127,7 @@ private fun SettingsModalSheet(
   onClearNotes: () -> Unit,
 ) {
   var hostDraft by remember(ui.host) { mutableStateOf(ui.host) }
+  var tokenDraft by remember(ui.apiToken) { mutableStateOf(ui.apiToken) }
 
   ModalBottomSheet(
     onDismissRequest = onDismiss,
@@ -1160,6 +1163,27 @@ private fun SettingsModalSheet(
             colors = ButtonDefaults.buttonColors(containerColor = WorldGitPalette.Cyan, contentColor = WorldGitPalette.Bg),
           ) {
             Text("Apply", fontWeight = FontWeight.Bold)
+          }
+        }
+        Spacer(Modifier.height(4.dp))
+        Text("API Token (optional X-WorldGit-Token)", style = MaterialTheme.typography.labelSmall)
+        Row(
+          verticalAlignment = Alignment.CenterVertically,
+          horizontalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+          OutlinedTextField(
+            value = tokenDraft,
+            onValueChange = { tokenDraft = it },
+            singleLine = true,
+            placeholder = { Text("Leave blank unless server requires token") },
+            shape = RoundedCornerShape(12.dp),
+            modifier = Modifier.weight(1f),
+          )
+          Button(
+            onClick = { onApplyToken(tokenDraft) },
+            colors = ButtonDefaults.buttonColors(containerColor = WorldGitPalette.Cyan, contentColor = WorldGitPalette.Bg),
+          ) {
+            Text("Save", fontWeight = FontWeight.Bold)
           }
         }
       }

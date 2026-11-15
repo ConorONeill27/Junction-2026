@@ -100,6 +100,7 @@ data class ImuState(
 data class AppUiState(
   val mode: HudMode = HudMode.ASK,
   val host: String = "127.0.0.1",
+  val apiToken: String = "",
   val glassesConnected: Boolean = false,
   val displayStarted: Boolean = false,
   val cameraStreaming: Boolean = false,

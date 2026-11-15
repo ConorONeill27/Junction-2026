@@ -563,6 +563,12 @@ class SpatialDatabase:
             (world_id, f"{prefix}%"),
         )
 
+    def clear_pins(self) -> None:
+        self._exec("DELETE FROM spatial_pins")
+
+    def clear_object_events(self) -> None:
+        self._exec("DELETE FROM object_events")
+
     def append_object_event(self, event: Dict[str, Any]) -> None:
         self._exec(
             """

@@ -4,9 +4,11 @@ import json
 import sys
 from pathlib import Path
 import tempfile
+import threading
 import unittest
 import urllib.error
 import urllib.request
+from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import cv2
 import numpy as np
@@ -35,6 +37,7 @@ class ObjectMemoryTests(unittest.TestCase):
                 notes_dir=Path(tmp) / "notes",
                 places_dir=Path(tmp) / "places",
                 memory_dir=Path(tmp) / "memory",
+                studio_url="",
             ).start()
             port = server.http.server_address[1]
             try:
@@ -95,6 +98,7 @@ class ObjectMemoryTests(unittest.TestCase):
                 notes_dir=Path(tmp) / "notes",
                 places_dir=Path(tmp) / "places",
                 memory_dir=Path(tmp) / "memory",
+                studio_url="",
             ).start()
             port = server.http.server_address[1]
             try:
@@ -137,6 +141,7 @@ class ObjectMemoryTests(unittest.TestCase):
                 notes_dir=Path(tmp) / "notes",
                 places_dir=Path(tmp) / "places",
                 memory_dir=Path(tmp) / "memory",
+                studio_url="",
             ).start()
             port = server.http.server_address[1]
             try:
@@ -187,6 +192,120 @@ class ObjectMemoryTests(unittest.TestCase):
                 self.assertEqual(mem["memories"], [])
             finally:
                 server.close()
+
+    def test_pause_during_in_flight_inference_does_not_restore_frame_or_memory(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            started = threading.Event()
+            release = threading.Event()
+            dets = [{"object_id": "b1", "label": "bottle", "confidence": 0.95, "bbox_xyxy": [20.0, 20.0, 100.0, 180.0]}]
+
+            def slow_predict(_frame):
+                started.set()
+                release.wait(timeout=3.0)
+                return dets
+
+            server = DetectionServer(
+                "127.0.0.1",
+                0,
+                predict=slow_predict,
+                notes_dir=Path(tmp) / "notes",
+                places_dir=Path(tmp) / "places",
+                memory_dir=Path(tmp) / "memory",
+                studio_url="",
+            ).start()
+            port = server.http.server_address[1]
+            try:
+                frame = np.full((240, 320, 3), 50, dtype=np.uint8)
+                ok, jpg = cv2.imencode(".jpg", frame)
+                self.assertTrue(ok)
+                resp_box = {}
+
+                def send_frame():
+                    req = urllib.request.Request(
+                        f"http://127.0.0.1:{port}/api/frame",
+                        data=jpg.tobytes(),
+                        headers={"Content-Type": "image/jpeg", "X-Tracking-Mode": "phone"},
+                        method="POST",
+                    )
+                    with urllib.request.urlopen(req, timeout=5) as resp:
+                        resp_box["body"] = json.loads(resp.read().decode("utf-8"))
+
+                t = threading.Thread(target=send_frame)
+                t.start()
+                self.assertTrue(started.wait(timeout=2.0))
+
+                # Toggle Privacy Pause while inference is in flight
+                with urllib.request.urlopen(urllib.request.Request(
+                    f"http://127.0.0.1:{port}/api/privacy",
+                    data=json.dumps({"paused": True}).encode("utf-8"),
+                    headers={"Content-Type": "application/json"},
+                    method="POST",
+                ), timeout=5) as resp:
+                    self.assertTrue(json.loads(resp.read().decode("utf-8"))["paused"])
+
+                release.set()
+                t.join(timeout=3.0)
+
+                self.assertTrue(resp_box.get("body", {}).get("paused"))
+                self.assertEqual(resp_box.get("body", {}).get("detections"), [])
+                self.assertIsNone(server.latest_frame)
+                self.assertEqual(server.latest_detections, [])
+                self.assertEqual(server.snapshot.get("detections"), [])
+                self.assertEqual(server.memory.list_memories(), [])
+            finally:
+                release.set()
+                server.close()
+
+    def test_api_token_and_studio_session_wipe_propagation(self):
+        studio_calls = []
+
+        class MockStudio(BaseHTTPRequestHandler):
+            def do_DELETE(self):
+                studio_calls.append((self.path, self.headers.get("X-WorldGit-Token")))
+                body = json.dumps({"ok": True, "cleared": True}).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *args):
+                pass
+
+        mock = HTTPServer(("127.0.0.1", 0), MockStudio)
+        mock_thread = threading.Thread(target=mock.serve_forever, daemon=True)
+        mock_thread.start()
+        with tempfile.TemporaryDirectory() as tmp:
+            server = DetectionServer(
+                "127.0.0.1",
+                0,
+                predict=lambda _f: [],
+                notes_dir=Path(tmp) / "notes",
+                places_dir=Path(tmp) / "places",
+                memory_dir=Path(tmp) / "memory",
+                studio_url=f"http://127.0.0.1:{mock.server_address[1]}",
+                api_token="demo-secret",
+            ).start()
+            port = server.http.server_address[1]
+            try:
+                with self.assertRaises(urllib.error.HTTPError) as unauth:
+                    urllib.request.urlopen(f"http://127.0.0.1:{port}/api/memory", timeout=5)
+                self.assertEqual(unauth.exception.code, 401)
+
+                req = urllib.request.Request(
+                    f"http://127.0.0.1:{port}/api/session",
+                    headers={"X-WorldGit-Token": "demo-secret"},
+                    method="DELETE",
+                )
+                with urllib.request.urlopen(req, timeout=5) as resp:
+                    wiped = json.loads(resp.read().decode("utf-8"))
+                self.assertTrue(wiped["cleared"])
+                self.assertTrue(wiped["studio_cleared"])
+                self.assertEqual(studio_calls, [("/api/session", "demo-secret")])
+            finally:
+                server.close()
+                mock.shutdown()
+                mock.server_close()
 
 
 if __name__ == "__main__":
