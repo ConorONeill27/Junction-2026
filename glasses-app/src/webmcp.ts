@@ -2,8 +2,8 @@ export type HudMode = 'ctrlf' | 'pins' | 'ctrlz' | 'crew' | 'scan';
 
 export const VOICE_HINTS: Record<HudMode, {phrase: string; description: string}> = {
   ctrlf: {
-    phrase: 'Hey Meta, find the red drill',
-    description: 'Voice: "Hey Meta, find the red drill"',
+    phrase: 'Where is the water bottle?',
+    description: 'Tap Ask & speak: "Where is the water bottle?"',
   },
   pins: {
     phrase: 'Hey Meta, pin a warning here',

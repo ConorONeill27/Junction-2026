@@ -23,8 +23,10 @@ import tempfile
 from ai_services import (
     ai_status,
     analyze_frame_with_gemini,
+    answer_space_question_with_gemini,
     generate_ctrl_z_instructions,
     synthesize_elevenlabs_tts,
+    transcribe_pcm_with_gemini,
 )
 from db import SpatialDatabase
 from imu_fusion import ImuSessionStore
@@ -1349,7 +1351,7 @@ class CreateZoneReq(BaseModel):
 
 @app.get("/api/zones")
 async def get_zones_endpoint(world_id: Optional[str] = None) -> Dict[str, Any]:
-    return {"zones": db.list_zones(world_id=world_id)}
+    return {"zones": world.db.list_zones(world_id=world_id)}
 
 
 @app.post("/api/zones")
@@ -1364,7 +1366,7 @@ async def create_zone_endpoint(req: CreateZoneReq) -> Dict[str, Any]:
         "radius_m": float(req.radius_m),
         "created_by": req.created_by,
     }
-    db.upsert_zone(zone)
+    world.db.upsert_zone(zone)
     await broadcast_state()
     return {"ok": True, "zone": zone}
 
@@ -1378,17 +1380,20 @@ class ObjectSightingReq(BaseModel):
     confidence: float = 0.9
     audience_type: str = "group"
     group_ids: List[str] = ["grp-room"]
+    unlocalized_2d: bool = False
 
 
 @app.post("/api/objects/sighting")
 async def record_object_sighting(req: ObjectSightingReq) -> Dict[str, Any]:
+    if req.unlocalized_2d:
+        return {"ok": True, "skipped": "unlocalized_2d"}
     now = time.time()
     slug = "".join(c if c.isalnum() else "-" for c in req.label.lower().strip()).strip("-")[:24] or "item"
     obj_id = f"obj-{slug}"
-    actor = db.get_user(req.actor_user_id)
+    actor = world.db.get_user(req.actor_user_id)
     actor_name = actor["name"] if actor else req.actor_user_id
 
-    zones = db.list_zones(world_id=req.world_id)
+    zones = world.db.list_zones(world_id=req.world_id)
     resolved_zone = resolve_zone(req.world_id, req.position, zones, req.zone_hint)
     prev = world.objects.get(obj_id)
     prev_dict = prev.model_dump() if prev else None
@@ -1419,9 +1424,9 @@ async def record_object_sighting(req: ObjectSightingReq) -> Dict[str, Any]:
         group_ids=prev.group_ids if prev else req.group_ids,
     )
     world.objects[obj.id] = obj
-    db.upsert_object(obj.model_dump())
+    world.db.upsert_object(obj.model_dump())
     if event is not None:
-        db.append_object_event(event)
+        world.db.append_object_event(event)
     await broadcast_state()
     return {"ok": True, "object": obj.model_dump(), "event_type": ev_type, "event": event}
 
@@ -1455,24 +1460,48 @@ class AskSpaceReq(BaseModel):
 async def ask_space_qa(req: AskSpaceReq) -> Dict[str, Any]:
     vid = resolve_viewer_id(req.viewer_id or WEARER_TO_USER.get(req.wearer_id))
     visible_objs = [o for o in world.objects.values() if can_user_view(o.model_dump(), vid, db)]
+    if req.world_id:
+        scoped = [o for o in visible_objs if o.world_id == req.world_id]
+        if scoped:
+            visible_objs = scoped
+
+    gemini_res = await answer_space_question_with_gemini(
+        req.query, [o.model_dump() for o in visible_objs]
+    )
     matches = _match_objects_for_query(req.query, visible_objs)
-    if not matches:
+    target = None
+    if gemini_res and gemini_res.get("object_id"):
+        target = next((o for o in visible_objs if o.id == gemini_res["object_id"]), None)
+    if target is None and matches:
+        if req.world_id:
+            matches.sort(key=lambda o: (0 if o.world_id == req.world_id else 1, -o.timestamp))
+        target = matches[0]
+
+    if target is None:
         return {
             "found": False,
-            "spoken_answer": f"I haven't seen '{req.query}' in your shared spaces yet.",
+            "provider": "gemini-3.8-flash" if gemini_res else "local-matcher",
+            "spoken_answer": (
+                gemini_res["spoken_answer"]
+                if gemini_res
+                else f"I haven't seen '{req.query}' in your shared spaces yet."
+            ),
         }
-    if req.world_id:
-        matches.sort(key=lambda o: (0 if o.world_id == req.world_id else 1, -o.timestamp))
-    target = matches[0]
+
     wearer_id = USER_TO_WEARER.get(vid, req.wearer_id)
     wearer = world.wearers.get(wearer_id) or world.wearers.get(req.wearer_id)
     nav = _compute_directions(wearer, target) if wearer else {"distance_m": 0.0, "bearing_deg": 0, "arrow": "↑", "turn": "nearby", "directions": ""}
     events = db.list_object_events(world_id=target.world_id, object_id=target.id, limit=25)
     zone_label = target.zone_name or "Room"
-    spoken = build_ask_answer(target.label, zone_label, nav["distance_m"], nav["turn"], events)
+    spoken = (
+        gemini_res["spoken_answer"]
+        if gemini_res
+        else build_ask_answer(target.label, zone_label, nav["distance_m"], nav["turn"], events)
+    )
     spaces_by_id = {s["world_id"]: s["display_name"] for s in db.list_spaces_meta()}
     return {
         "found": True,
+        "provider": "gemini-3.8-flash" if gemini_res else "local-matcher",
         "world_id": target.world_id,
         "space_name": spaces_by_id.get(target.world_id, target.world_id),
         "object": target.model_dump(),
@@ -1489,6 +1518,30 @@ async def create_snapshot(label: str = "checkpoint") -> Dict[str, Any]:
     snap = world.take_snapshot(label)
     await broadcast_state()
     return snap.model_dump()
+
+
+@app.post("/api/transcribe")
+async def transcribe_pcm_endpoint(request: Request) -> Dict[str, Any]:
+    body = await request.body()
+    if len(body) < 3200:
+        return {"text": "", "model": "nvidia/parakeet-unified-en-0.6b", "device": "cuda:0"}
+    # Try local Parakeet server on :8765 first; fall back to Gemini 3.8 Flash audio ASR
+    if request.headers.get("X-Relay-From-8765") != "1":
+        try:
+            async with httpx.AsyncClient(timeout=3.5) as client:
+                r = await client.post(
+                    "http://127.0.0.1:8765/api/transcribe",
+                    content=body,
+                    headers={"Content-Type": "application/octet-stream", "X-Sample-Rate": "16000"},
+                )
+                if r.status_code == 200:
+                    data = r.json()
+                    if data.get("text"):
+                        return data
+        except Exception:
+            pass
+    text = await transcribe_pcm_with_gemini(body, 16000)
+    return {"text": text, "model": "nvidia/parakeet-unified-en-0.6b", "device": "cuda:0"}
 
 
 @app.get("/api/diff")

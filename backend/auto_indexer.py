@@ -284,7 +284,7 @@ def _refine_names_with_gemini(
             parts.append(f"#{idx} ({kind}, rough='{fallback_name}'):")
             parts.append(types.Part.from_bytes(data=base64.b64decode(b64), mime_type="image/jpeg"))
 
-        resp = client.models.generate_content(model="gemini-2.5-flash", contents=parts)
+        resp = client.models.generate_content(model="gemini-3.8-flash", contents=parts)
         raw = resp.text or ""
         m = re.search(r"\[[\s\S]*\]", raw)
         if not m:

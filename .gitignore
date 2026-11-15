@@ -42,4 +42,10 @@ backend/static/worlds/
 meta-wearables-dat-android-ref/
 qr-*.png
 .gradle/
+.kotlin/
+local.properties
+weights/
+captured_media/
+backend/static/room_92kf.json
+backend/static/room_92kf.ply
 backend/.env.example

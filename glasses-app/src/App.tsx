@@ -89,6 +89,19 @@ export default function App() {
                   wearers={wg.wearers}
                   selfWearer={wg.selfWearer}
                   imu={wg.imu}
+                  cursorPos={wg.cursorPos}
+                  projectedObjects={wg.projectedObjects}
+                  aimedObject={wg.aimedObject}
+                  pinDraft={wg.pinDraft}
+                  pinStatus={wg.pinStatus}
+                  hudOverlayItems={wg.hudOverlayItems}
+                  hudCursor={wg.hudCursor}
+                  liveSpeech={wg.liveSpeech}
+                  onOverlayMove={wg.onOverlayMove}
+                  onOverlayClick={wg.onOverlayClick}
+                  onPinDraftChange={wg.setPinDraft}
+                  onAimCursor={wg.aimCursor}
+                  onDropCursorPin={(xPct, yPct) => void wg.dropCursorPin(xPct, yPct)}
                 />
               </div>
             </Panel>
@@ -96,10 +109,9 @@ export default function App() {
 
           <div className="action-dock">
             <ButtonRail>
-              <Button title="Find" onClick={wg.cycleTargetOrShowCtrlF} />
+              <Button title={wg.isListening ? 'Listening' : 'Ask'} onClick={() => void wg.askVoiceAction()} />
               <Button title="Pins" onClick={wg.showPinsOrDropPin} />
               <Button title="Undo" onClick={() => void wg.runCtrlZAction()} />
-              <Button title="Crew" onClick={wg.showCrewOrStepWalk} />
               <Button title={wg.imu.isRecording ? 'Stop' : 'Scan'} onClick={wg.toggleScanAction} />
             </ButtonRail>
           </div>

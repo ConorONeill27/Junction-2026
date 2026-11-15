@@ -25,7 +25,7 @@ class ObjectStore:
         import cv2
 
         now = time.time()
-        self.tracks = {key: value for key, value in self.tracks.items() if now - value["last_seen"] < 10}
+        self.tracks = {key: value for key, value in self.tracks.items() if now - value["last_seen"] < 3600}
         # Match globally by strongest same-label overlap, one detection per ID.
         candidates = sorted(
             ((overlap(d["bbox_xyxy"], track["bbox_xyxy"]), index, key)

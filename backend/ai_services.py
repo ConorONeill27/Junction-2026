@@ -7,10 +7,21 @@ AI services for WorldGit:
 import base64
 import json
 import os
+from pathlib import Path
 import re
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
+from dotenv import load_dotenv
 import httpx
+
+_ENV_PATH = Path(__file__).resolve().parent / ".env"
+load_dotenv(_ENV_PATH, override=True)
+GEMINI_MODEL = "gemini-3.8-flash"
+
+
+def _get_gemini_key() -> str:
+    load_dotenv(_ENV_PATH, override=True)
+    return (os.getenv("GEMINI_API_KEY") or "").strip()
 
 
 def _extract_json_array(raw_text: str) -> List[Dict[str, Any]]:
@@ -33,7 +44,7 @@ async def analyze_frame_with_gemini(
     Detect objects and hazards in an incoming first-person frame using Gemini 2.5 Flash,
     falling back to OpenAI GPT-4o-mini or deterministic detection when keys are absent.
     """
-    gemini_key = os.getenv("GEMINI_API_KEY")
+    gemini_key = _get_gemini_key()
     openai_key = os.getenv("OPENAI_API_KEY")
     clean_b64 = image_b64.split(",", 1)[1] if "," in image_b64 else image_b64
 
@@ -52,7 +63,7 @@ async def analyze_frame_with_gemini(
             client = genai.Client(api_key=gemini_key)
             img_bytes = base64.b64decode(clean_b64)
             response = client.models.generate_content(
-                model="gemini-2.5-flash",
+                model=GEMINI_MODEL,
                 contents=[
                     types.Part.from_bytes(data=img_bytes, mime_type="image/jpeg"),
                     prompt,
@@ -138,7 +149,7 @@ async def generate_ctrl_z_instructions(diff: Dict[str, Any]) -> Dict[str, Any]:
             "undo_steps": ["Scene matches previous snapshot. No undo needed."],
         }
 
-    gemini_key = os.getenv("GEMINI_API_KEY")
+    gemini_key = _get_gemini_key()
     openai_key = os.getenv("OPENAI_API_KEY")
     instruction_prompt = (
         "Turn this physical room diff into concise, numbered spoken step-by-step instructions "
@@ -152,7 +163,7 @@ async def generate_ctrl_z_instructions(diff: Dict[str, Any]) -> Dict[str, Any]:
 
             client = genai.Client(api_key=gemini_key)
             resp = client.models.generate_content(
-                model="gemini-2.5-flash",
+                model=GEMINI_MODEL,
                 contents=instruction_prompt,
             )
             match = re.search(r"\[[\s\S]*\]", resp.text or "")
@@ -223,8 +234,96 @@ async def synthesize_elevenlabs_tts(text: str) -> Dict[str, Any]:
 
 def ai_status() -> Dict[str, Any]:
     return {
-        "gemini": bool(os.getenv("GEMINI_API_KEY")),
+        "gemini": bool(_get_gemini_key()),
         "openai": bool(os.getenv("OPENAI_API_KEY")),
         "elevenlabs": bool(os.getenv("ELEVENLABS_API_KEY")),
         "modal_url": os.getenv("MODAL_RECONSTRUCT_URL") or "stub-local-ready",
     }
+
+
+async def answer_space_question_with_gemini(
+    query: str,
+    objects: List[Dict[str, Any]],
+) -> Optional[Dict[str, str]]:
+    """Use Gemini 2.5 Flash to match a natural-language question to scanned room objects."""
+    gemini_key = _get_gemini_key()
+    if not gemini_key or not query.strip() or not objects:
+        return None
+    compact = [
+        {
+            "id": o.get("id"),
+            "label": o.get("label"),
+            "zone": o.get("zone_name") or "Room",
+            "seen_by": o.get("seen_by"),
+            "position": o.get("position"),
+        }
+        for o in objects[:40]
+    ]
+    prompt = (
+        "You are WorldGit on Meta Ray-Ban Display glasses. "
+        "Given the user's question and the scanned 3D room objects JSON, pick the best matching object_id "
+        "and write a short, natural 1-sentence spoken_answer telling the user where it is (mention the zone/area, do NOT mention meter distances). "
+        'Return ONLY JSON: {"object_id": "<id or null>", "spoken_answer": "<short sentence>"}.\n\n'
+        f"Question: {query}\n"
+        f"Objects: {json.dumps(compact)}"
+    )
+    try:
+        from google import genai
+
+        client = genai.Client(api_key=gemini_key)
+        resp = client.models.generate_content(model=GEMINI_MODEL, contents=prompt)
+        match = re.search(r"\{[\s\S]*\}", resp.text or "")
+        if match:
+            parsed = json.loads(match.group(0))
+            if isinstance(parsed, dict) and parsed.get("spoken_answer"):
+                return {
+                    "object_id": str(parsed.get("object_id") or ""),
+                    "spoken_answer": str(parsed["spoken_answer"]),
+                }
+    except Exception:
+        pass
+    return None
+
+
+async def transcribe_pcm_with_gemini(pcm_bytes: bytes, sample_rate: int = 16000) -> str:
+    """Transcribe 16-bit mono PCM audio using Gemini 3.8 Flash."""
+    gemini_key = _get_gemini_key()
+    if not gemini_key or len(pcm_bytes) < 3200:
+        return ""
+    import io
+    import wave
+    import numpy as np
+
+    samples = np.frombuffer(pcm_bytes[: len(pcm_bytes) - (len(pcm_bytes) % 2)], dtype="<i2")
+    if samples.size == 0:
+        return ""
+    rms = float(np.sqrt(np.mean(samples.astype(np.float64) ** 2)))
+    if rms < 110.0:
+        return ""
+
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(sample_rate)
+        wf.writeframes(samples.tobytes())
+
+    try:
+        from google import genai
+        from google.genai import types
+
+        client = genai.Client(api_key=gemini_key)
+        resp = client.models.generate_content(
+            model=GEMINI_MODEL,
+            contents=[
+                types.Part.from_bytes(data=buf.getvalue(), mime_type="audio/wav"),
+                "Transcribe ONLY the exact words spoken in this short voice note. "
+                "Do not add quotes, prefixes, or commentary. If no clear speech is audible, return NOTHING.",
+            ],
+        )
+        text = (resp.text or "").strip().strip('"').strip("'")
+        if text.upper() == "NOTHING":
+            return ""
+        return text[:240]
+    except Exception:
+        return ""

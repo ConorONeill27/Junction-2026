@@ -23,6 +23,8 @@ body {
   display: grid;
   grid-template-rows: minmax(0, 1fr) auto;
   block-size: 100%;
+  inline-size: 100%;
+  max-inline-size: 100%;
   min-block-size: 0;
   min-inline-size: 0;
 }
@@ -38,4 +40,26 @@ body {
   gap: calc(var(--uit-spacing-large) + var(--uit-spacing-xsmall));
   min-inline-size: 0;
   padding: var(--uit-spacing-large);
+}
+
+.compass-stage {
+  display: flex;
+  align-items: center;
+  gap: var(--uit-spacing-large);
+  min-inline-size: 0;
+}
+
+.compass-ring {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.compass-details {
+  display: flex;
+  flex-direction: column;
+  gap: var(--uit-spacing-xsmall);
+  min-inline-size: 0;
+  flex: 1 1 auto;
 }

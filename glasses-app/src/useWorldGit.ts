@@ -9,6 +9,27 @@ const WS_URL =
     ? `${WS_PROTO}//${window.location.host}/ws/stream`
     : 'ws://127.0.0.1:4173/ws/stream';
 
+interface SpeechRecInstance {
+  lang: string;
+  continuous?: boolean;
+  interimResults: boolean;
+  maxAlternatives: number;
+  onresult: ((e: {results: ArrayLike<ArrayLike<{transcript: string}> & {isFinal?: boolean}>}) => void) | null;
+  onerror: ((e: {error?: string}) => void) | null;
+  onend: (() => void) | null;
+  start: () => void;
+  stop?: () => void;
+}
+
+type SpeechRecCtor = new () => SpeechRecInstance;
+
+declare global {
+  interface Window {
+    SpeechRecognition?: SpeechRecCtor;
+    webkitSpeechRecognition?: SpeechRecCtor;
+  }
+}
+
 export interface SpatialObject {
   id: string;
   label: string;
@@ -25,6 +46,75 @@ export interface SpatialPin {
   position: number[];
   landmark: string;
   age_label?: string;
+}
+
+export interface HudCalibration {
+  size: number;
+  horizontal: number;
+  vertical: number;
+  roll: number;
+}
+
+export interface HudOverlayItem {
+  id: string;
+  label: string;
+  confidence: number;
+  rawBox: [number, number, number, number];
+  frameSize: [number, number];
+  box: [number, number, number, number];
+  labelBounds: {x: number; y: number; w: number; h: number};
+  noteBounds: {x: number; y: number; w: number; h: number};
+  noteLines: string[];
+  note?: string;
+}
+
+export interface HeadCursorState {
+  visible: boolean;
+  x: number;
+  y: number;
+  selectedId: string | null;
+}
+
+export interface LiveSpeechState {
+  active: boolean;
+  finishing: boolean;
+  noteId: string | null;
+  text: string;
+  error: string | null;
+}
+
+interface RawYoloDetection {
+  object_id: string;
+  label: string;
+  confidence: number;
+  bbox_xyxy: [number, number, number, number];
+  note?: string;
+}
+
+const DEFAULT_CALIBRATION: HudCalibration = {
+  size: 0.8522121,
+  horizontal: -512.44965,
+  vertical: -365.0765,
+  roll: 0.0,
+};
+
+function wrapNoteLines(text: string, maxChars = 26): string[] {
+  const words = text.trim().split(/\s+/).filter(Boolean);
+  if (words.length === 0) return ['add note?'];
+  const lines: string[] = [];
+  let cur = '';
+  for (const w of words) {
+    if (!cur) {
+      cur = w.slice(0, maxChars);
+    } else if (cur.length + 1 + w.length <= maxChars) {
+      cur += ` ${w}`;
+    } else {
+      lines.push(cur);
+      cur = w.slice(0, maxChars);
+    }
+  }
+  if (cur) lines.push(cur);
+  return lines.slice(0, 3);
 }
 
 export interface Wearer {
@@ -148,8 +238,10 @@ export function computeLocalDirection(wearerPos: number[], wearerYaw: number, ta
   }
   return {
     arrow,
+    angle,
+    turn,
     dist,
-    text: `${target.label} seen by ${target.seen_by}. Walk ${dist}m ${turn}.`,
+    text: `${target.label} seen by ${target.seen_by}. ${turn === 'straight ahead' ? 'Look straight ahead.' : `Turn ${turn}.`}`,
   };
 }
 
@@ -190,6 +282,7 @@ export function useWorldGit() {
   ]);
   const [itemIndex, setItemIndex] = useState(0);
   const [searchMessage, setSearchMessage] = useState('');
+  const [isListening, setIsListening] = useState(false);
   const [statusNote, setStatusNote] = useState('Hub syncing...');
   const [imu, setImu] = useState<ImuTelemetry>({
     sensorStatus: 'idle',
@@ -207,6 +300,48 @@ export function useWorldGit() {
     lastSessionId: null,
     lastSyncNote: 'Tap Scan to arm 9-axis sensors & record walk',
   });
+  const [cursorPos, setCursorPos] = useState<{xPct: number; yPct: number}>({xPct: 50, yPct: 50});
+  const [pinDraft, setPinDraft] = useState('');
+  const [pinStatus, setPinStatus] = useState('');
+  const [calibration, setCalibration] = useState<HudCalibration>(DEFAULT_CALIBRATION);
+  const [rawDetections, setRawDetections] = useState<RawYoloDetection[]>([
+    {
+      object_id: 'ee5906dc8f2544e189bfa659871e7504',
+      label: 'bottle',
+      confidence: 0.476,
+      bbox_xyxy: [392.98, 574.17, 438.85, 684.95],
+    },
+    {
+      object_id: '19dea338a6854cfeb795d39c3ff105ec',
+      label: 'desk',
+      confidence: 0.268,
+      bbox_xyxy: [388.71, 346.24, 536.7, 607.09],
+    },
+    {
+      object_id: '9341b735850942de96757e3ae7335969',
+      label: 'bed',
+      confidence: 0.494,
+      bbox_xyxy: [447.62, 361.12, 540.0, 959.93],
+    },
+  ]);
+  const [frameSizePx, setFrameSizePx] = useState<[number, number]>([540, 960]);
+  const [savedNotesMap, setSavedNotesMap] = useState<Record<string, string>>({});
+  const [hudCursor, setHudCursor] = useState<HeadCursorState>({
+    visible: true,
+    x: 0.55,
+    y: 0.72,
+    selectedId: 'ee5906dc8f2544e189bfa659871e7504',
+  });
+  const [liveSpeech, setLiveSpeech] = useState<LiveSpeechState>({
+    active: false,
+    finishing: false,
+    noteId: null,
+    text: '',
+    error: null,
+  });
+  const speechStopRef = useRef<(() => void) | null>(null);
+  const lastPointerMoveMsRef = useRef(0);
+  const headOriginRef = useRef<{yaw: number; pitch: number} | null>(null);
 
   const wsRef = useRef<WebSocket | null>(null);
   const stepRef = useRef(0);
@@ -577,9 +712,8 @@ export function useWorldGit() {
             fusedYawRef.current = heading;
           } else {
             const err = wrapDeg(heading - fusedYawRef.current);
-            if (Math.abs(err) <= 18) {
-              fusedYawRef.current = norm360(fusedYawRef.current + 0.08 * err);
-            }
+            const gain = Math.abs(err) <= 18 ? 0.15 : 0.45;
+            fusedYawRef.current = norm360(fusedYawRef.current + gain * err);
             headingRef.current = heading;
           }
         }
@@ -746,6 +880,16 @@ export function useWorldGit() {
     [detachSensorListeners, pushTelemetryUi],
   );
 
+  // Auto-start live 9-axis compass & step-distance tracking when no permission gate blocks it
+  useEffect(() => {
+    const motionCtor: object | undefined =
+      typeof DeviceMotionEvent === 'function' ? DeviceMotionEvent : undefined;
+    const needsPrompt = motionCtor && typeof Reflect.get(motionCtor, 'requestPermission') === 'function';
+    if (!needsPrompt && !sensorActiveRef.current) {
+      void startSensorsAndRecord(false);
+    }
+  }, [startSensorsAndRecord]);
+
   // Pause listeners + checkpoint IMU if Meta OS dims/backgrounds HUD; resume active Scan on return
   useEffect(() => {
     const onVisibility = () => {
@@ -807,31 +951,552 @@ export function useWorldGit() {
     void startSensorsAndRecord(true);
   }, [startSensorsAndRecord, stopSensorsAndUpload]);
 
+  const speakOut = useCallback((text: string) => {
+    try {
+      if (typeof window !== 'undefined' && 'speechSynthesis' in window && text) {
+        window.speechSynthesis.cancel();
+        const utter = new SpeechSynthesisUtterance(text);
+        utter.rate = 1.05;
+        window.speechSynthesis.speak(utter);
+      }
+    } catch {
+      /* TTS optional */
+    }
+  }, []);
+
   const findObjectAction = useCallback(
     async (query: string) => {
       setMode('ctrlf');
+      if (!sensorActiveRef.current) {
+        void startSensorsAndRecord(false);
+      }
       const idx = objects.findIndex(o => o.label.toLowerCase().includes(query.toLowerCase()));
       if (idx >= 0) setItemIndex(idx);
       try {
-        const res = await fetch(`${API_BASE}/api/ctrl-f`, {
+        const res = await fetch(`${API_BASE}/api/ask`, {
           method: 'POST',
           headers: {'Content-Type': 'application/json'},
-          body: JSON.stringify({wearer_id: 'wearer-b', query}),
+          body: JSON.stringify({
+            viewer_id: 'usr-conor',
+            wearer_id: 'wearer-b',
+            query,
+            world_id: 'world_1',
+          }),
         });
         const data = await res.json();
-        const msg = data.directions || data.message || localNav.text;
+        if (data.object?.id) {
+          const matchedIdx = objects.findIndex(
+            o => o.id === data.object.id || o.label.toLowerCase() === String(data.object.label || '').toLowerCase(),
+          );
+          if (matchedIdx >= 0) {
+            setItemIndex(matchedIdx);
+          } else if (Array.isArray(data.object.position)) {
+            const added: SpatialObject = {
+              id: String(data.object.id),
+              label: String(data.object.label || query),
+              position: data.object.position,
+              seen_by: String(data.object.seen_by || 'WorldGit'),
+              timestamp: Number(data.object.timestamp) || Date.now() / 1000,
+            };
+            setObjects(prev => [added, ...prev]);
+            setItemIndex(0);
+          }
+        }
+        const msg = data.spoken_answer || data.directions || data.message || localNav.text;
         setSearchMessage(msg);
+        speakOut(msg);
         return data;
       } catch {
         setSearchMessage(localNav.text);
         return {found: true, directions: localNav.text};
       }
     },
-    [objects, localNav.text],
+    [objects, localNav.text, speakOut],
   );
 
+  // Poll Display Access calibration (/api/calibration), YOLO detections (/api/detections), and persistent notes (/api/notes)
+  useEffect(() => {
+    let active = true;
+    const fetchCal = () => {
+      fetch(`${API_BASE}/api/calibration`)
+        .then(r => (r.ok ? r.json() : null))
+        .then(data => {
+          if (!active || !data || typeof data.size !== 'number') return;
+          setCalibration({
+            size: Number(data.size),
+            horizontal: Number(data.horizontal || 0),
+            vertical: Number(data.vertical || 0),
+            roll: Number(data.roll || 0),
+          });
+        })
+        .catch(() => {});
+    };
+
+    const fetchDetAndNotes = () => {
+      fetch(`${API_BASE}/api/detections`)
+        .then(r => (r.ok ? r.json() : null))
+        .then(data => {
+          if (!active || !data) return;
+          if (Array.isArray(data.frame_size_px) && data.frame_size_px.length === 2) {
+            setFrameSizePx([Number(data.frame_size_px[0]) || 540, Number(data.frame_size_px[1]) || 960]);
+          }
+          if (Array.isArray(data.detections) && data.detections.length > 0) {
+            const parsed: RawYoloDetection[] = data.detections
+              .filter((d: Record<string, unknown>) => Array.isArray(d.bbox_xyxy) && d.bbox_xyxy.length === 4)
+              .map((d: Record<string, unknown>, idx: number) => ({
+                object_id: String(d.object_id || `det-${idx}`),
+                label: String(d.label || 'object'),
+                confidence: Number(d.confidence || 0.8),
+                bbox_xyxy: [
+                  Number((d.bbox_xyxy as number[])[0]),
+                  Number((d.bbox_xyxy as number[])[1]),
+                  Number((d.bbox_xyxy as number[])[2]),
+                  Number((d.bbox_xyxy as number[])[3]),
+                ],
+                note: typeof d.note === 'string' && d.note.trim() ? d.note.trim() : undefined,
+              }));
+            if (parsed.length > 0) {
+              setRawDetections(parsed);
+            }
+          }
+        })
+        .catch(() => {});
+
+      fetch(`${API_BASE}/api/notes`)
+        .then(r => (r.ok ? r.json() : null))
+        .then(data => {
+          if (!active || !data || !Array.isArray(data.notes)) return;
+          const nextMap: Record<string, string> = {};
+          for (const n of data.notes) {
+            const text = String(n?.text || '').trim();
+            if (!text) continue;
+            if (n.object_id) nextMap[String(n.object_id)] = text;
+            if (n.label) nextMap[`label:${String(n.label).toLowerCase()}`] = text;
+          }
+          if (Object.keys(nextMap).length > 0) {
+            setSavedNotesMap(prev => ({...prev, ...nextMap}));
+          }
+        })
+        .catch(() => {});
+    };
+
+    fetchCal();
+    fetchDetAndNotes();
+    const detTimer = window.setInterval(fetchDetAndNotes, 500);
+    const calTimer = window.setInterval(fetchCal, 4000);
+    return () => {
+      active = false;
+      window.clearInterval(detTimer);
+      window.clearInterval(calTimer);
+    };
+  }, []);
+
+  // Live camera scan in Pins mode: capture frames via getUserMedia and POST to /api/frame for YOLO-World
+  useEffect(() => {
+    if (mode !== 'pins') return;
+    if (typeof navigator === 'undefined' || !navigator.mediaDevices?.getUserMedia) return;
+    let cancelled = false;
+    let stream: MediaStream | null = null;
+    let timerId: number | null = null;
+    let inFlight = false;
+
+    const video = document.createElement('video');
+    video.playsInline = true;
+    video.muted = true;
+    const canvas = document.createElement('canvas');
+    const ctx = canvas.getContext('2d');
+
+    navigator.mediaDevices
+      .enumerateDevices()
+      .then(devices => {
+        const videoInputs = devices.filter(d => d.kind === 'videoinput');
+        const glassesCam =
+          videoInputs.find(d => /ray-?ban|meta|glasses|display|wearable|external/i.test(d.label)) ||
+          videoInputs.find(d => d.label && !/back|rear|environment|wide|telephoto|macro/i.test(d.label));
+        const videoConstraint: MediaTrackConstraints = glassesCam
+          ? {deviceId: {exact: glassesCam.deviceId}, width: {ideal: 960}, height: {ideal: 540}}
+          : {width: {ideal: 960}, height: {ideal: 540}};
+        return navigator.mediaDevices.getUserMedia({
+          video: videoConstraint,
+          audio: false,
+        });
+      })
+      .catch(() =>
+        navigator.mediaDevices.getUserMedia({
+          video: {width: {ideal: 960}, height: {ideal: 540}},
+          audio: false,
+        }),
+      )
+      .then(s => {
+        if (cancelled) {
+          s.getTracks().forEach(t => t.stop());
+          return;
+        }
+        stream = s;
+        video.srcObject = s;
+        void video.play().catch(() => {});
+
+        timerId = window.setInterval(() => {
+          if (cancelled || inFlight || !ctx || video.readyState < 2 || !video.videoWidth || !video.videoHeight) {
+            return;
+          }
+          const targetW = Math.min(960, video.videoWidth);
+          const targetH = Math.round((video.videoHeight / video.videoWidth) * targetW);
+          if (canvas.width !== targetW || canvas.height !== targetH) {
+            canvas.width = targetW;
+            canvas.height = targetH;
+          }
+          ctx.drawImage(video, 0, 0, targetW, targetH);
+          inFlight = true;
+          canvas.toBlob(
+            async blob => {
+              try {
+                if (!blob || cancelled) return;
+                const res = await fetch(`${API_BASE}/api/frame`, {
+                  method: 'POST',
+                  headers: {
+                    'Content-Type': 'image/jpeg',
+                    'X-Tracking-Mode': 'phone',
+                  },
+                  body: blob,
+                });
+                if (!res.ok || cancelled) return;
+                const data = await res.json();
+                if (Array.isArray(data?.frame_size_px) && data.frame_size_px.length >= 2) {
+                  setFrameSizePx([Number(data.frame_size_px[0]) || 960, Number(data.frame_size_px[1]) || 540]);
+                }
+                if (Array.isArray(data?.detections)) {
+                  const parsed: RawYoloDetection[] = data.detections
+                    .filter((d: Record<string, unknown>) => Array.isArray(d.bbox_xyxy) && d.bbox_xyxy.length >= 4)
+                    .map((d: Record<string, unknown>, idx: number) => ({
+                      object_id: String(d.object_id || `${d.label || 'obj'}_${idx}`),
+                      label: String(d.label || 'object'),
+                      confidence: Number(d.confidence ?? 0.7),
+                      bbox_xyxy: [
+                        Number((d.bbox_xyxy as number[])[0]),
+                        Number((d.bbox_xyxy as number[])[1]),
+                        Number((d.bbox_xyxy as number[])[2]),
+                        Number((d.bbox_xyxy as number[])[3]),
+                      ],
+                      note: typeof d.note === 'string' && d.note.trim() ? d.note.trim() : undefined,
+                    }));
+                  setRawDetections(parsed);
+                }
+              } catch {
+                // Ignore transient frame errors; polling /api/detections remains active
+              } finally {
+                inFlight = false;
+              }
+            },
+            'image/jpeg',
+            0.72,
+          );
+        }, 280);
+      })
+      .catch(() => {});
+
+    return () => {
+      cancelled = true;
+      if (timerId !== null) window.clearInterval(timerId);
+      if (stream) stream.getTracks().forEach(t => t.stop());
+      video.srcObject = null;
+    };
+  }, [mode]);
+
+  // HeadCursorController: update cursor from head orientation when pointer hasn't moved recently
+  useEffect(() => {
+    if (mode !== 'pins' || !sensorActiveRef.current) return;
+    if (Date.now() - lastPointerMoveMsRef.current < 1200) return;
+    const yaw = selfWearer.yaw;
+    const pitch = selfWearer.pitch ?? 0;
+    if (!headOriginRef.current) {
+      headOriginRef.current = {yaw, pitch};
+      return;
+    }
+    const dYaw = ((yaw - headOriginRef.current.yaw + 540) % 360) - 180;
+    const dPitch = pitch - headOriginRef.current.pitch;
+    const nx = Math.max(0.04, Math.min(0.96, 0.5 + dYaw / 60));
+    const ny = Math.max(0.04, Math.min(0.96, 0.5 - dPitch / 45));
+    setHudCursor(prev => ({...prev, visible: true, x: nx, y: ny}));
+  }, [mode, selfWearer.yaw, selfWearer.pitch]);
+
+  // Exact HudProjection.kt + YoloOverlay.kt projection into 600x600 glasses optical display
+  const hudOverlayItems = useMemo<HudOverlayItem[]>(() => {
+    const [width, height] = frameSizePx;
+    const cameraFocal = Math.hypot(width, height) / (2 * Math.tan((90 * Math.PI) / 180 / 2));
+    const displayFocal = Math.hypot(600, 600) / (2 * Math.tan((20 * Math.PI) / 180 / 2));
+    const clampedSize = Math.max(0.2, Math.min(3.0, calibration.size));
+    const scale = (displayFocal / cameraFocal) * clampedSize;
+    const rad = (calibration.roll * Math.PI) / 180;
+    const c = Math.cos(rad);
+    const s = Math.sin(rad);
+
+    const projectPoint = (x: number, y: number): [number, number] => {
+      const dx = (x - width / 2) * scale;
+      const dy = (y - height / 2) * scale;
+      return [
+        300 + calibration.horizontal + c * dx - s * dy,
+        300 + calibration.vertical + s * dx + c * dy,
+      ];
+    };
+
+    const items: HudOverlayItem[] = [];
+    for (const det of rawDetections) {
+      const b = det.bbox_xyxy;
+      const corners = [
+        projectPoint(b[0], b[1]),
+        projectPoint(b[2], b[1]),
+        projectPoint(b[2], b[3]),
+        projectPoint(b[0], b[3]),
+      ];
+      const box: [number, number, number, number] = [
+        Math.min(...corners.map(p => p[0])),
+        Math.min(...corners.map(p => p[1])),
+        Math.max(...corners.map(p => p[0])),
+        Math.max(...corners.map(p => p[1])),
+      ];
+      if (box[2] <= 0 || box[3] <= 0 || box[0] >= 600 || box[1] >= 600) {
+        continue;
+      }
+
+      const visX1 = Math.max(6, Math.min(594, box[0]));
+      const visY1 = Math.max(6, Math.min(594, box[1]));
+      const visX2 = Math.max(visX1 + 20, Math.min(594, box[2]));
+      const visY2 = Math.max(visY1 + 20, Math.min(594, box[3]));
+
+      const labelText = det.label.slice(0, 28);
+      const lw = Math.min(580, Math.max(58, labelText.length * 10 + 18));
+      const lh = 28;
+      const cx = (visX1 + visX2) / 2;
+      const cy = (visY1 + visY2) / 2;
+      const lx = Math.max(8, Math.min(592 - lw, cx - lw / 2));
+      const ly = Math.max(8, Math.min(520 - lh, cy - lh / 2));
+
+      const savedNote =
+        savedNotesMap[det.object_id] ||
+        savedNotesMap[`label:${det.label.toLowerCase()}`] ||
+        det.note;
+
+      const notePrompt =
+        liveSpeech.active && liveSpeech.noteId === det.object_id
+          ? liveSpeech.finishing
+            ? 'Transcribing...'
+            : 'stop recording'
+          : savedNote || 'add note?';
+
+      const lines = wrapNoteLines(notePrompt, 26);
+      const maxLineChars = Math.max(...lines.map(l => l.length), 9);
+      const nw = Math.min(584, Math.max(lw, maxLineChars * 9.5 + 18));
+      const nh = lines.length * 22 + 10;
+      const nx = Math.max(8, Math.min(592 - nw, lx));
+      const ny = Math.min(592 - nh, ly + lh + 4);
+
+      items.push({
+        id: det.object_id,
+        label: labelText,
+        confidence: det.confidence,
+        rawBox: det.bbox_xyxy,
+        frameSize: frameSizePx,
+        box: [visX1, visY1, visX2, visY2],
+        labelBounds: {x: lx, y: ly, w: lw, h: lh},
+        noteBounds: {x: nx, y: ny, w: nw, h: nh},
+        noteLines: lines,
+        note: savedNote,
+      });
+    }
+    return items;
+  }, [rawDetections, frameSizePx, calibration, savedNotesMap, liveSpeech]);
+
+  // Auto-select whichever object the glasses cursor is over (when not actively recording)
+  useEffect(() => {
+    if (mode !== 'pins' || liveSpeech.active) return;
+    const px = hudCursor.x * 600;
+    const py = hudCursor.y * 600;
+
+    let hovered = hudOverlayItems.find(
+      i =>
+        (px >= i.labelBounds.x - 10 &&
+          px <= i.labelBounds.x + i.labelBounds.w + 10 &&
+          py >= i.labelBounds.y - 10 &&
+          py <= i.labelBounds.y + i.labelBounds.h + 10) ||
+        (px >= i.noteBounds.x - 10 &&
+          px <= i.noteBounds.x + i.noteBounds.w + 10 &&
+          py >= i.noteBounds.y - 10 &&
+          py <= i.noteBounds.y + i.noteBounds.h + 10),
+    );
+    if (!hovered) {
+      let bestArea = Infinity;
+      for (const item of hudOverlayItems) {
+        const [x1, y1, x2, y2] = item.box;
+        if (px >= x1 - 6 && px <= x2 + 6 && py >= y1 - 6 && py <= y2 + 6) {
+          const area = Math.max(1, (x2 - x1) * (y2 - y1));
+          if (area < bestArea) {
+            bestArea = area;
+            hovered = item;
+          }
+        }
+      }
+    }
+
+    const nextId = hovered?.id ?? null;
+    setHudCursor(prev => (prev.selectedId === nextId ? prev : {...prev, selectedId: nextId}));
+  }, [mode, hudCursor.x, hudCursor.y, hudOverlayItems, liveSpeech.active]);
+
+  const projectedObjects = useMemo(() => {
+    return objects.slice(0, 8).map((obj, idx) => {
+      const dx = obj.position[0] - selfWearer.position[0];
+      const dz = obj.position[2] - selfWearer.position[2];
+      const rawBearing = (Math.atan2(dx, -dz) * 180) / Math.PI;
+      const rel = ((rawBearing - selfWearer.yaw + 540) % 360) - 180;
+      const xPct = Math.max(10, Math.min(90, 50 + (rel / 90) * 40));
+      const dy = (obj.position[1] ?? 1.0) - 1.2;
+      const yPct = Math.max(18, Math.min(82, 50 - dy * 28 + (idx % 2 === 0 ? -6 : 6)));
+      return {object: obj, xPct, yPct};
+    });
+  }, [objects, selfWearer.position, selfWearer.yaw]);
+
+  const aimedObject = useMemo(() => {
+    const selectedOverlay = hudOverlayItems.find(i => i.id === hudCursor.selectedId);
+    if (selectedOverlay) {
+      const matched = objects.find(o => o.label.toLowerCase() === selectedOverlay.label.toLowerCase());
+      if (matched) return matched;
+    }
+    if (projectedObjects.length === 0) return activeTarget;
+    let best = projectedObjects[0];
+    let bestDist = Infinity;
+    for (const item of projectedObjects) {
+      const d = Math.hypot(item.xPct - cursorPos.xPct, item.yPct - cursorPos.yPct);
+      if (d < bestDist) {
+        bestDist = d;
+        best = item;
+      }
+    }
+    return best.object;
+  }, [hudOverlayItems, hudCursor.selectedId, objects, projectedObjects, cursorPos, activeTarget]);
+
+  const captureVoiceTranscript = useCallback(
+    async (
+      promptMsg: string,
+      onStatus: (msg: string) => void,
+      onFinal: (transcript: string) => Promise<void>,
+    ) => {
+      if (isListening) return;
+      const SpeechRec =
+        typeof window !== 'undefined'
+          ? window.SpeechRecognition || window.webkitSpeechRecognition
+          : undefined;
+
+      if (typeof SpeechRec === 'function') {
+        try {
+          setIsListening(true);
+          onStatus(promptMsg);
+          const rec = new SpeechRec();
+          rec.lang = 'en-US';
+          rec.interimResults = true;
+          rec.maxAlternatives = 1;
+          let handled = false;
+          rec.onresult = ev => {
+            const last = ev.results[ev.results.length - 1];
+            const text = last?.[0]?.transcript?.trim() || '';
+            if (!text) return;
+            onStatus(`Heard: "${text}"`);
+            if (last.isFinal && !handled) {
+              handled = true;
+              setIsListening(false);
+              void onFinal(text);
+            }
+          };
+          rec.onerror = ev => {
+            setIsListening(false);
+            onStatus(`Mic error (${ev.error || 'denied'}) — tap again to retry`);
+          };
+          rec.onend = () => {
+            setIsListening(false);
+          };
+          rec.start();
+          return;
+        } catch {
+          setIsListening(false);
+        }
+      }
+
+      if (typeof navigator !== 'undefined' && navigator.mediaDevices?.getUserMedia) {
+        setIsListening(true);
+        onStatus(`${promptMsg} (NVIDIA STT)...`);
+        try {
+          const stream = await navigator.mediaDevices.getUserMedia({audio: true});
+          const ctx = new AudioContext({sampleRate: 16000});
+          const src = ctx.createMediaStreamSource(stream);
+          const proc = ctx.createScriptProcessor(4096, 1, 1);
+          const chunks: Int16Array[] = [];
+          proc.onaudioprocess = e => {
+            const f32 = e.inputBuffer.getChannelData(0);
+            const i16 = new Int16Array(f32.length);
+            for (let i = 0; i < f32.length; i += 1) {
+              const s = Math.max(-1, Math.min(1, f32[i]));
+              i16[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
+            }
+            chunks.push(i16);
+          };
+          src.connect(proc);
+          proc.connect(ctx.destination);
+          await new Promise(resolve => setTimeout(resolve, 3500));
+          proc.disconnect();
+          src.disconnect();
+          stream.getTracks().forEach(t => t.stop());
+          await ctx.close();
+
+          const total = chunks.reduce((acc, c) => acc + c.length, 0);
+          const merged = new Int16Array(total);
+          let offset = 0;
+          for (const c of chunks) {
+            merged.set(c, offset);
+            offset += c.length;
+          }
+          const tRes = await fetch(`${API_BASE}/api/transcribe`, {
+            method: 'POST',
+            headers: {'Content-Type': 'application/octet-stream', 'X-Sample-Rate': '16000'},
+            body: merged.buffer,
+          });
+          const tData = await tRes.json();
+          const transcript = String(tData.text || '').trim();
+          setIsListening(false);
+          if (transcript) {
+            onStatus(`Heard: "${transcript}"`);
+            await onFinal(transcript);
+          } else {
+            onStatus('Did not catch speech — tap again to retry');
+          }
+        } catch {
+          setIsListening(false);
+          onStatus('Microphone unavailable — check browser mic permission');
+        }
+        return;
+      }
+
+      onStatus('Voice input not supported in this browser');
+    },
+    [isListening],
+  );
+
+  const askVoiceAction = useCallback(async () => {
+    setMode('ctrlf');
+    await captureVoiceTranscript(
+      'Listening... ask where an item is',
+      setSearchMessage,
+      async transcript => {
+        await findObjectAction(transcript);
+      },
+    );
+  }, [captureVoiceTranscript, findObjectAction]);
+
   const pinMemoryAction = useCallback(
-    async (text: string, kind: string) => {
+    async (
+      text: string,
+      kind: string,
+      overridePos?: number[],
+      landmarkLabel?: string,
+    ) => {
       setMode('pins');
       const normalized = kind.includes('warn')
         ? 'warning'
@@ -843,8 +1508,8 @@ export function useWorldGit() {
         author: 'Conor',
         text,
         pin_type: normalized,
-        position: [...selfWearer.position],
-        landmark: 'Current Gaze',
+        position: overridePos ? [...overridePos] : [...selfWearer.position],
+        landmark: landmarkLabel || (overridePos ? 'Cursor Aim' : 'Current Gaze'),
         age_label: 'just now',
       };
       setPins(prev => [newPin, ...prev]);
@@ -852,14 +1517,297 @@ export function useWorldGit() {
         await fetch(`${API_BASE}/api/pin`, {
           method: 'POST',
           headers: {'Content-Type': 'application/json'},
-          body: JSON.stringify({...newPin, created_at: Date.now() / 1000}),
+          body: JSON.stringify({...newPin, world_id: 'world_1', created_at: Date.now() / 1000}),
         });
+        setPinStatus(`Saved permanently to ${newPin.landmark}: "${text}"`);
       } catch {
-        /* local state updated for offline mode */
+        setPinStatus(`Pinned locally to ${newPin.landmark} (Hub unreachable)`);
       }
       return {pinned: true, pin: newPin};
     },
     [selfWearer.position],
+  );
+
+  const persistOverlayNote = useCallback(
+    async (item: HudOverlayItem, text: string) => {
+      const clean = text.trim();
+      if (!clean) return;
+      setSavedNotesMap(prev => ({
+        ...prev,
+        [item.id]: clean,
+        [`label:${item.label.toLowerCase()}`]: clean,
+      }));
+      const matched3d = objects.find(o => o.label.toLowerCase() === item.label.toLowerCase());
+      const pos3d = matched3d ? matched3d.position : selfWearer.position;
+      void pinMemoryAction(clean, 'note', pos3d, item.label);
+      try {
+        await fetch(`${API_BASE}/api/notes`, {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({
+            object_id: item.id,
+            label: item.label,
+            text: clean,
+            author: 'Conor',
+            bbox_xyxy: item.rawBox,
+            frame_size_px: item.frameSize,
+            position_3d: pos3d,
+          }),
+        });
+      } catch {
+        /* local state + /api/pin already persisted */
+      }
+      speakOut(`${item.label}: ${clean}`);
+    },
+    [objects, selfWearer.position, pinMemoryAction, speakOut],
+  );
+
+  const finishLiveSpeech = useCallback(() => {
+    if (speechStopRef.current) {
+      speechStopRef.current();
+      speechStopRef.current = null;
+    }
+  }, []);
+
+  const startLiveSpeech = useCallback(
+    async (item: HudOverlayItem) => {
+      if (liveSpeech.active) {
+        finishLiveSpeech();
+        return;
+      }
+      setLiveSpeech({
+        active: true,
+        finishing: false,
+        noteId: item.id,
+        text: '',
+        error: null,
+      });
+
+      let latestWebText = '';
+      let recInstance: SpeechRecInstance | null = null;
+      const SpeechRec =
+        typeof window !== 'undefined'
+          ? window.SpeechRecognition || window.webkitSpeechRecognition
+          : undefined;
+      if (typeof SpeechRec === 'function') {
+        try {
+          recInstance = new SpeechRec();
+          recInstance.lang = 'en-US';
+          recInstance.continuous = true;
+          recInstance.interimResults = true;
+          recInstance.maxAlternatives = 1;
+          recInstance.onresult = ev => {
+            let combined = '';
+            for (let i = 0; i < ev.results.length; i += 1) {
+              combined += `${ev.results[i]?.[0]?.transcript || ''} `;
+            }
+            const trimmed = combined.trim();
+            if (trimmed) {
+              latestWebText = trimmed;
+              setLiveSpeech(prev => (prev.active ? {...prev, text: trimmed} : prev));
+            }
+          };
+          recInstance.start();
+        } catch {
+          recInstance = null;
+        }
+      }
+
+      const chunks: Int16Array[] = [];
+      let stream: MediaStream | null = null;
+      let ctx: AudioContext | null = null;
+      let proc: ScriptProcessorNode | null = null;
+      let src: MediaStreamAudioSourceNode | null = null;
+      let heardSpeech = false;
+      let lastSpeechMs = Date.now();
+      let stopped = false;
+
+      const finalizeCapture = async () => {
+        if (stopped) return;
+        stopped = true;
+        speechStopRef.current = null;
+        setLiveSpeech(prev => ({...prev, finishing: true}));
+
+        try {
+          recInstance?.stop?.();
+        } catch {}
+        try {
+          proc?.disconnect();
+          src?.disconnect();
+          stream?.getTracks().forEach(t => t.stop());
+          if (ctx) await ctx.close();
+        } catch {}
+
+        let finalTranscript = latestWebText.trim();
+        if (!finalTranscript && chunks.length > 0) {
+          const total = chunks.reduce((acc, c) => acc + c.length, 0);
+          const merged = new Int16Array(total);
+          let offset = 0;
+          for (const c of chunks) {
+            merged.set(c, offset);
+            offset += c.length;
+          }
+          if (merged.byteLength >= 3200) {
+            try {
+              const tRes = await fetch(`${API_BASE}/api/transcribe`, {
+                method: 'POST',
+                headers: {'Content-Type': 'application/octet-stream', 'X-Sample-Rate': '16000'},
+                body: merged.buffer,
+              });
+              if (tRes.ok) {
+                const tData = await tRes.json();
+                finalTranscript = String(tData.text || '').trim();
+              }
+            } catch {}
+          }
+        }
+
+        if (finalTranscript) {
+          await persistOverlayNote(item, finalTranscript);
+          setLiveSpeech({active: false, finishing: false, noteId: null, text: '', error: null});
+        } else {
+          setLiveSpeech({
+            active: false,
+            finishing: false,
+            noteId: null,
+            text: '',
+            error: 'No speech detected — tap add note? and speak',
+          });
+        }
+      };
+
+      speechStopRef.current = () => {
+        void finalizeCapture();
+      };
+
+      if (typeof navigator !== 'undefined' && navigator.mediaDevices?.getUserMedia) {
+        try {
+          stream = await navigator.mediaDevices.getUserMedia({audio: true});
+          ctx = new AudioContext({sampleRate: 16000});
+          src = ctx.createMediaStreamSource(stream);
+          proc = ctx.createScriptProcessor(4096, 1, 1);
+          proc.onaudioprocess = e => {
+            if (stopped) return;
+            const f32 = e.inputBuffer.getChannelData(0);
+            const i16 = new Int16Array(f32.length);
+            let sumSq = 0;
+            for (let i = 0; i < f32.length; i += 1) {
+              const s = Math.max(-1, Math.min(1, f32[i]));
+              sumSq += s * s;
+              i16[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
+            }
+            chunks.push(i16);
+            const rms = Math.sqrt(sumSq / Math.max(1, f32.length));
+            if (rms > 0.015) {
+              heardSpeech = true;
+              lastSpeechMs = Date.now();
+            } else if (heardSpeech && Date.now() - lastSpeechMs > 1700) {
+              void finalizeCapture();
+            }
+          };
+          src.connect(proc);
+          proc.connect(ctx.destination);
+        } catch {
+          if (!recInstance) {
+            setLiveSpeech({
+              active: false,
+              finishing: false,
+              noteId: null,
+              text: '',
+              error: 'Microphone permission needed for voice notes',
+            });
+            speechStopRef.current = null;
+            return;
+          }
+        }
+      }
+
+      window.setTimeout(() => {
+        if (!stopped) {
+          void finalizeCapture();
+        }
+      }, 6500);
+    },
+    [liveSpeech.active, finishLiveSpeech, persistOverlayNote],
+  );
+
+  const onOverlayMove = useCallback((xNorm: number, yNorm: number) => {
+    lastPointerMoveMsRef.current = Date.now();
+    const cx = Math.max(0.02, Math.min(0.98, xNorm));
+    const cy = Math.max(0.02, Math.min(0.98, yNorm));
+    setHudCursor(prev => ({...prev, visible: true, x: cx, y: cy}));
+    setCursorPos({xPct: cx * 100, yPct: cy * 100});
+  }, []);
+
+  const onOverlayClick = useCallback(
+    (xNormOverride?: number, yNormOverride?: number) => {
+      if (liveSpeech.active) {
+        finishLiveSpeech();
+        return;
+      }
+      const cx = xNormOverride !== undefined ? Math.max(0.02, Math.min(0.98, xNormOverride)) : hudCursor.x;
+      const cy = yNormOverride !== undefined ? Math.max(0.02, Math.min(0.98, yNormOverride)) : hudCursor.y;
+      const px = cx * 600;
+      const py = cy * 600;
+
+      // 1. Check yoloNoteAt / selected object's note prompt, label, or bounding box
+      const currentSelected = hudOverlayItems.find(i => i.id === hudCursor.selectedId);
+      if (currentSelected) {
+        const nb = currentSelected.noteBounds;
+        const lb = currentSelected.labelBounds;
+        const [bx1, by1, bx2, by2] = currentSelected.box;
+        const inNote = px >= nb.x - 10 && px <= nb.x + nb.w + 10 && py >= nb.y - 10 && py <= nb.y + nb.h + 10;
+        const inSelectedLabel = px >= lb.x - 8 && px <= lb.x + lb.w + 8 && py >= lb.y - 8 && py <= lb.y + lb.h + 8;
+        const inBox = px >= bx1 - 6 && px <= bx2 + 6 && py >= by1 - 6 && py <= by2 + 6;
+        if (inNote || inSelectedLabel || inBox || xNormOverride === undefined) {
+          void startLiveSpeech(currentSelected);
+          return;
+        }
+      }
+
+      // 2. Check yoloLabelAt (exact label bounds hit, then closest label/box)
+      let hit = hudOverlayItems.find(
+        i =>
+          px >= i.labelBounds.x - 8 &&
+          px <= i.labelBounds.x + i.labelBounds.w + 8 &&
+          py >= i.labelBounds.y - 8 &&
+          py <= i.labelBounds.y + i.labelBounds.h + 8,
+      );
+      if (!hit) {
+        let bestDist = Infinity;
+        for (const item of hudOverlayItems) {
+          const lcx = item.labelBounds.x + item.labelBounds.w / 2;
+          const lcy = item.labelBounds.y + item.labelBounds.h / 2;
+          const d = Math.hypot(lcx - px, lcy - py);
+          if (d < bestDist) {
+            bestDist = d;
+            hit = item;
+          }
+        }
+      }
+      if (hit) {
+        setHudCursor({visible: true, x: cx, y: cy, selectedId: hit.id});
+      }
+    },
+    [liveSpeech.active, finishLiveSpeech, hudCursor, hudOverlayItems, startLiveSpeech],
+  );
+
+  const aimCursor = useCallback(
+    (xPct: number, yPct: number) => {
+      onOverlayMove(xPct / 100, yPct / 100);
+    },
+    [onOverlayMove],
+  );
+
+  const dropCursorPin = useCallback(
+    async (xPctOverride?: number, yPctOverride?: number) => {
+      onOverlayClick(
+        xPctOverride !== undefined ? xPctOverride / 100 : undefined,
+        yPctOverride !== undefined ? yPctOverride / 100 : undefined,
+      );
+      return {pinned: true};
+    },
+    [onOverlayClick],
   );
 
   const runCtrlZAction = useCallback(async () => {
@@ -892,8 +1840,8 @@ export function useWorldGit() {
       setMode('pins');
       return;
     }
-    void pinMemoryAction('Caution: wet cable & power strip on floor', 'warning');
-  }, [mode, pinMemoryAction]);
+    void dropCursorPin();
+  }, [mode, dropCursorPin]);
 
   const showCrewOrStepWalk = useCallback(() => {
     if (mode !== 'crew') {
@@ -939,9 +1887,24 @@ export function useWorldGit() {
     activeTarget,
     localNav,
     searchMessage,
+    isListening,
     statusNote,
     imu,
+    cursorPos,
+    projectedObjects,
+    aimedObject,
+    pinDraft,
+    pinStatus,
+    hudOverlayItems,
+    hudCursor,
+    liveSpeech,
+    onOverlayMove,
+    onOverlayClick,
+    setPinDraft,
+    aimCursor,
+    dropCursorPin,
     findObjectAction,
+    askVoiceAction,
     pinMemoryAction,
     runCtrlZAction,
     startSensorsAndRecord,

@@ -9,6 +9,7 @@ import socket
 import threading
 import time
 from urllib.parse import parse_qs, urlparse
+import urllib.request
 from audio_clips import AudioClips, DEFAULT_AUDIO_DIR, MAX_AUDIO_BYTES
 from object_memory import DEFAULT_MEMORY_DIR, ObjectMemoryStore
 from parakeet_asr import ParakeetClient, TranscriptionUnavailable, MAX_PCM_BYTES, validate_pcm
@@ -238,7 +239,26 @@ class DetectionServer:
                         return
                     body = self.rfile.read(length)
                     validate_pcm(body)
-                    data = json.dumps(owner.transcribe(body)).encode()
+                    try:
+                        transcript = owner.transcribe(body)
+                    except TranscriptionUnavailable:
+                        studio = (owner.studio_url or "http://127.0.0.1:8000").rstrip("/")
+                        req = urllib.request.Request(
+                            f"{studio}/api/transcribe",
+                            data=body,
+                            headers={
+                                "Content-Type": "application/octet-stream",
+                                "X-Sample-Rate": "16000",
+                                "X-Relay-From-8765": "1",
+                            },
+                            method="POST",
+                        )
+                        try:
+                            with urllib.request.urlopen(req, timeout=12) as resp:
+                                transcript = json.loads(resp.read().decode("utf-8"))
+                        except Exception as exc:
+                            raise TranscriptionUnavailable(f"Parakeet and Gemini ASR unavailable: {exc}") from exc
+                    data = json.dumps(transcript).encode()
                     self.send_response(200)
                     self.send_header('Content-Type', 'application/json')
                     self.send_header('Content-Length', str(len(data)))

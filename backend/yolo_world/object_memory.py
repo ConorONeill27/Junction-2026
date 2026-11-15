@@ -308,6 +308,7 @@ class ObjectMemoryStore:
                             "actor_user_id": self.actor_user_id,
                             "zone_hint": spatial_phrase or context or "",
                             "confidence": round(conf, 3),
+                            "unlocalized_2d": True,
                         },
                     )
 
