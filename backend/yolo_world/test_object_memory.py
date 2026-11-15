@@ -127,6 +127,67 @@ class ObjectMemoryTests(unittest.TestCase):
             finally:
                 server.close()
 
+    def test_multi_instance_bottles_privacy_block_and_session_wipe(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            dets = [{"object_id": "b1", "label": "bottle", "confidence": 0.92, "bbox_xyxy": [40.0, 30.0, 120.0, 190.0]}]
+            server = DetectionServer(
+                "127.0.0.1",
+                0,
+                predict=lambda _f: dets,
+                notes_dir=Path(tmp) / "notes",
+                places_dir=Path(tmp) / "places",
+                memory_dir=Path(tmp) / "memory",
+            ).start()
+            port = server.http.server_address[1]
+            try:
+                # Blue bottle frame
+                f1 = np.full((240, 320, 3), 20, dtype=np.uint8)
+                f1[30:190, 40:120] = (230, 40, 20)
+                _, j1 = cv2.imencode(".jpg", f1)
+                urllib.request.urlopen(urllib.request.Request(
+                    f"http://127.0.0.1:{port}/api/frame", data=j1.tobytes(),
+                    headers={"Content-Type": "image/jpeg", "X-Tracking-Mode": "phone"}, method="POST",
+                ), timeout=5).read()
+
+                # Distinct red bottle frame
+                f2 = np.full((240, 320, 3), 20, dtype=np.uint8)
+                f2[30:190, 40:120] = (20, 40, 230)
+                _, j2 = cv2.imencode(".jpg", f2)
+                urllib.request.urlopen(urllib.request.Request(
+                    f"http://127.0.0.1:{port}/api/frame", data=j2.tobytes(),
+                    headers={"Content-Type": "image/jpeg", "X-Tracking-Mode": "phone"}, method="POST",
+                ), timeout=5).read()
+
+                found = json.loads(urllib.request.urlopen(
+                    f"http://127.0.0.1:{port}/api/memory/find?q=bottle", timeout=5,
+                ).read().decode("utf-8"))
+                self.assertTrue(found["found"])
+                self.assertEqual(found["instance_count"], 2)
+
+                # Privacy pause clears latest_frame and skips /api/frame inference
+                urllib.request.urlopen(urllib.request.Request(
+                    f"http://127.0.0.1:{port}/api/privacy",
+                    data=json.dumps({"paused": True}).encode("utf-8"),
+                    headers={"Content-Type": "application/json"}, method="POST",
+                ), timeout=5).read()
+                self.assertIsNone(server.latest_frame)
+                res_paused = json.loads(urllib.request.urlopen(urllib.request.Request(
+                    f"http://127.0.0.1:{port}/api/frame", data=j1.tobytes(),
+                    headers={"Content-Type": "image/jpeg", "X-Tracking-Mode": "phone"}, method="POST",
+                ), timeout=5).read().decode("utf-8"))
+                self.assertTrue(res_paused["paused"])
+                self.assertIsNone(server.latest_frame)
+
+                # Full session wipe
+                wiped = json.loads(urllib.request.urlopen(urllib.request.Request(
+                    f"http://127.0.0.1:{port}/api/session", method="DELETE",
+                ), timeout=5).read().decode("utf-8"))
+                self.assertTrue(wiped["cleared"])
+                mem = json.loads(urllib.request.urlopen(f"http://127.0.0.1:{port}/api/memory", timeout=5).read().decode("utf-8"))
+                self.assertEqual(mem["memories"], [])
+            finally:
+                server.close()
+
 
 if __name__ == "__main__":
     unittest.main()

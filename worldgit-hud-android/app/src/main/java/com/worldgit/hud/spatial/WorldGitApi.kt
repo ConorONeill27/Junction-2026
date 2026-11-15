@@ -390,14 +390,24 @@ object WorldGitApi {
   }
 
   fun clearNotes(host: String) = runCatching {
-    val conn = URI("${visionBase(host)}/api/notes").toURL().openConnection() as HttpURLConnection
-    conn.connectTimeout = 2000
-    conn.readTimeout = 2000
-    conn.requestMethod = "DELETE"
-    try {
-      conn.inputStream.use { it.readBytes() }
-    } finally {
-      conn.disconnect()
+    val deletePath: (String) -> Int = { path ->
+      val conn = URI("${visionBase(host)}$path").toURL().openConnection() as HttpURLConnection
+      conn.connectTimeout = 2000
+      conn.readTimeout = 2000
+      conn.requestMethod = "DELETE"
+      try {
+        val code = conn.responseCode
+        val stream = if (code in 200..299) conn.inputStream else conn.errorStream
+        stream?.use { it.readBytes() }
+        code
+      } finally {
+        conn.disconnect()
+      }
+    }
+    val code = deletePath("/api/session")
+    if (code !in 200..299) {
+      deletePath("/api/notes")
+      deletePath("/api/memory")
     }
   }
 }

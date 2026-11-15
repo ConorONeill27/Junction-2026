@@ -80,6 +80,8 @@ class WorldGitViewModel(application: Application) : AndroidViewModel(application
   private val frameBusy = AtomicBoolean(false)
   private val networkBusy = AtomicBoolean(false)
   private var nextUploadAtNs = 0L
+  @Volatile private var lastVisionOkMs = 0L
+  @Volatile private var manualSelectionHoldUntilMs = 0L
 
   private var spatialObjects: List<SpatialObject> = emptyList()
   private var wearerPos = Triple(0.0, 1.6, 0.0)
@@ -652,8 +654,32 @@ class WorldGitViewModel(application: Application) : AndroidViewModel(application
 
   fun togglePrivacy() {
     val next = !_ui.value.memoryPaused
-    _ui.value = _ui.value.copy(memoryPaused = next)
+    if (next) {
+      if (_ui.value.speech.active) cancelSpeech()
+      _ui.value = _ui.value.copy(
+        memoryPaused = true,
+        cameraPreview = null,
+        yoloState = YoloState(status = "Privacy paused"),
+        projectedYoloState = YoloState(status = "Privacy paused"),
+      )
+    } else {
+      _ui.value = _ui.value.copy(
+        memoryPaused = false,
+        yoloState = YoloState(status = "Point glasses at objects to scan"),
+      )
+    }
     viewModelScope.launch(Dispatchers.IO) { WorldGitApi.togglePrivacy(_ui.value.host, next) }
+  }
+
+  fun selectNextDetectedObject() {
+    val cur = _ui.value
+    val items = cur.projectedYoloState.items.ifEmpty { cur.yoloState.items }
+    if (items.isEmpty()) return
+    val currentIdx = cur.cursor.selectedId?.let { sel -> items.indexOfFirst { it.id == sel } } ?: -1
+    val nextItem = items[(currentIdx + 1) % items.size]
+    manualSelectionHoldUntilMs = System.currentTimeMillis() + 6000L
+    headCursor.updateHoverSelection(nextItem.id)
+    _ui.value = cur.copy(cursor = headCursor.state.copy(selectedId = nextItem.id))
   }
 
   fun clearSavedNotes() {
@@ -720,9 +746,11 @@ class WorldGitViewModel(application: Application) : AndroidViewModel(application
   }
 
   private fun receiveGlassesVideoFrame(i420: ByteArray, width: Int, height: Int, receivedAtNs: Long) {
+    if (_ui.value.memoryPaused) return
     if (!frameBusy.compareAndSet(false, true)) return
     visionHandler.post {
       try {
+        if (_ui.value.memoryPaused) return@post
         val argb = GlassesFramePixels.i420ToArgb(i420, width, height)
         val bitmap = Bitmap.createBitmap(argb, width, height, Bitmap.Config.ARGB_8888)
         val pose = glassesMotion.predict(receivedAtNs) ?: phoneMotion.predict(receivedAtNs)
@@ -767,6 +795,8 @@ class WorldGitViewModel(application: Application) : AndroidViewModel(application
           viewModelScope.launch(Dispatchers.IO) {
             try {
               val res = WorldGitApi.postFrame(host, jpeg, pose)
+              lastVisionOkMs = System.currentTimeMillis()
+              if (_ui.value.memoryPaused) return@launch
               visionHandler.post {
                 localTracker.correct(res.items, receivedAtNs / 1e9, SystemClock.elapsedRealtimeNanos() / 1e9, res.width, res.height)
               }
@@ -779,6 +809,14 @@ class WorldGitViewModel(application: Application) : AndroidViewModel(application
               }
             } catch (e: Exception) {
               Log.w(TAG, "Frame upload skipped: ${e.message}")
+              if (lastVisionOkMs > 0L && System.currentTimeMillis() - lastVisionOkMs > 2500L) {
+                val msg = "Vision server offline — reconnecting"
+                _ui.value = _ui.value.copy(
+                  yoloState = YoloState(status = msg),
+                  projectedYoloState = YoloState(status = msg),
+                  deviceStatus = msg,
+                )
+              }
             } finally {
               networkBusy.set(false)
             }
@@ -805,9 +843,11 @@ class WorldGitViewModel(application: Application) : AndroidViewModel(application
       predicted
     }
 
-    if (cur.mode == HudMode.PINS && !cur.speech.active) {
+    if (cur.mode == HudMode.PINS && !cur.speech.active && !cur.memoryPaused) {
       val hovered = WorldGitHudRenderer.hoveredObjectId(projected, headCursor.state, cur.speech)
-      headCursor.updateHoverSelection(hovered)
+      if (hovered != null || System.currentTimeMillis() > manualSelectionHoldUntilMs) {
+        headCursor.updateHoverSelection(hovered)
+      }
     }
 
     if (cur.projectedYoloState != projected || cur.cursor != headCursor.state) {
@@ -904,6 +944,34 @@ class WorldGitViewModel(application: Application) : AndroidViewModel(application
       }
 
       HudMode.PINS -> {
+        if (cur.memoryPaused) {
+          return GlassesHudPacket(signature = "PINS:PAUSED", minIntervalMs = 500L) {
+            flexBox(direction = Direction.COLUMN, gap = 10, padding = 16) {
+              flexBox(direction = Direction.ROW, gap = 8, crossAlignment = Alignment.CENTER) {
+                icon(IconName.EYE, style = IconStyle.OUTLINE)
+                text("WorldGit • Privacy Paused", style = TextStyle.HEADING)
+              }
+              flexBox(direction = Direction.COLUMN, gap = 8, padding = 18, background = FlexBoxBackground.CARD, flexGrow = 1f) {
+                text("Camera frame uploads and object memory are paused.", style = TextStyle.BODY)
+              }
+              buttonGroup(alignment = ButtonGroupAlignment.CENTER) {
+                button(
+                  label = "Resume",
+                  style = ButtonStyle.PRIMARY,
+                  iconName = IconName.EYE,
+                  actionRole = ActionRole.PRIMARY,
+                  onClick = { onMain { togglePrivacy() } },
+                )
+                button(
+                  label = "Ask",
+                  style = ButtonStyle.SECONDARY,
+                  iconName = IconName.COMPASS_NORTH_UP_RED,
+                  onClick = { onMain { setMode(HudMode.ASK) } },
+                )
+              }
+            }
+          }
+        }
         val s = cur.speech
         val hoveredItem = cur.cursor.selectedId?.let { id ->
           projected.items.firstOrNull { it.id == id } ?: cur.yoloState.items.firstOrNull { it.id == id }
@@ -972,18 +1040,28 @@ class WorldGitViewModel(application: Application) : AndroidViewModel(application
                   actionRole = ActionRole.PRIMARY,
                   onClick = { onMain { handleHudPrimaryAction() } },
                 )
+                if (projected.items.isNotEmpty()) {
+                  button(
+                    label = "Next",
+                    style = ButtonStyle.SECONDARY,
+                    iconName = IconName.ARROW_RIGHT,
+                    onClick = { onMain { selectNextDetectedObject() } },
+                  )
+                }
                 button(
                   label = "Ask",
                   style = ButtonStyle.SECONDARY,
                   iconName = IconName.COMPASS_NORTH_UP_RED,
                   onClick = { onMain { setMode(HudMode.ASK) } },
                 )
-                button(
-                  label = "Scan",
-                  style = ButtonStyle.OUTLINE,
-                  iconName = IconName.EYE,
-                  onClick = { onMain { setMode(HudMode.SCAN) } },
-                )
+                if (projected.items.isEmpty()) {
+                  button(
+                    label = "Scan",
+                    style = ButtonStyle.OUTLINE,
+                    iconName = IconName.EYE,
+                    onClick = { onMain { setMode(HudMode.SCAN) } },
+                  )
+                }
               }
             }
           }

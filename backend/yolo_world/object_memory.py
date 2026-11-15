@@ -185,6 +185,25 @@ def _spatial_context(target_det, target_box, detections, width: int, height: int
 from studio_bridge import post_json_async
 
 
+def _crop_hsv_hist(crop_bgr):
+    """Compact 8x8 HS color histogram for distinguishing different instances of the same class."""
+    if crop_bgr is None or crop_bgr.size == 0:
+        return None
+    hsv = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2HSV)
+    hist = cv2.calcHist([hsv], [0, 1], None, [8, 8], [0, 180, 0, 256])
+    cv2.normalize(hist, hist)
+    return [round(float(v), 4) for v in hist.flatten()]
+
+
+def _hist_corr(a, b) -> float:
+    if not a or not b or len(a) != len(b):
+        return 1.0
+    import numpy as np
+    va = np.asarray(a, dtype=np.float32)
+    vb = np.asarray(b, dtype=np.float32)
+    return float(cv2.compareHist(va, vb, cv2.HISTCMP_CORREL))
+
+
 class ObjectMemoryStore:
     """Stores last-seen frame, crop, and surrounding context for everyday objects."""
 
@@ -242,6 +261,7 @@ class ObjectMemoryStore:
             now = time.time()
             h, w = frame.shape[:2]
             updated = False
+            used_keys_this_frame = set()
             for det in detections:
                 if det.get("anchor_source"):
                     continue
@@ -249,13 +269,38 @@ class ObjectMemoryStore:
                 conf = float(det.get("confidence", 0.0))
                 if not label or conf < min_conf:
                     continue
-                if now - self._last_saved_at.get(label, 0.0) < 0.75:
-                    continue
                 bbox = det.get("bbox_xyxy") or [0, 0, 0, 0]
                 x1, y1, x2, y2 = [int(v) for v in bbox]
                 l, t = max(0, x1), max(0, y1)
                 r, b = min(w, x2), min(h, y2)
                 if r <= l or b <= t:
+                    continue
+
+                crop = frame[t:b, l:r]
+                hist = _crop_hsv_hist(crop)
+
+                # Match an existing instance of this class by visual appearance (HSV histogram),
+                # or allocate "<label> #2" if two distinct instances are seen.
+                existing_keys = [k for k, v in self.items.items() if v.get("label") == label and k not in used_keys_this_frame]
+                target_key = None
+                best_sim = -1.0
+                for k in existing_keys:
+                    sim = _hist_corr(hist, self.items[k].get("hist"))
+                    if sim > best_sim:
+                        best_sim = sim
+                        target_key = k
+
+                if target_key is None or (best_sim < 0.62 and len([k for k, v in self.items.items() if v.get("label") == label]) < 4):
+                    if label not in self.items and label not in used_keys_this_frame:
+                        target_key = label
+                    else:
+                        idx = 2
+                        while f"{label} #{idx}" in self.items or f"{label} #{idx}" in used_keys_this_frame:
+                            idx += 1
+                        target_key = f"{label} #{idx}" if idx <= 4 else (target_key or label)
+
+                used_keys_this_frame.add(target_key)
+                if now - self._last_saved_at.get(target_key, 0.0) < 0.75:
                     continue
 
                 context, spatial_phrase, in_hand = _spatial_context(det, (l, t, r, b), detections, w, h)
@@ -267,7 +312,7 @@ class ObjectMemoryStore:
                     if ol and ol != label and ol not in neighbors:
                         neighbors.append(ol)
 
-                safe_name = "".join(c if c.isalnum() or c in "-_" else "_" for c in label)
+                safe_name = "".join(c if c.isalnum() or c in "-_" else "_" for c in target_key)
                 annotated = frame.copy()
                 cv2.rectangle(annotated, (l, t), (r, b), (72, 235, 160), 3)
                 tag = f"{_spoken_label(label)}: {spatial_phrase}"
@@ -277,9 +322,10 @@ class ObjectMemoryStore:
                 frame_path = self.directory / f"{safe_name}_frame.jpg"
                 crop_path = self.directory / f"{safe_name}_crop.jpg"
                 cv2.imwrite(str(frame_path), annotated)
-                cv2.imwrite(str(crop_path), frame[t:b, l:r])
+                cv2.imwrite(str(crop_path), crop)
 
-                self.items[label] = {
+                self.items[target_key] = {
+                    "instance_id": target_key,
                     "label": label,
                     "confidence": round(conf, 3),
                     "context": context,
@@ -291,8 +337,9 @@ class ObjectMemoryStore:
                     "last_seen": now,
                     "frame_file": frame_path.name,
                     "crop_file": crop_path.name,
+                    "hist": hist,
                 }
-                self._last_saved_at[label] = now
+                self._last_saved_at[target_key] = now
                 updated = True
 
                 if self.studio_url:
@@ -326,30 +373,38 @@ class ObjectMemoryStore:
             out.sort(key=lambda x: x.get("last_seen", 0.0), reverse=True)
             return out
 
-    def _lookup_locked(self, query: str):
+    def _lookup_all_locked(self, query: str):
         q = (query or "").strip().lower()
         if not q:
-            return None
+            return []
         candidates = LABEL_ALIASES.get(q, (q,))
-        for cand in candidates:
-            if cand in self.items:
-                return self.items[cand]
+        hits = []
         for cand in candidates:
             for k, v in self.items.items():
-                if cand in k or k in cand:
-                    return v
-        return None
+                lbl = (v.get("label") or k).lower()
+                if lbl == cand or cand in k or k in cand or cand in lbl:
+                    if v not in hits:
+                        hits.append(v)
+        hits.sort(key=lambda x: x.get("last_seen", 0.0), reverse=True)
+        return hits
 
-    def _with_snapshot(self, item: dict, now: float) -> dict:
+    def _lookup_locked(self, query: str):
+        hits = self._lookup_all_locked(query)
+        return hits[0] if hits else None
+
+    def _with_snapshot(self, item: dict, now: float, instance_count: int = 1) -> dict:
         rec = dict(item)
+        rec.pop("hist", None)
         age = _human_age(max(0.0, now - float(rec.get("last_seen", now))))
         rec["age_label"] = age
+        rec["instance_count"] = instance_count
         loc = rec.get("spatial_phrase") or rec.get("context") or "in room view"
         ctx = rec.get("context") or ""
+        multi_prefix = f"{instance_count} {rec['label']}s tracked; latest " if instance_count > 1 else ""
         if ctx and ctx not in loc:
-            rec["summary"] = f"{rec['label'].title()} last seen {age}, {loc} ({ctx})"
+            rec["summary"] = f"{multi_prefix}{rec['label'].title()} last seen {age}, {loc} ({ctx})"
         else:
-            rec["summary"] = f"{rec['label'].title()} last seen {age}, {loc}"
+            rec["summary"] = f"{multi_prefix}{rec['label'].title()} last seen {age}, {loc}"
         frame_path = self.directory / rec["frame_file"]
         if frame_path.exists():
             rec["snapshot_b64"] = base64.b64encode(frame_path.read_bytes()).decode("ascii")
@@ -360,10 +415,10 @@ class ObjectMemoryStore:
         if not q:
             return None
         with self.lock:
-            match = self._lookup_locked(q)
-            if match is None:
+            hits = self._lookup_all_locked(q)
+            if not hits:
                 return None
-            return self._with_snapshot(match, time.time())
+            return self._with_snapshot(hits[0], time.time(), instance_count=len(hits))
 
     def ask(self, question: str):
         """Answer natural-language memory queries such as 'Hey Meta, have I left anything behind?'."""

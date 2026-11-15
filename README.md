@@ -1,52 +1,45 @@
-# WorldGit — Version Control for the Physical World
+# WorldGit — Ctrl+F & Spatial Memory for Meta AI Glasses
 
-**Multiplayer Spatial Memory (`Ctrl+F`, `Ctrl+Z`, `git diff`, Spatial Pins & Friend's World) for Meta AI Glasses.**
+**Hands-free object memory, spoken spatial notes, and 3D room context for Meta Ray-Ban Display AI glasses.**
 
-> **Docs & AI Collaboration:**
-> - [`EXPLAINER.md`](EXPLAINER.md) — Full architecture, 6-track breakdown, frozen API contracts, 4-person parallel workflow & 90s demo script
-> - [`AGENTS.md`](AGENTS.md) / [`CLAUDE.md`](CLAUDE.md) / [`.cursorrules`](.cursorrules) — Rules for AI coding assistants working simultaneously without conflicts
-> - [`CODEX_WORKFLOW.md`](CODEX_WORKFLOW.md) — OpenAI Codex architecture & verification log
+> **Docs & Submission:**
+> - [`docs/META_SUBMISSION.md`](docs/META_SUBMISSION.md) — Meta challenge submission, privacy/accessibility controls, and honest scope
+> - [`EXPLAINER.md`](EXPLAINER.md) — Full system architecture, API contracts, and demo script
+> - [`worldgit-hud-android/`](worldgit-hud-android/) — **Native Android + Meta DAT SDK glasses app** (live glasses camera, 60 Hz IMU fusion, Bloks HUD, voice transcription, and TTS)
 
-## Tracks & Tech Challenges
+## Architecture & Components
 
-| Track / Challenge | Integration in WorldGit | Location |
+| Component | Purpose | Location |
 |---|---|---|
-| **Meta — AI Glasses for Everyone, Everyday** | Official `@wearables-ui-toolkit/mrbd` 600×600 transparent HUD, D-pad/Neural Band controls & WebMCP voice tools | [`glasses-app/`](glasses-app/) |
-| **Google DeepMind — Gemini API** | Semantic first-person frame object detection (`gemini-2.5-flash`) & `Ctrl+Z` spoken restore generation | [`backend/ai_services.py`](backend/ai_services.py) |
-| **Modal — Best Use of Modal** | Cloud GPU (`L4`) monocular Depth-Anything-V2 3D point-cloud reconstruction endpoint | [`gpu_worker/reconstruct.py`](gpu_worker/reconstruct.py) |
-| **ElevenLabs** | Low-latency whispered spatial guidance (`eleven_turbo_v2_5`) via `/api/tts` | [`backend/ai_services.py`](backend/ai_services.py) |
-| **Aiven** | Persistent PostgreSQL backend (`AIVEN_DATABASE_URL`) for spatial objects, `git` snapshots & Friend's World memories | [`backend/db.py`](backend/db.py) |
-| **OpenAI — Best Use of Codex** | AI-accelerated development workflow & GPT-4o-mini reasoning fallback | [`CODEX_WORKFLOW.md`](CODEX_WORKFLOW.md) |
+| **Native Meta Display App** | Real Meta DAT SDK integration: glasses camera stream, Bloks HUD (`Ask` compass, `Pins` overlay, `Next` object cycling, `Undo`), Whisper/Gemini voice notes, TTS, and Privacy Pause | [`worldgit-hud-android/`](worldgit-hud-android/) |
+| **Real-Time Vision Server (`:8765`)** | YOLO-World object detection, HSV multi-instance object memory (`ObjectMemoryStore`), spatial notes (`SpatialNoteStore`), ORB place anchors, strict Privacy Pause, and `DELETE /api/session` wipe | [`backend/yolo_world/`](backend/yolo_world/) |
+| **3D Studio & Spatial Hub (`:8000`)** | Room reconstruction (`VGGT-1B` / `Depth-Anything-V2`), spatial diffing, Gemini Q&A, and ElevenLabs/browser TTS | [`backend/`](backend/) |
+| **3D Studio Web UI (`:5173`)** | Desktop Three.js spatial viewer, object-pin inspector, and live glasses telemetry | [`frontend/`](frontend/) |
+| **Web HUD Simulator (`:4173`)** | Browser/MRBD-simulator companion HUD for desktop testing without hardware | [`glasses-app/`](glasses-app/) |
 
 ## Quick Start
 
-### 1. Backend Spatial Hub (`http://127.0.0.1:8000`)
+### 1. Real-Time Vision Server (`127.0.0.1:8765`, USB `adb reverse`)
+```powershell
+cd backend\yolo_world
+..\.venv311\Scripts\python.exe run.py --source phone --headless
+```
+> Binds to `127.0.0.1` by default (use `adb reverse tcp:8765 tcp:8765` for USB-connected Android phones; set `WORLDGIT_API_TOKEN` to require `X-WorldGit-Token` on API requests).
+
+### 2. Native Android + Meta Display App (`worldgit-hud-android`)
+```powershell
+cd worldgit-hud-android
+.\gradlew.bat assembleDebug
+adb reverse tcp:8765 tcp:8765
+adb reverse tcp:8000 tcp:8000
+adb install -r app\build\outputs\apk\debug\app-debug.apk
+```
+
+### 3. Spatial Hub (`127.0.0.1:8000`) & 3D Studio (`127.0.0.1:5173`)
 ```powershell
 cd backend
-python -m venv .venv
-.venv\Scripts\activate
-pip install -r requirements.txt
-uvicorn main:app --host 127.0.0.1 --port 8000
+.\.venv311\Scripts\uvicorn.exe main:app --host 127.0.0.1 --port 8000
 ```
-
-Optional environment variables in `backend/.env`:
-```env
-GEMINI_API_KEY=...
-OPENAI_API_KEY=...
-ELEVENLABS_API_KEY=...
-AIVEN_DATABASE_URL=postgres://...
-MODAL_RECONSTRUCT_URL=https://...modal.run
-```
-
-### 2. Meta Ray-Ban Display HUD (`http://127.0.0.1:4173`)
-```powershell
-cd glasses-app
-npm run build
-npm run preview -- --host 127.0.0.1 --port 4173
-```
-Open `http://127.0.0.1:4173/` in the **Meta Ray-Ban Display Simulator** Chrome extension (or desktop browser with Arrow keys + Enter).
-
-### 3. Desktop 3D Command Center (`http://127.0.0.1:5173`)
 ```powershell
 cd frontend
 npm install

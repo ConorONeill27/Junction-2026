@@ -30,11 +30,12 @@ class CameraHTTPServer(ThreadingHTTPServer):
 
 
 class DetectionServer:
-    def __init__(self, host="0.0.0.0", port=8765, predict=None, track=None, audio_dir=DEFAULT_AUDIO_DIR, transcribe=None, notes_dir=DEFAULT_NOTES_DIR, places_dir=DEFAULT_PLACES_DIR, memory_dir=DEFAULT_MEMORY_DIR, studio_url=DEFAULT_STUDIO_URL):
+    def __init__(self, host="127.0.0.1", port=8765, predict=None, track=None, audio_dir=DEFAULT_AUDIO_DIR, transcribe=None, notes_dir=DEFAULT_NOTES_DIR, places_dir=DEFAULT_PLACES_DIR, memory_dir=DEFAULT_MEMORY_DIR, studio_url=DEFAULT_STUDIO_URL, api_token=None):
         self.lock = threading.Lock()
         self.snapshot = {"timestamp": None, "source": "laptop_camera", "detections": []}
         owner = self
         self.studio_url = studio_url
+        self.api_token = (api_token if api_token is not None else os.getenv("WORLDGIT_API_TOKEN", "")).strip()
         self.inference_lock = threading.Lock()
         self.audio_clips = AudioClips(audio_dir)
         self.transcribe = transcribe or ParakeetClient().transcribe
@@ -46,6 +47,15 @@ class DetectionServer:
 
         class Handler(BaseHTTPRequestHandler):
             protocol_version = "HTTP/1.1"
+
+            def _authorized(self):
+                if not owner.api_token:
+                    return True
+                supplied = (self.headers.get("X-WorldGit-Token") or "").strip()
+                if supplied != owner.api_token:
+                    self._send_json({"error": "Unauthorized"}, status=401)
+                    return False
+                return True
 
             def _send_json(self, obj, status=200):
                 data = json.dumps(obj).encode("utf-8")
@@ -62,6 +72,8 @@ class DetectionServer:
                 self.connection.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
 
             def do_GET(self):
+                if not self._authorized():
+                    return
                 if self.path == "/api/calibration":
                     cal_path = Path(__file__).resolve().parent / "hud_calibration.json"
                     data = cal_path.read_bytes() if cal_path.exists() else b"{}"
@@ -111,6 +123,8 @@ class DetectionServer:
                 self.wfile.write(data)
 
             def do_DELETE(self):
+                if not self._authorized():
+                    return
                 if self.path == "/api/notes":
                     owner.notes.clear()
                     self._send_json({"ok": True, "notes": []})
@@ -123,9 +137,26 @@ class DetectionServer:
                     owner.memory.clear()
                     self._send_json({"ok": True, "memories": []})
                     return
+                if self.path == "/api/session":
+                    owner.memory.clear()
+                    owner.notes.clear()
+                    owner.places.clear()
+                    with owner.lock:
+                        owner.latest_frame = None
+                        owner.latest_detections = []
+                        owner.snapshot = {"timestamp": time.time(), "source": "cleared", "detections": [], "paused": owner.memory.paused}
+                    audio_dir_path = getattr(owner.audio_clips, "directory", None)
+                    if audio_dir_path and Path(audio_dir_path).exists():
+                        for f in Path(audio_dir_path).glob("*"):
+                            if f.is_file():
+                                f.unlink(missing_ok=True)
+                    self._send_json({"ok": True, "memories": [], "notes": [], "places": [], "cleared": True})
+                    return
                 self.send_error(404)
 
             def do_POST(self):
+                if not self._authorized():
+                    return
                 if self.path == "/api/calibration":
                     self.save_calibration()
                     return
@@ -153,6 +184,18 @@ class DetectionServer:
                 length = int(self.headers.get("Content-Length", "0"))
                 if not 0 < length <= 2_000_000:
                     self.send_error(413)
+                    return
+                if owner.memory.paused:
+                    # Drain request body without decoding or retaining frames while Privacy Pause is active
+                    if length > 0:
+                        self.rfile.read(length)
+                    self._send_json({
+                        "timestamp": time.time(),
+                        "source": "privacy_paused",
+                        "detections": [],
+                        "paused": True,
+                        "tracking_mode": "paused",
+                    })
                     return
                 if not owner.inference_lock.acquire(blocking=False):
                     self.send_error(429, "Inference busy; drop this frame")
@@ -280,6 +323,16 @@ class DetectionServer:
                     length = int(self.headers.get("Content-Length", "0"))
                     payload = json.loads(self.rfile.read(length).decode("utf-8")) if length > 0 else {}
                     paused = owner.memory.set_paused(bool(payload.get("paused", not owner.memory.paused)))
+                    if paused:
+                        with owner.lock:
+                            owner.latest_frame = None
+                            owner.latest_detections = []
+                            owner.snapshot = {
+                                "timestamp": time.time(),
+                                "source": "privacy_paused",
+                                "detections": [],
+                                "paused": True,
+                            }
                     self._send_json({"ok": True, "paused": paused})
                 except (OSError, ValueError, TypeError):
                     self.send_error(400, "Invalid privacy payload")

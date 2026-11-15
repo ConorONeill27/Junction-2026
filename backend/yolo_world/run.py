@@ -53,7 +53,7 @@ def main():
     parser.add_argument("--model", type=Path, default=MODEL_PATH)
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT, help="Latest detection centers TXT file (overwritten each pass)")
     parser.add_argument("--objects-dir", type=Path, default=DEFAULT_OBJECTS_DIR, help="Folder containing object IDs and crops")
-    parser.add_argument("--host", default="0.0.0.0", help="Detection API bind address")
+    parser.add_argument("--host", default="127.0.0.1", help="Detection API bind address")
     parser.add_argument("--port", type=int, default=8765, help="Phone app detection API port")
     parser.add_argument("--device", default="auto", help="auto selects CUDA when available; cpu or 0 also supported")
     parser.add_argument("--classes", nargs="+", help="Optional custom vocabulary; first use downloads a text encoder")

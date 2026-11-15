@@ -50,28 +50,33 @@ A phone screen requires stopping, unlocking, aiming, and holding the device. Met
   - High-contrast HUD cards and calibrated display bounds (`hud_calibration.json` + phone `SharedPreferences`).
   - Toggleable **Voice: ON/OFF** (`TextToSpeech` readout for pinned notes, place reviews, and bottle-finder results).
 - **Privacy & Consent:**
-  - Explicit **Memory: ON / PAUSED** toggle (`POST /api/privacy`) that immediately stops passive memory capture and displays `PRIVACY: MEMORY PAUSED` on the glasses HUD.
-  - One-tap **Clear** control (`DELETE /api/memory`) to wipe stored snapshots and metadata.
-  - Local-first storage on the user's own server (`notes/`, `places/`, `memory/`).
+  - **Strict Privacy Pause (`POST /api/privacy`):** Stops frame uploads on the Android app (`receiveGlassesVideoFrame` returns immediately), clears live HUD previews/boxes, drops `latest_frame` and `latest_detections` on `:8765`, rejects/short-circuits `/api/frame` processing while paused, and displays `WorldGit • Privacy Paused` with a one-tap **Resume** button on the glasses HUD.
+  - **Full Session Wipe (`DELETE /api/session`):** One-tap **Clear** wipes object memory snapshots (`memory/`), saved spatial notes (`notes/`), place anchors (`places/`), recorded audio clips (`audio_clips/`), and in-memory frames/detections.
+  - **Localhost-by-Default & Optional Auth:** The `:8765` Vision server binds to `127.0.0.1` by default (routed over USB `adb reverse tcp:8765 tcp:8765`) and supports `WORLDGIT_API_TOKEN` / `X-WorldGit-Token` header verification.
+- **Accessible & Inclusive Input:**
+  - **Head-Aim-Free `Next` Cycling:** In glasses `Pins` mode, wearers can either aim with head motion or tap **Next** in the Bloks `buttonGroup` to cycle through detected objects without fine neck/head aiming.
+  - **Multi-Instance Object Disambiguation:** `ObjectMemoryStore` compares 8×8 Hue-Saturation crop histograms to distinguish multiple items of the same class (e.g. `bottle` vs `bottle #2`) and reports age/staleness (`just now`, `5m ago`).
 - **Device & Network Resilience:**
-  - Graceful handling of camera/microphone permissions, glasses connect/disconnect state changes, server disconnects, and `adb reverse tcp:8765 tcp:8765` / LAN fallback.
+  - Graceful handling of camera/microphone permissions, glasses connect/disconnect state changes, automatic clearing of stale HUD boxes if `:8765` drops for >2.5s, and `adb reverse` USB tunneling.
 
 ---
 
-## 5. Plausible Path to Adoption / Pilot
+## 5. Proposed Next Steps: Path to Adoption / Pilot (Not Yet Field-Tested)
 
-1. **Phase 1 — Personal & Household Pilot:** Opt-in everyday memory for keys, medication, water bottles, and shared kitchen/office notes.
-2. **Phase 2 — Assisted Living & Accessibility Pilot:** Partner with occupational therapists and accessibility groups to evaluate spoken object-finder cues and room-handoff reminders for older adults and users with low vision or memory impairments.
-3. **Phase 3 — Local Neighborhood Place Layers:** Opt-in friend-circle storefront notes and reviews without requiring full 3D city mapping.
+> *Note: Within the hackathon scope, no external user study or clinical trial has been conducted yet. The following is the proposed pilot roadmap:*
+
+1. **Proposed Phase 1 — Household Opt-In Trial:** Evaluate everyday object-memory recall (`bottle`, `keys`, `medication`) and room-note handoffs across 3–5 shared households, measuring retrieval latency and false-positive rate.
+2. **Proposed Phase 2 — Accessibility Co-Design:** Partner with occupational therapists and low-vision / ADHD user groups to refine spoken TTS cadence, `Next` button navigation, and HUD contrast.
+3. **Proposed Phase 3 — Opt-In Neighborhood Place Layers:** Extend local ORB place anchors to shared friend-circle notes with explicit per-place consent.
 
 ---
 
 ## 6. Architecture & Verification Summary
 
-- **Android Glasses App (`backend/yolo_world/android-display-access/`):** Meta DAT SDK integration, calibrated HUD overlay (`YoloOverlay.kt`), Live Transcription (`LiveTranscriptionViewModel.kt`), TTS + Memory + Privacy controls (`YoloViewModel.kt`, `YoloScreen.kt`, `DisplayViewModel.kt`, `AppScaffold.kt`).
-- **Real-Time Vision Server (`:8765`, `backend/yolo_world/`):** YOLO-World detection, `SpatialNoteStore`, `PlaceAnchorStore`, `ObjectMemoryStore`, and FastAPI/WebSocket server (`detection_server.py`, `run.py`).
-- **3D Studio & Reconstruction Backend (`:8000`, `backend/main.py` & `frontend/`):** VGGT-1B 3D room reconstruction, RANSAC floor leveling + corridor carving, `/api/pin-from-hud` raycasting, and Three.js 3D Studio.
+- **Native Android Glasses App (`worldgit-hud-android/`):** Meta DAT SDK integration (`WearablesSessionManager.kt`), 60 Hz IMU fusion + Bloks HUD (`WorldGitViewModel.kt`, `WorldGitHudRenderer.kt`), local optical tracking, voice transcription, TTS, and Privacy Pause / Wipe controls.
+- **Real-Time Vision Server (`:8765`, `backend/yolo_world/`):** YOLO-World detection, `SpatialNoteStore`, `PlaceAnchorStore`, `ObjectMemoryStore` (HSV multi-instance + staleness), and `detection_server.py`.
+- **3D Studio & Spatial Hub (`:8000`, `backend/main.py` & `frontend/`):** Pre-scanned 3D room viewer, spatial diffing, Gemini Q&A, and `/api/pin-from-hud` approximate projection bridge.
 - **Automated Checks:**
-  - Python unit tests: `python -m unittest discover -s backend/yolo_world -p "test_*.py" -v`
-  - Frontend builds: `npm run build` in `frontend/` and `glasses-app/`
-  - Android unit tests & APK build: `gradlew testDebugUnitTest assembleDebug`
+  - Python unit tests: `backend\.venv311\Scripts\python.exe -m unittest discover -s backend/yolo_world -p "test_*.py" -v`
+  - Android APK build: `.\gradlew.bat assembleDebug` in `worldgit-hud-android/`
+  - Frontend build: `npm run build` in `frontend/` and `glasses-app/`
