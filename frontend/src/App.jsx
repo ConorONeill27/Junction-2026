@@ -96,9 +96,9 @@ export default function App() {
   const [depthPreviewB64, setDepthPreviewB64] = useState("");
   const [splatSize, setSplatSize] = useState(0.022);
   const [showPointCloud, setShowPointCloud] = useState(true);
-  const [showFrustums, setShowFrustums] = useState(true);
+  const [showFrustums, setShowFrustums] = useState(false);
   const [showVideoMarkers, setShowVideoMarkers] = useState(true);
-  const [autoOrbit, setAutoOrbit] = useState(true);
+  const [autoOrbit, setAutoOrbit] = useState(false);
   const [spatialObjects, setSpatialObjects] = useState([]);
   const [spatialPins, setSpatialPins] = useState([]);
   const [videoTrail, setVideoTrail] = useState([]);
@@ -109,6 +109,7 @@ export default function App() {
   const [studioOpen, setStudioOpen] = useState(false);
   const [noteModalOpen, setNoteModalOpen] = useState(false);
   const [noteInitPos, setNoteInitPos] = useState(null);
+  const [noteInitObjectId, setNoteInitObjectId] = useState("");
   const [clickTarget, setClickTarget] = useState(null);
 
   const mp = useMultiplayerSpace("usr-conor", "world_1");
@@ -231,7 +232,7 @@ export default function App() {
     controls.dampingFactor = 0.08;
     controls.minDistance = 0.25;
     controls.maxDistance = 60;
-    controls.autoRotate = true;
+    controls.autoRotate = false;
     controls.autoRotateSpeed = 1.6;
     controls.update();
 
@@ -1350,6 +1351,7 @@ export default function App() {
         }}
         onOpenNoteModal={() => {
           setNoteInitPos(null);
+          setNoteInitObjectId("");
           setNoteModalOpen(true);
         }}
         drawerOpen={drawerOpen}
@@ -1436,6 +1438,12 @@ export default function App() {
         onFocusPosition={focusCameraOnTarget}
         onOpenNoteModal={() => {
           setNoteInitPos(null);
+          setNoteInitObjectId("");
+          setNoteModalOpen(true);
+        }}
+        onPinToObject={(obj) => {
+          setNoteInitPos(Array.isArray(obj.position) ? obj.position : null);
+          setNoteInitObjectId(obj.id || "");
           setNoteModalOpen(true);
         }}
         onCreateZone={mp.createZone}
@@ -1473,6 +1481,8 @@ export default function App() {
         open={noteModalOpen}
         onClose={() => setNoteModalOpen(false)}
         initialPosition={noteInitPos}
+        initialObjectId={noteInitObjectId}
+        objects={spatialObjects}
         groups={mp.bootstrap.groups}
         friends={mp.bootstrap.friends}
         onSubmit={mp.createPin}

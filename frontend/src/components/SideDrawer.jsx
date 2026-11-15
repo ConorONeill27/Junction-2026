@@ -45,6 +45,7 @@ export default function SideDrawer({
   worldId,
   onFocusPosition,
   onOpenNoteModal,
+  onPinToObject,
   onCreateZone,
   onReportSighting,
   onAddFriend,
@@ -264,22 +265,37 @@ export default function SideDrawer({
               Tracked Objects ({objects.length})
             </span>
             {objects.map((obj) => (
-              <button
+              <div
                 key={obj.id}
-                type="button"
                 className="wg-card"
-                style={{ textAlign: "left", cursor: "pointer" }}
+                style={{ cursor: "pointer" }}
                 onClick={() => onFocusPosition && onFocusPosition(obj.position)}
               >
                 <div className="wg-card-row">
                   <strong style={{ fontSize: 13.5 }}>{obj.label}</strong>
-                  <span className="wg-badge">{obj.zone_name || "Room"}</span>
+                  <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                    <span className="wg-badge">{obj.zone_name || "Room"}</span>
+                    {onPinToObject && (
+                      <button
+                        type="button"
+                        className="wg-btn"
+                        style={{ minHeight: 28, padding: "0 8px", fontSize: 11 }}
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          onPinToObject(obj);
+                        }}
+                      >
+                        <PinIcon size={12} />
+                        <span>Pin Note</span>
+                      </button>
+                    )}
+                  </div>
                 </div>
                 <div style={{ fontSize: 12, color: "var(--text-secondary)" }}>
                   Last seen by {obj.last_seen_by_name || obj.owner || "Wearer"} &bull;{" "}
                   {formatAge(obj.last_seen_at)}
                 </div>
-              </button>
+              </div>
             ))}
 
             <span className="wg-section-label" style={{ paddingLeft: 2 }}>

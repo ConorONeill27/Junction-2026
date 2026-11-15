@@ -5,11 +5,14 @@ export default function NoteComposerModal({
   open,
   onClose,
   initialPosition,
+  initialObjectId = "",
+  objects = [],
   groups = [],
   friends = [],
   onSubmit,
 }) {
   const [pinType, setPinType] = useState("note");
+  const [selectedObjectId, setSelectedObjectId] = useState(initialObjectId || "");
   const [placeName, setPlaceName] = useState("");
   const [rating, setRating] = useState(5);
   const [text, setText] = useState("");
@@ -25,8 +28,10 @@ export default function NoteComposerModal({
     if (open) {
       setErr("");
       setSaving(false);
+      setPinType("note");
+      setSelectedObjectId(initialObjectId || "");
     }
-  }, [open]);
+  }, [open, initialObjectId]);
 
   if (!open) return null;
 
@@ -47,13 +52,19 @@ export default function NoteComposerModal({
     setSaving(true);
     setErr("");
     try {
+      const targetObj = objects.find((o) => o.id === selectedObjectId);
+      const finalPos = targetObj?.position || initialPosition || [0, 1.0, -1.2];
+      const finalLandmark =
+        pinType === "place_review"
+          ? placeName.trim()
+          : targetObj?.label || "Spatial Note";
       await onSubmit({
         pin_type: pinType,
         place_name: pinType === "place_review" ? placeName.trim() : "",
         rating: pinType === "place_review" ? rating : null,
         text: text.trim(),
-        landmark: pinType === "place_review" ? placeName.trim() : "Spatial Note",
-        position: initialPosition || [0, 1.0, -1.2],
+        landmark: finalLandmark,
+        position: finalPos,
         audience_type: audienceType,
         group_ids: audienceType === "group" ? selectedGroupIds : [],
         target_user_ids: audienceType === "people" ? selectedUserIds : [],
@@ -111,6 +122,24 @@ export default function NoteComposerModal({
             Place Review
           </button>
         </div>
+
+        {pinType === "note" && objects.length > 0 && (
+          <label style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+            <span className="wg-section-label">Attach to Object (Optional)</span>
+            <select
+              className="wg-select"
+              value={selectedObjectId}
+              onChange={(e) => setSelectedObjectId(e.target.value)}
+            >
+              <option value="">Custom / Clicked 3D Spot</option>
+              {objects.map((o) => (
+                <option key={o.id} value={o.id}>
+                  {o.label} ({o.zone_name || "Hotel Room"})
+                </option>
+              ))}
+            </select>
+          </label>
+        )}
 
         {pinType === "place_review" && (
           <>
@@ -219,6 +248,24 @@ export default function NoteComposerModal({
               );
             })}
           </div>
+        )}
+
+        {pinType === "note" && objects.length > 0 && (
+          <label style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+            <span className="wg-section-label">Attach to Object (Optional)</span>
+            <select
+              className="wg-select"
+              value={selectedObjectId}
+              onChange={(e) => setSelectedObjectId(e.target.value)}
+            >
+              <option value="">Custom / Clicked 3D Spot</option>
+              {objects.map((o) => (
+                <option key={o.id} value={o.id}>
+                  {o.label} ({o.zone_name || "Hotel Room"})
+                </option>
+              ))}
+            </select>
+          </label>
         )}
 
         {pinType === "place_review" && (

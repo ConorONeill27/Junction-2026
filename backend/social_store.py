@@ -223,16 +223,22 @@ def seed_everyday_social_data(db: Any) -> None:
         })
 
     if not db.list_zones("world_1"):
-        db.upsert_zone({
-            "zone_id": "zone-beside-left-bed",
-            "world_id": "world_1",
-            "name": "Beside Left Bed",
-            "x": -0.72,
-            "y": 0.06,
-            "z": 0.70,
-            "radius_m": 0.95,
-            "created_by": "usr-conor",
-        })
+        for zid, name, x, y, z in (
+            ("zone-beside-left-bed", "Beside Left Bed", -0.72, 0.06, 0.70),
+            ("zone-right-nightstand", "Right Nightstand", 0.72, 0.25, 0.70),
+            ("zone-foot-of-bed", "Foot of Bed", 0.0, 0.15, -0.45),
+            ("zone-room-entrance", "Room Entrance", 1.68, 0.20, -0.10),
+        ):
+            db.upsert_zone({
+                "zone_id": zid,
+                "world_id": "world_1",
+                "name": name,
+                "x": x,
+                "y": y,
+                "z": z,
+                "radius_m": 0.95,
+                "created_by": "usr-conor",
+            })
 
     if not db.list_objects():
         db.upsert_object({
